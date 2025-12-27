@@ -1,5 +1,919 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+//! A segmented growable vector with stable pointers.
+//!
+//! Unlike `Vec`, pushing new elements never invalidates pointers to existing elements.
+//! This is achieved by storing elements in segments of exponentially growing sizes.
+//!
+//! # Example
+//!
+//! ```
+//! use segmented_vec::SegmentedVec;
+//!
+//! let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+//! vec.push(1);
+//! vec.push(2);
+//!
+//! // Get a pointer to the first element
+//! let ptr = &vec[0] as *const i32;
+//!
+//! // Push more elements - the pointer remains valid!
+//! for i in 3..100 {
+//!     vec.push(i);
+//! }
+//!
+//! // The pointer is still valid
+//! assert_eq!(unsafe { *ptr }, 1);
+//! ```
+
+mod sort;
+
+use std::alloc::{self, Layout};
+use std::cmp::Ordering;
+use std::marker::PhantomData;
+use std::mem::MaybeUninit;
+use std::ops::{Index, IndexMut};
+use std::ptr::NonNull;
+
+/// A segmented vector with stable pointers.
+///
+/// `PREALLOC` specifies the number of elements to store inline (must be 0 or a power of 2).
+/// Elements beyond the preallocation are stored in dynamically allocated segments.
+pub struct SegmentedVec<T, const PREALLOC: usize = 0> {
+    prealloc_segment: MaybeUninit<[T; PREALLOC]>,
+    dynamic_segments: Vec<NonNull<T>>,
+    len: usize,
+    _marker: PhantomData<T>,
+}
+
+// Safety: SegmentedVec is Send if T is Send
+unsafe impl<T: Send, const PREALLOC: usize> Send for SegmentedVec<T, PREALLOC> {}
+// Safety: SegmentedVec is Sync if T is Sync
+unsafe impl<T: Sync, const PREALLOC: usize> Sync for SegmentedVec<T, PREALLOC> {}
+
+impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
+    const PREALLOC_EXP: u32 = if PREALLOC == 0 {
+        0
+    } else {
+        assert!(PREALLOC.is_power_of_two(), "PREALLOC must be 0 or a power of 2");
+        PREALLOC.trailing_zeros()
+    };
+
+    /// Creates a new empty `SegmentedVec`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use segmented_vec::SegmentedVec;
+    /// let vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+    /// assert!(vec.is_empty());
+    /// ```
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            prealloc_segment: MaybeUninit::uninit(),
+            dynamic_segments: Vec::new(),
+            len: 0,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Returns the number of elements in the vector.
+    #[inline]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns `true` if the vector contains no elements.
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Returns the current capacity of the vector.
+    pub fn capacity(&self) -> usize {
+        if self.dynamic_segments.is_empty() {
+            PREALLOC
+        } else {
+            let shelf_count = self.dynamic_segments.len() as u32;
+            if PREALLOC == 0 {
+                (1usize << shelf_count) - 1
+            } else {
+                (1usize << (Self::PREALLOC_EXP + 1 + shelf_count)) - PREALLOC
+            }
+        }
+    }
+
+    /// Appends an element to the back of the vector.
+    ///
+    /// # Panics
+    ///
+    /// Panics if allocation fails.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use segmented_vec::SegmentedVec;
+    /// let mut vec: SegmentedVec<i32> = SegmentedVec::new();
+    /// vec.push(1);
+    /// vec.push(2);
+    /// assert_eq!(vec.len(), 2);
+    /// ```
+    #[inline]
+    pub fn push(&mut self, value: T) {
+        let index = self.len;
+        self.grow_capacity(index + 1);
+        unsafe {
+            self.unchecked_write(index, value);
+        }
+        self.len = index + 1;
+    }
+
+    /// Removes the last element from the vector and returns it, or `None` if empty.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use segmented_vec::SegmentedVec;
+    /// let mut vec: SegmentedVec<i32> = SegmentedVec::new();
+    /// vec.push(1);
+    /// vec.push(2);
+    /// assert_eq!(vec.pop(), Some(2));
+    /// assert_eq!(vec.pop(), Some(1));
+    /// assert_eq!(vec.pop(), None);
+    /// ```
+    #[inline]
+    pub fn pop(&mut self) -> Option<T> {
+        if self.len == 0 {
+            return None;
+        }
+        let index = self.len - 1;
+        let value = unsafe { self.unchecked_read(index) };
+        self.len = index;
+        Some(value)
+    }
+
+    /// Returns a reference to the element at the given index.
+    ///
+    /// Returns `None` if the index is out of bounds.
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if index >= self.len {
+            None
+        } else {
+            Some(unsafe { self.unchecked_at(index) })
+        }
+    }
+
+    /// Returns a mutable reference to the element at the given index.
+    ///
+    /// Returns `None` if the index is out of bounds.
+    #[inline]
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index >= self.len {
+            None
+        } else {
+            Some(unsafe { self.unchecked_at_mut(index) })
+        }
+    }
+
+    /// Returns a reference to the first element, or `None` if empty.
+    #[inline]
+    pub fn first(&self) -> Option<&T> {
+        self.get(0)
+    }
+
+    /// Returns a mutable reference to the first element, or `None` if empty.
+    #[inline]
+    pub fn first_mut(&mut self) -> Option<&mut T> {
+        self.get_mut(0)
+    }
+
+    /// Returns a reference to the last element, or `None` if empty.
+    #[inline]
+    pub fn last(&self) -> Option<&T> {
+        if self.len == 0 {
+            None
+        } else {
+            self.get(self.len - 1)
+        }
+    }
+
+    /// Returns a mutable reference to the last element, or `None` if empty.
+    #[inline]
+    pub fn last_mut(&mut self) -> Option<&mut T> {
+        if self.len == 0 {
+            None
+        } else {
+            self.get_mut(self.len - 1)
+        }
+    }
+
+    /// Clears the vector, removing all elements.
+    ///
+    /// This does not deallocate the dynamic segments.
+    pub fn clear(&mut self) {
+        // Drop all elements
+        for i in 0..self.len {
+            unsafe {
+                std::ptr::drop_in_place(self.unchecked_at_mut(i));
+            }
+        }
+        self.len = 0;
+    }
+
+    /// Shortens the vector, keeping the first `new_len` elements.
+    ///
+    /// If `new_len` is greater than or equal to the current length, this has no effect.
+    pub fn truncate(&mut self, new_len: usize) {
+        if new_len >= self.len {
+            return;
+        }
+        // Drop elements beyond new_len
+        for i in new_len..self.len {
+            unsafe {
+                std::ptr::drop_in_place(self.unchecked_at_mut(i));
+            }
+        }
+        self.len = new_len;
+    }
+
+    /// Reserves capacity for at least `additional` more elements.
+    pub fn reserve(&mut self, additional: usize) {
+        self.grow_capacity(self.len + additional);
+    }
+
+    /// Shrinks the capacity to match the current length.
+    ///
+    /// This deallocates unused dynamic segments.
+    pub fn shrink_to_fit(&mut self) {
+        self.shrink_capacity(self.len);
+    }
+
+    /// Returns an iterator over references to the elements.
+    #[inline]
+    pub fn iter(&self) -> Iter<'_, T, PREALLOC> {
+        Iter {
+            vec: self,
+            index: 0,
+            shelf_index: 0,
+            box_index: 0,
+            shelf_size: if PREALLOC == 0 { 1 } else { PREALLOC * 2 },
+        }
+    }
+
+    /// Returns an iterator over mutable references to the elements.
+    #[inline]
+    pub fn iter_mut(&mut self) -> IterMut<'_, T, PREALLOC> {
+        IterMut {
+            vec: self,
+            index: 0,
+            shelf_index: 0,
+            box_index: 0,
+            shelf_size: if PREALLOC == 0 { 1 } else { PREALLOC * 2 },
+        }
+    }
+
+    /// Extends the vector by cloning elements from a slice.
+    pub fn extend_from_slice(&mut self, other: &[T])
+    where
+        T: Clone,
+    {
+        self.reserve(other.len());
+        for item in other {
+            self.push(item.clone());
+        }
+    }
+
+    /// Sorts the vector in place using a stable sorting algorithm.
+    ///
+    /// This sort is stable (i.e., does not reorder equal elements) and O(n * log(n)) worst-case.
+    ///
+    /// The algorithm is a merge sort adapted from the Rust standard library.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use segmented_vec::SegmentedVec;
+    ///
+    /// let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+    /// vec.extend([3, 1, 4, 1, 5, 9, 2, 6]);
+    /// vec.sort();
+    /// assert_eq!(vec.iter().copied().collect::<Vec<_>>(), vec![1, 1, 2, 3, 4, 5, 6, 9]);
+    /// ```
+    #[inline]
+    pub fn sort(&mut self)
+    where
+        T: Ord,
+    {
+        self.sort_by(|a, b| a.cmp(b));
+    }
+
+    /// Sorts the vector in place with a comparator function.
+    ///
+    /// This sort is stable (i.e., does not reorder equal elements) and O(n * log(n)) worst-case.
+    ///
+    /// The comparator function must define a total ordering for the elements.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use segmented_vec::SegmentedVec;
+    ///
+    /// let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+    /// vec.extend([3, 1, 4, 1, 5, 9, 2, 6]);
+    /// vec.sort_by(|a, b| b.cmp(a)); // reverse order
+    /// assert_eq!(vec.iter().copied().collect::<Vec<_>>(), vec![9, 6, 5, 4, 3, 2, 1, 1]);
+    /// ```
+    pub fn sort_by<F>(&mut self, mut compare: F)
+    where
+        F: FnMut(&T, &T) -> Ordering,
+    {
+        if self.len <= 1 {
+            return;
+        }
+        let len = self.len;
+        let mut is_less = |a: &T, b: &T| compare(a, b) == Ordering::Less;
+        sort::merge_sort(self, 0, len, &mut is_less);
+    }
+
+    /// Sorts the vector in place with a key extraction function.
+    ///
+    /// This sort is stable (i.e., does not reorder equal elements) and O(m * n * log(n)) worst-case,
+    /// where the key function is O(m).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use segmented_vec::SegmentedVec;
+    ///
+    /// let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+    /// vec.extend([-3, 1, -4, 1, 5, -9, 2, 6]);
+    /// vec.sort_by_key(|k| k.abs());
+    /// assert_eq!(vec.iter().copied().collect::<Vec<_>>(), vec![1, 1, 2, -3, -4, 5, 6, -9]);
+    /// ```
+    #[inline]
+    pub fn sort_by_key<K, F>(&mut self, mut f: F)
+    where
+        F: FnMut(&T) -> K,
+        K: Ord,
+    {
+        self.sort_by(|a, b| f(a).cmp(&f(b)));
+    }
+
+    /// Sorts the vector in place using an unstable sorting algorithm.
+    ///
+    /// This sort is unstable (i.e., may reorder equal elements), in-place, and O(n * log(n)) worst-case.
+    ///
+    /// The algorithm is a quicksort with heapsort fallback, adapted from the Rust standard library.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use segmented_vec::SegmentedVec;
+    ///
+    /// let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+    /// vec.extend([3, 1, 4, 1, 5, 9, 2, 6]);
+    /// vec.sort_unstable();
+    /// assert_eq!(vec.iter().copied().collect::<Vec<_>>(), vec![1, 1, 2, 3, 4, 5, 6, 9]);
+    /// ```
+    #[inline]
+    pub fn sort_unstable(&mut self)
+    where
+        T: Ord,
+    {
+        self.sort_unstable_by(|a, b| a.cmp(b));
+    }
+
+    /// Sorts the vector in place with a comparator function using an unstable sorting algorithm.
+    ///
+    /// This sort is unstable (i.e., may reorder equal elements), in-place, and O(n * log(n)) worst-case.
+    ///
+    /// The comparator function must define a total ordering for the elements.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use segmented_vec::SegmentedVec;
+    ///
+    /// let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+    /// vec.extend([3, 1, 4, 1, 5, 9, 2, 6]);
+    /// vec.sort_unstable_by(|a, b| b.cmp(a)); // reverse order
+    /// assert_eq!(vec.iter().copied().collect::<Vec<_>>(), vec![9, 6, 5, 4, 3, 2, 1, 1]);
+    /// ```
+    pub fn sort_unstable_by<F>(&mut self, mut compare: F)
+    where
+        F: FnMut(&T, &T) -> Ordering,
+    {
+        if self.len <= 1 {
+            return;
+        }
+        let len = self.len;
+        let mut is_less = |a: &T, b: &T| compare(a, b) == Ordering::Less;
+        sort::quicksort(self, 0, len, &mut is_less);
+    }
+
+    /// Sorts the vector in place with a key extraction function using an unstable sorting algorithm.
+    ///
+    /// This sort is unstable (i.e., may reorder equal elements), in-place, and O(n * log(n)) worst-case,
+    /// where the key function is O(m).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use segmented_vec::SegmentedVec;
+    ///
+    /// let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+    /// vec.extend([-3, 1, -4, 1, 5, -9, 2, 6]);
+    /// vec.sort_unstable_by_key(|k| k.abs());
+    /// // Note: unstable sort may reorder equal elements, so we just check it's sorted by abs value
+    /// let result: Vec<i32> = vec.iter().copied().collect();
+    /// for i in 1..result.len() {
+    ///     assert!(result[i-1].abs() <= result[i].abs());
+    /// }
+    /// ```
+    #[inline]
+    pub fn sort_unstable_by_key<K, F>(&mut self, mut f: F)
+    where
+        F: FnMut(&T) -> K,
+        K: Ord,
+    {
+        self.sort_unstable_by(|a, b| f(a).cmp(&f(b)));
+    }
+
+    // --- Internal helper methods ---
+
+    /// Calculate the number of shelves needed for a given capacity.
+    #[inline]
+    fn shelf_count(box_count: usize) -> u32 {
+        if box_count == 0 {
+            return 0;
+        }
+        if PREALLOC == 0 {
+            (box_count + 1).next_power_of_two().trailing_zeros()
+        } else {
+            let val = box_count + PREALLOC;
+            val.next_power_of_two().trailing_zeros() - Self::PREALLOC_EXP - 1
+        }
+    }
+
+    /// Calculate the size of a shelf at a given index.
+    #[inline]
+    fn shelf_size(shelf_index: u32) -> usize {
+        if PREALLOC == 0 {
+            1usize << shelf_index
+        } else {
+            1usize << (shelf_index + Self::PREALLOC_EXP + 1)
+        }
+    }
+
+    /// Calculate which shelf a list index falls into.
+    #[inline]
+    fn shelf_index(list_index: usize) -> u32 {
+        if PREALLOC == 0 {
+            (list_index + 1).ilog2()
+        } else {
+            (list_index + PREALLOC).ilog2() - Self::PREALLOC_EXP - 1
+        }
+    }
+
+    /// Calculate the index within a shelf for a given list index.
+    #[inline]
+    fn box_index(list_index: usize, shelf_index: u32) -> usize {
+        if PREALLOC == 0 {
+            (list_index + 1) - (1usize << shelf_index)
+        } else {
+            list_index + PREALLOC - (1usize << (Self::PREALLOC_EXP + 1 + shelf_index))
+        }
+    }
+
+    /// Get an unchecked reference to an element.
+    ///
+    /// # Safety
+    ///
+    /// `index` must be less than `self.len`.
+    #[inline]
+    unsafe fn unchecked_at(&self, index: usize) -> &T {
+        if index < PREALLOC {
+            &(*self.prealloc_segment.as_ptr())[index]
+        } else {
+            let shelf_index = Self::shelf_index(index);
+            let box_index = Self::box_index(index, shelf_index);
+            &*self.dynamic_segments[shelf_index as usize].as_ptr().add(box_index)
+        }
+    }
+
+    /// Get an unchecked mutable reference to an element.
+    ///
+    /// # Safety
+    ///
+    /// `index` must be less than `self.len`.
+    #[inline]
+    unsafe fn unchecked_at_mut(&mut self, index: usize) -> &mut T {
+        if index < PREALLOC {
+            &mut (*self.prealloc_segment.as_mut_ptr())[index]
+        } else {
+            let shelf_index = Self::shelf_index(index);
+            let box_index = Self::box_index(index, shelf_index);
+            &mut *self.dynamic_segments[shelf_index as usize].as_ptr().add(box_index)
+        }
+    }
+
+    /// Write a value to an index without reading the old value.
+    ///
+    /// # Safety
+    ///
+    /// The capacity must be sufficient for this index.
+    #[inline]
+    unsafe fn unchecked_write(&mut self, index: usize, value: T) {
+        if index < PREALLOC {
+            std::ptr::write(&mut (*self.prealloc_segment.as_mut_ptr())[index], value);
+        } else {
+            let shelf_index = Self::shelf_index(index);
+            let box_index = Self::box_index(index, shelf_index);
+            std::ptr::write(
+                self.dynamic_segments[shelf_index as usize].as_ptr().add(box_index),
+                value,
+            );
+        }
+    }
+
+    /// Read a value from an index.
+    ///
+    /// # Safety
+    ///
+    /// `index` must be less than `self.len`, and the value must not be read again.
+    #[inline]
+    unsafe fn unchecked_read(&self, index: usize) -> T {
+        if index < PREALLOC {
+            std::ptr::read(&(*self.prealloc_segment.as_ptr())[index])
+        } else {
+            let shelf_index = Self::shelf_index(index);
+            let box_index = Self::box_index(index, shelf_index);
+            std::ptr::read(self.dynamic_segments[shelf_index as usize].as_ptr().add(box_index))
+        }
+    }
+
+    /// Grow capacity to accommodate at least `new_capacity` elements.
+    fn grow_capacity(&mut self, new_capacity: usize) {
+        let new_shelf_count = Self::shelf_count(new_capacity);
+        let old_shelf_count = self.dynamic_segments.len() as u32;
+
+        if new_shelf_count > old_shelf_count {
+            self.dynamic_segments.reserve((new_shelf_count - old_shelf_count) as usize);
+
+            for i in old_shelf_count..new_shelf_count {
+                let size = Self::shelf_size(i);
+                let layout = Layout::array::<T>(size).expect("Layout overflow");
+                let ptr = if layout.size() == 0 {
+                    NonNull::dangling()
+                } else {
+                    let ptr = unsafe { alloc::alloc(layout) };
+                    NonNull::new(ptr as *mut T).expect("Allocation failed")
+                };
+                self.dynamic_segments.push(ptr);
+            }
+        }
+    }
+
+    /// Shrink capacity to the minimum needed for `new_capacity` elements.
+    fn shrink_capacity(&mut self, new_capacity: usize) {
+        if new_capacity <= PREALLOC {
+            // Free all dynamic segments
+            self.free_shelves(self.dynamic_segments.len() as u32, 0);
+            self.dynamic_segments.clear();
+            self.dynamic_segments.shrink_to_fit();
+            return;
+        }
+
+        let new_shelf_count = Self::shelf_count(new_capacity);
+        let old_shelf_count = self.dynamic_segments.len() as u32;
+
+        if new_shelf_count < old_shelf_count {
+            self.free_shelves(old_shelf_count, new_shelf_count);
+            self.dynamic_segments.truncate(new_shelf_count as usize);
+            self.dynamic_segments.shrink_to_fit();
+        }
+    }
+
+    /// Free shelves from `from_count` down to `to_count` (exclusive).
+    fn free_shelves(&mut self, from_count: u32, to_count: u32) {
+        for i in (to_count..from_count).rev() {
+            let size = Self::shelf_size(i);
+            let layout = Layout::array::<T>(size).expect("Layout overflow");
+            if layout.size() > 0 {
+                unsafe {
+                    alloc::dealloc(self.dynamic_segments[i as usize].as_ptr() as *mut u8, layout);
+                }
+            }
+        }
+    }
+}
+
+impl<T, const PREALLOC: usize> Drop for SegmentedVec<T, PREALLOC> {
+    fn drop(&mut self) {
+        // Drop all elements
+        self.clear();
+        // Free all dynamic segments
+        self.free_shelves(self.dynamic_segments.len() as u32, 0);
+    }
+}
+
+impl<T, const PREALLOC: usize> sort::IndexedAccess<T> for SegmentedVec<T, PREALLOC> {
+    #[inline]
+    fn get_ref(&self, index: usize) -> &T {
+        debug_assert!(index < self.len);
+        unsafe { self.unchecked_at(index) }
+    }
+
+    #[inline]
+    fn get_ptr(&self, index: usize) -> *const T {
+        debug_assert!(index < self.len);
+        if index < PREALLOC {
+            unsafe { (*self.prealloc_segment.as_ptr()).as_ptr().add(index) }
+        } else {
+            let shelf_index = Self::shelf_index(index);
+            let box_index = Self::box_index(index, shelf_index);
+            unsafe { self.dynamic_segments[shelf_index as usize].as_ptr().add(box_index) }
+        }
+    }
+
+    #[inline]
+    fn get_ptr_mut(&mut self, index: usize) -> *mut T {
+        debug_assert!(index < self.len);
+        if index < PREALLOC {
+            unsafe { (*self.prealloc_segment.as_mut_ptr()).as_mut_ptr().add(index) }
+        } else {
+            let shelf_index = Self::shelf_index(index);
+            let box_index = Self::box_index(index, shelf_index);
+            unsafe { self.dynamic_segments[shelf_index as usize].as_ptr().add(box_index) }
+        }
+    }
+
+    #[inline]
+    fn swap(&mut self, a: usize, b: usize) {
+        if a == b {
+            return;
+        }
+        debug_assert!(a < self.len && b < self.len);
+        unsafe {
+            let ptr_a = self.get_ptr_mut(a);
+            let ptr_b = self.get_ptr_mut(b);
+            std::ptr::swap(ptr_a, ptr_b);
+        }
+    }
+}
+
+impl<T, const PREALLOC: usize> Default for SegmentedVec<T, PREALLOC> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T, const PREALLOC: usize> Index<usize> for SegmentedVec<T, PREALLOC> {
+    type Output = T;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("index out of bounds")
+    }
+}
+
+impl<T, const PREALLOC: usize> IndexMut<usize> for SegmentedVec<T, PREALLOC> {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        self.get_mut(index).expect("index out of bounds")
+    }
+}
+
+impl<T: Clone, const PREALLOC: usize> Clone for SegmentedVec<T, PREALLOC> {
+    fn clone(&self) -> Self {
+        let mut new_vec = Self::new();
+        new_vec.reserve(self.len);
+        for i in 0..self.len {
+            new_vec.push(unsafe { self.unchecked_at(i) }.clone());
+        }
+        new_vec
+    }
+}
+
+impl<T: std::fmt::Debug, const PREALLOC: usize> std::fmt::Debug for SegmentedVec<T, PREALLOC> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl<T: PartialEq, const PREALLOC: usize> PartialEq for SegmentedVec<T, PREALLOC> {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len != other.len {
+            return false;
+        }
+        for i in 0..self.len {
+            if unsafe { self.unchecked_at(i) } != unsafe { other.unchecked_at(i) } {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl<T: Eq, const PREALLOC: usize> Eq for SegmentedVec<T, PREALLOC> {}
+
+impl<T, const PREALLOC: usize> FromIterator<T> for SegmentedVec<T, PREALLOC> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let iter = iter.into_iter();
+        let (lower, _) = iter.size_hint();
+        let mut vec = Self::new();
+        vec.reserve(lower);
+        for item in iter {
+            vec.push(item);
+        }
+        vec
+    }
+}
+
+impl<T, const PREALLOC: usize> Extend<T> for SegmentedVec<T, PREALLOC> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        let iter = iter.into_iter();
+        let (lower, _) = iter.size_hint();
+        self.reserve(lower);
+        for item in iter {
+            self.push(item);
+        }
+    }
+}
+
+// --- Iterator implementations ---
+
+/// An iterator over references to elements of a `SegmentedVec`.
+pub struct Iter<'a, T, const PREALLOC: usize> {
+    vec: &'a SegmentedVec<T, PREALLOC>,
+    index: usize,
+    shelf_index: u32,
+    box_index: usize,
+    shelf_size: usize,
+}
+
+impl<'a, T, const PREALLOC: usize> Iterator for Iter<'a, T, PREALLOC> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.vec.len {
+            return None;
+        }
+
+        if self.index < PREALLOC {
+            let ptr = unsafe { &(*self.vec.prealloc_segment.as_ptr())[self.index] };
+            self.index += 1;
+            if self.index == PREALLOC {
+                self.box_index = 0;
+                self.shelf_index = 0;
+                self.shelf_size = PREALLOC * 2;
+            }
+            return Some(ptr);
+        }
+
+        let ptr = unsafe {
+            &*self.vec.dynamic_segments[self.shelf_index as usize]
+                .as_ptr()
+                .add(self.box_index)
+        };
+        self.index += 1;
+        self.box_index += 1;
+        if self.box_index == self.shelf_size {
+            self.shelf_index += 1;
+            self.box_index = 0;
+            self.shelf_size *= 2;
+        }
+        Some(ptr)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.vec.len - self.index;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<'a, T, const PREALLOC: usize> ExactSizeIterator for Iter<'a, T, PREALLOC> {}
+
+
+/// An iterator over mutable references to elements of a `SegmentedVec`.
+pub struct IterMut<'a, T, const PREALLOC: usize> {
+    vec: &'a mut SegmentedVec<T, PREALLOC>,
+    index: usize,
+    shelf_index: u32,
+    box_index: usize,
+    shelf_size: usize,
+}
+
+impl<'a, T, const PREALLOC: usize> Iterator for IterMut<'a, T, PREALLOC> {
+    type Item = &'a mut T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.vec.len {
+            return None;
+        }
+
+        if self.index < PREALLOC {
+            // Safety: We're iterating forward only once per element
+            let ptr = unsafe { &mut (*self.vec.prealloc_segment.as_mut_ptr())[self.index] };
+            self.index += 1;
+            if self.index == PREALLOC {
+                self.box_index = 0;
+                self.shelf_index = 0;
+                self.shelf_size = PREALLOC * 2;
+            }
+            // Safety: We're extending the lifetime, but we never return the same index twice
+            return Some(unsafe { &mut *(ptr as *mut T) });
+        }
+
+        let ptr = unsafe {
+            &mut *self.vec.dynamic_segments[self.shelf_index as usize]
+                .as_ptr()
+                .add(self.box_index)
+        };
+        self.index += 1;
+        self.box_index += 1;
+        if self.box_index == self.shelf_size {
+            self.shelf_index += 1;
+            self.box_index = 0;
+            self.shelf_size *= 2;
+        }
+        // Safety: We're extending the lifetime, but we never return the same index twice
+        Some(unsafe { &mut *(ptr as *mut T) })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.vec.len - self.index;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<'a, T, const PREALLOC: usize> ExactSizeIterator for IterMut<'a, T, PREALLOC> {}
+
+impl<T, const PREALLOC: usize> IntoIterator for SegmentedVec<T, PREALLOC> {
+    type Item = T;
+    type IntoIter = IntoIter<T, PREALLOC>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        IntoIter {
+            vec: self,
+            index: 0,
+        }
+    }
+}
+
+impl<'a, T, const PREALLOC: usize> IntoIterator for &'a SegmentedVec<T, PREALLOC> {
+    type Item = &'a T;
+    type IntoIter = Iter<'a, T, PREALLOC>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a, T, const PREALLOC: usize> IntoIterator for &'a mut SegmentedVec<T, PREALLOC> {
+    type Item = &'a mut T;
+    type IntoIter = IterMut<'a, T, PREALLOC>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
+/// An owning iterator over elements of a `SegmentedVec`.
+pub struct IntoIter<T, const PREALLOC: usize> {
+    vec: SegmentedVec<T, PREALLOC>,
+    index: usize,
+}
+
+impl<T, const PREALLOC: usize> Iterator for IntoIter<T, PREALLOC> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.vec.len {
+            return None;
+        }
+        let value = unsafe { self.vec.unchecked_read(self.index) };
+        self.index += 1;
+        Some(value)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.vec.len - self.index;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<T, const PREALLOC: usize> ExactSizeIterator for IntoIter<T, PREALLOC> {}
+
+impl<T, const PREALLOC: usize> Drop for IntoIter<T, PREALLOC> {
+    fn drop(&mut self) {
+        // Drop remaining elements that weren't consumed
+        for i in self.index..self.vec.len {
+            unsafe {
+                std::ptr::drop_in_place(self.vec.unchecked_at_mut(i));
+            }
+        }
+        // Prevent the Vec from dropping elements again
+        self.vec.len = 0;
+    }
 }
 
 #[cfg(test)]
@@ -7,8 +921,412 @@ mod tests {
     use super::*;
 
     #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+    fn test_new_empty() {
+        let vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        assert!(vec.is_empty());
+        assert_eq!(vec.len(), 0);
+    }
+
+    #[test]
+    fn test_push_pop() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.push(1);
+        vec.push(2);
+        vec.push(3);
+        assert_eq!(vec.len(), 3);
+        assert_eq!(vec.pop(), Some(3));
+        assert_eq!(vec.pop(), Some(2));
+        assert_eq!(vec.pop(), Some(1));
+        assert_eq!(vec.pop(), None);
+    }
+
+    #[test]
+    fn test_get() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.push(10);
+        vec.push(20);
+        vec.push(30);
+        assert_eq!(vec.get(0), Some(&10));
+        assert_eq!(vec.get(1), Some(&20));
+        assert_eq!(vec.get(2), Some(&30));
+        assert_eq!(vec.get(3), None);
+    }
+
+    #[test]
+    fn test_index() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.push(10);
+        vec.push(20);
+        assert_eq!(vec[0], 10);
+        assert_eq!(vec[1], 20);
+        vec[0] = 100;
+        assert_eq!(vec[0], 100);
+    }
+
+    #[test]
+    fn test_stable_pointers() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.push(1);
+        let ptr = &vec[0] as *const i32;
+
+        // Push many more elements to trigger segment allocations
+        for i in 2..1000 {
+            vec.push(i);
+        }
+
+        // The pointer should still be valid
+        assert_eq!(unsafe { *ptr }, 1);
+    }
+
+    #[test]
+    fn test_iter() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        for i in 0..100 {
+            vec.push(i);
+        }
+
+        let collected: Vec<i32> = vec.iter().copied().collect();
+        let expected: Vec<i32> = (0..100).collect();
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn test_iter_mut() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        for i in 0..10 {
+            vec.push(i);
+        }
+
+        for item in vec.iter_mut() {
+            *item *= 2;
+        }
+
+        let collected: Vec<i32> = vec.iter().copied().collect();
+        let expected: Vec<i32> = (0..10).map(|x| x * 2).collect();
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn test_into_iter() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        for i in 0..10 {
+            vec.push(i);
+        }
+
+        let collected: Vec<i32> = vec.into_iter().collect();
+        let expected: Vec<i32> = (0..10).collect();
+        assert_eq!(collected, expected);
+    }
+
+    #[test]
+    fn test_from_iter() {
+        let vec: SegmentedVec<i32, 4> = (0..10).collect();
+        assert_eq!(vec.len(), 10);
+        for i in 0..10 {
+            assert_eq!(vec[i], i as i32);
+        }
+    }
+
+    #[test]
+    fn test_extend() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.extend(0..5);
+        vec.extend(5..10);
+        assert_eq!(vec.len(), 10);
+        for i in 0..10 {
+            assert_eq!(vec[i], i as i32);
+        }
+    }
+
+    #[test]
+    fn test_clear() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.extend(0..10);
+        vec.clear();
+        assert!(vec.is_empty());
+        assert_eq!(vec.len(), 0);
+    }
+
+    #[test]
+    fn test_truncate() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.extend(0..10);
+        vec.truncate(5);
+        assert_eq!(vec.len(), 5);
+        for i in 0..5 {
+            assert_eq!(vec[i], i as i32);
+        }
+    }
+
+    #[test]
+    fn test_zero_prealloc() {
+        let mut vec: SegmentedVec<i32, 0> = SegmentedVec::new();
+        for i in 0..100 {
+            vec.push(i);
+        }
+
+        for i in 0..100 {
+            assert_eq!(vec[i], i as i32);
+        }
+
+        assert_eq!(vec.pop(), Some(99));
+        assert_eq!(vec.len(), 99);
+    }
+
+    #[test]
+    fn test_various_prealloc_sizes() {
+        fn test_prealloc<const N: usize>() {
+            let mut vec: SegmentedVec<i32, N> = SegmentedVec::new();
+            for i in 0..100 {
+                vec.push(i);
+            }
+            for i in 0..100 {
+                assert_eq!(vec[i], i as i32);
+            }
+        }
+
+        test_prealloc::<0>();
+        test_prealloc::<1>();
+        test_prealloc::<2>();
+        test_prealloc::<4>();
+        test_prealloc::<8>();
+        test_prealloc::<16>();
+    }
+
+    #[test]
+    fn test_clone() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.extend(0..10);
+        let vec2 = vec.clone();
+        assert_eq!(vec, vec2);
+    }
+
+    #[test]
+    fn test_debug() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.extend(0..3);
+        let debug_str = format!("{:?}", vec);
+        assert_eq!(debug_str, "[0, 1, 2]");
+    }
+
+    #[test]
+    fn test_first_last() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        assert_eq!(vec.first(), None);
+        assert_eq!(vec.last(), None);
+
+        vec.push(1);
+        assert_eq!(vec.first(), Some(&1));
+        assert_eq!(vec.last(), Some(&1));
+
+        vec.push(2);
+        vec.push(3);
+        assert_eq!(vec.first(), Some(&1));
+        assert_eq!(vec.last(), Some(&3));
+    }
+
+    #[test]
+    fn test_drop_elements() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let drop_count = Rc::new(Cell::new(0));
+
+        struct DropCounter {
+            counter: Rc<Cell<i32>>,
+        }
+
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.counter.set(self.counter.get() + 1);
+            }
+        }
+
+        {
+            let mut vec: SegmentedVec<DropCounter, 4> = SegmentedVec::new();
+            for _ in 0..10 {
+                vec.push(DropCounter {
+                    counter: Rc::clone(&drop_count),
+                });
+            }
+        }
+
+        assert_eq!(drop_count.get(), 10);
+    }
+
+    #[test]
+    fn test_shrink_to_fit() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.extend(0..100);
+        vec.truncate(5);
+        vec.shrink_to_fit();
+        assert_eq!(vec.len(), 5);
+        for i in 0..5 {
+            assert_eq!(vec[i], i as i32);
+        }
+    }
+
+    #[test]
+    fn test_sort() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.extend([5, 2, 8, 1, 9, 3, 7, 4, 6, 0]);
+        vec.sort();
+        let result: Vec<i32> = vec.iter().copied().collect();
+        assert_eq!(result, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn test_sort_empty() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.sort();
+        assert!(vec.is_empty());
+    }
+
+    #[test]
+    fn test_sort_single() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.push(42);
+        vec.sort();
+        assert_eq!(vec[0], 42);
+    }
+
+    #[test]
+    fn test_sort_already_sorted() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.extend(0..10);
+        vec.sort();
+        let result: Vec<i32> = vec.iter().copied().collect();
+        assert_eq!(result, (0..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_sort_reverse_sorted() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.extend((0..10).rev());
+        vec.sort();
+        let result: Vec<i32> = vec.iter().copied().collect();
+        assert_eq!(result, (0..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_sort_by() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.extend([5, 2, 8, 1, 9, 3, 7, 4, 6, 0]);
+        vec.sort_by(|a, b| b.cmp(a)); // reverse order
+        let result: Vec<i32> = vec.iter().copied().collect();
+        assert_eq!(result, vec![9, 8, 7, 6, 5, 4, 3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn test_sort_by_key() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.extend([-5, 2, -8, 1, -9, 3, -7, 4, -6, 0]);
+        vec.sort_by_key(|k| k.abs());
+        let result: Vec<i32> = vec.iter().copied().collect();
+        assert_eq!(result, vec![0, 1, 2, 3, 4, -5, -6, -7, -8, -9]);
+    }
+
+    #[test]
+    fn test_sort_stable() {
+        // Test that sort is stable (equal elements maintain their relative order)
+        #[derive(Debug, Clone, Eq, PartialEq)]
+        struct Item {
+            key: i32,
+            order: usize,
+        }
+
+        let mut vec: SegmentedVec<Item, 4> = SegmentedVec::new();
+        vec.push(Item { key: 1, order: 0 });
+        vec.push(Item { key: 2, order: 1 });
+        vec.push(Item { key: 1, order: 2 });
+        vec.push(Item { key: 2, order: 3 });
+        vec.push(Item { key: 1, order: 4 });
+
+        vec.sort_by_key(|item| item.key);
+
+        // All items with key=1 should come first, in original order
+        assert_eq!(vec[0], Item { key: 1, order: 0 });
+        assert_eq!(vec[1], Item { key: 1, order: 2 });
+        assert_eq!(vec[2], Item { key: 1, order: 4 });
+        // Then items with key=2, in original order
+        assert_eq!(vec[3], Item { key: 2, order: 1 });
+        assert_eq!(vec[4], Item { key: 2, order: 3 });
+    }
+
+    #[test]
+    fn test_sort_unstable() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.extend([5, 2, 8, 1, 9, 3, 7, 4, 6, 0]);
+        vec.sort_unstable();
+        let result: Vec<i32> = vec.iter().copied().collect();
+        assert_eq!(result, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn test_sort_unstable_by() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.extend([5, 2, 8, 1, 9, 3, 7, 4, 6, 0]);
+        vec.sort_unstable_by(|a, b| b.cmp(a)); // reverse order
+        let result: Vec<i32> = vec.iter().copied().collect();
+        assert_eq!(result, vec![9, 8, 7, 6, 5, 4, 3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn test_sort_unstable_by_key() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.extend([-5, 2, -8, 1, -9, 3, -7, 4, -6, 0]);
+        vec.sort_unstable_by_key(|k| k.abs());
+        // Just verify it's sorted by absolute value (unstable may reorder equal elements)
+        let result: Vec<i32> = vec.iter().copied().collect();
+        for i in 1..result.len() {
+            assert!(result[i - 1].abs() <= result[i].abs());
+        }
+    }
+
+    #[test]
+    fn test_sort_large() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        // Add numbers in reverse order
+        vec.extend((0..1000).rev());
+        vec.sort();
+        for i in 0..1000 {
+            assert_eq!(vec[i], i as i32);
+        }
+    }
+
+    #[test]
+    fn test_sort_unstable_large() {
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        // Add numbers in reverse order
+        vec.extend((0..1000).rev());
+        vec.sort_unstable();
+        for i in 0..1000 {
+            assert_eq!(vec[i], i as i32);
+        }
+    }
+
+    #[test]
+    fn test_sort_with_zero_prealloc() {
+        let mut vec: SegmentedVec<i32, 0> = SegmentedVec::new();
+        vec.extend([5, 2, 8, 1, 9, 3, 7, 4, 6, 0]);
+        vec.sort();
+        let result: Vec<i32> = vec.iter().copied().collect();
+        assert_eq!(result, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn test_sort_pointers_remain_stable_after_sort() {
+        // Verify that after sorting, pointers to elements are still valid
+        // (they point to different values, but the memory locations are stable)
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.extend([5, 2, 8, 1, 9]);
+
+        // Get pointer to first element before sort
+        let ptr = &vec[0] as *const i32;
+
+        vec.sort();
+
+        // After sort, the pointer still points to valid memory (now contains sorted value)
+        assert_eq!(unsafe { *ptr }, 1); // First element after sort is 1
     }
 }
