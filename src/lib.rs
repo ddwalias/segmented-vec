@@ -27,7 +27,10 @@
 mod slice;
 mod sort;
 
-pub use slice::{SegmentedSlice, SegmentedSliceMut, SliceIter, SliceIterMut};
+pub use slice::{
+    Chunks, ChunksExact, RChunks, SegmentedSlice, SegmentedSliceMut, SliceIter, SliceIterMut,
+    Windows,
+};
 
 use std::alloc::{self, Layout};
 use std::cmp::Ordering;
@@ -608,6 +611,339 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
         self.as_mut_slice().sort_unstable_by_key(f);
     }
 
+    /// Checks if the elements of this vector are sorted.
+    pub fn is_sorted(&self) -> bool
+    where
+        T: PartialOrd,
+    {
+        self.as_slice().is_sorted()
+    }
+
+    /// Checks if the elements of this vector are sorted using the given comparator function.
+    pub fn is_sorted_by<F>(&self, compare: F) -> bool
+    where
+        F: FnMut(&T, &T) -> bool,
+    {
+        self.as_slice().is_sorted_by(compare)
+    }
+
+    /// Checks if the elements of this vector are sorted using the given key extraction function.
+    pub fn is_sorted_by_key<K, F>(&self, f: F) -> bool
+    where
+        F: FnMut(&T) -> K,
+        K: PartialOrd,
+    {
+        self.as_slice().is_sorted_by_key(f)
+    }
+
+    /// Returns the index of the partition point according to the given predicate.
+    pub fn partition_point<P>(&self, pred: P) -> usize
+    where
+        P: FnMut(&T) -> bool,
+    {
+        self.as_slice().partition_point(pred)
+    }
+
+    /// Rotates the vector in-place such that the first `mid` elements move to the end.
+    pub fn rotate_left(&mut self, mid: usize) {
+        self.as_mut_slice().rotate_left(mid);
+    }
+
+    /// Rotates the vector in-place such that the last `k` elements move to the front.
+    pub fn rotate_right(&mut self, k: usize) {
+        self.as_mut_slice().rotate_right(k);
+    }
+
+    /// Creates a new `SegmentedVec` with at least the specified capacity.
+    pub fn with_capacity(capacity: usize) -> Self {
+        let mut vec = Self::new();
+        vec.reserve(capacity);
+        vec
+    }
+
+    /// Inserts an element at position `index`, shifting all elements after it to the right.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index > len`.
+    pub fn insert(&mut self, index: usize, element: T) {
+        assert!(index <= self.len);
+        self.push(element);
+        // Rotate the new element into place
+        if index < self.len - 1 {
+            for i in (index..self.len - 1).rev() {
+                unsafe {
+                    let ptr_a = self.unchecked_at_mut(i) as *mut T;
+                    let ptr_b = self.unchecked_at_mut(i + 1) as *mut T;
+                    std::ptr::swap(ptr_a, ptr_b);
+                }
+            }
+        }
+    }
+
+    /// Removes and returns the element at position `index`, shifting all elements after it to the left.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= len`.
+    pub fn remove(&mut self, index: usize) -> T {
+        assert!(index < self.len);
+        // Shift elements left
+        for i in index..self.len - 1 {
+            unsafe {
+                let ptr_a = self.unchecked_at_mut(i) as *mut T;
+                let ptr_b = self.unchecked_at_mut(i + 1) as *mut T;
+                std::ptr::swap(ptr_a, ptr_b);
+            }
+        }
+        self.pop().unwrap()
+    }
+
+    /// Removes an element from the vector and returns it.
+    ///
+    /// The removed element is replaced by the last element of the vector.
+    /// This does not preserve ordering, but is O(1).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= len`.
+    pub fn swap_remove(&mut self, index: usize) -> T {
+        assert!(index < self.len);
+        let last_index = self.len - 1;
+        if index != last_index {
+            unsafe {
+                let ptr_a = self.unchecked_at_mut(index) as *mut T;
+                let ptr_b = self.unchecked_at_mut(last_index) as *mut T;
+                std::ptr::swap(ptr_a, ptr_b);
+            }
+        }
+        self.pop().unwrap()
+    }
+
+    /// Retains only the elements specified by the predicate.
+    ///
+    /// Removes all elements for which `f(&element)` returns `false`.
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&T) -> bool,
+    {
+        let mut i = 0;
+        while i < self.len {
+            if f(unsafe { self.unchecked_at(i) }) {
+                i += 1;
+            } else {
+                self.remove(i);
+            }
+        }
+    }
+
+    /// Retains only the elements specified by the predicate, passing a mutable reference.
+    pub fn retain_mut<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&mut T) -> bool,
+    {
+        let mut i = 0;
+        while i < self.len {
+            if f(unsafe { self.unchecked_at_mut(i) }) {
+                i += 1;
+            } else {
+                self.remove(i);
+            }
+        }
+    }
+
+    /// Removes consecutive duplicate elements.
+    ///
+    /// If the vector is sorted, this removes all duplicates.
+    pub fn dedup(&mut self)
+    where
+        T: PartialEq,
+    {
+        self.dedup_by(|a, b| a == b);
+    }
+
+    /// Removes consecutive elements that satisfy the given equality relation.
+    pub fn dedup_by<F>(&mut self, mut same_bucket: F)
+    where
+        F: FnMut(&mut T, &mut T) -> bool,
+    {
+        if self.len <= 1 {
+            return;
+        }
+        let mut write = 1;
+        for read in 1..self.len {
+            let should_keep = unsafe {
+                let prev_ptr = self.unchecked_at_mut(write - 1) as *mut T;
+                let curr_ptr = self.unchecked_at_mut(read) as *mut T;
+                !same_bucket(&mut *prev_ptr, &mut *curr_ptr)
+            };
+            if should_keep {
+                if read != write {
+                    unsafe {
+                        let ptr_src = self.unchecked_at_mut(read) as *mut T;
+                        let ptr_dst = self.unchecked_at_mut(write) as *mut T;
+                        std::ptr::swap(ptr_dst, ptr_src);
+                    }
+                }
+                write += 1;
+            } else {
+                // Drop the duplicate
+                unsafe {
+                    std::ptr::drop_in_place(self.unchecked_at_mut(read));
+                }
+            }
+        }
+        self.len = write;
+    }
+
+    /// Removes consecutive elements that map to the same key.
+    pub fn dedup_by_key<K, F>(&mut self, mut key: F)
+    where
+        F: FnMut(&mut T) -> K,
+        K: PartialEq,
+    {
+        self.dedup_by(|a, b| key(a) == key(b));
+    }
+
+    /// Resizes the vector in-place so that `len` is equal to `new_len`.
+    ///
+    /// If `new_len` is greater than `len`, the vector is extended by the difference,
+    /// with each additional slot filled with `value`.
+    /// If `new_len` is less than `len`, the vector is simply truncated.
+    pub fn resize(&mut self, new_len: usize, value: T)
+    where
+        T: Clone,
+    {
+        if new_len > self.len {
+            self.reserve(new_len - self.len);
+            while self.len < new_len {
+                self.push(value.clone());
+            }
+        } else {
+            self.truncate(new_len);
+        }
+    }
+
+    /// Resizes the vector in-place so that `len` is equal to `new_len`.
+    ///
+    /// If `new_len` is greater than `len`, the vector is extended by the difference,
+    /// with each additional slot filled with the result of calling the closure `f`.
+    pub fn resize_with<F>(&mut self, new_len: usize, mut f: F)
+    where
+        F: FnMut() -> T,
+    {
+        if new_len > self.len {
+            self.reserve(new_len - self.len);
+            while self.len < new_len {
+                self.push(f());
+            }
+        } else {
+            self.truncate(new_len);
+        }
+    }
+
+    /// Moves all the elements of `other` into `self`, leaving `other` empty.
+    pub fn append(&mut self, other: &mut Self) {
+        let other_len = other.len;
+        self.reserve(other_len);
+        let start = self.len;
+        while let Some(item) = other.pop() {
+            self.push(item);
+        }
+        // Reverse the appended portion since pop() returns in reverse order
+        let mut left = start;
+        let mut right = self.len;
+        while left < right {
+            right -= 1;
+            if left < right {
+                unsafe {
+                    let ptr_a = self.unchecked_at_mut(left) as *mut T;
+                    let ptr_b = self.unchecked_at_mut(right) as *mut T;
+                    std::ptr::swap(ptr_a, ptr_b);
+                }
+                left += 1;
+            }
+        }
+    }
+
+    /// Splits the vector into two at the given index.
+    ///
+    /// Returns a newly allocated vector containing the elements in the range `[at, len)`.
+    /// After the call, the original vector will contain elements `[0, at)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `at > len`.
+    pub fn split_off(&mut self, at: usize) -> Self {
+        assert!(at <= self.len);
+        let mut other = Self::new();
+        other.reserve(self.len - at);
+        for i in at..self.len {
+            other.push(unsafe { self.unchecked_read(i) });
+        }
+        self.len = at;
+        other
+    }
+
+    /// Returns an iterator over `chunk_size` elements of the vector at a time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `chunk_size` is 0.
+    pub fn chunks(&self, chunk_size: usize) -> Chunks<'_, T, PREALLOC> {
+        self.as_slice().chunks(chunk_size)
+    }
+
+    /// Returns an iterator over all contiguous windows of length `size`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size` is 0.
+    pub fn windows(&self, size: usize) -> Windows<'_, T, PREALLOC> {
+        self.as_slice().windows(size)
+    }
+
+    /// Returns an iterator over `chunk_size` elements at a time, starting from the end.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `chunk_size` is 0.
+    pub fn rchunks(&self, chunk_size: usize) -> RChunks<'_, T, PREALLOC> {
+        self.as_slice().rchunks(chunk_size)
+    }
+
+    /// Returns an iterator over exactly `chunk_size` elements at a time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `chunk_size` is 0.
+    pub fn chunks_exact(&self, chunk_size: usize) -> ChunksExact<'_, T, PREALLOC> {
+        self.as_slice().chunks_exact(chunk_size)
+    }
+
+    /// Creates a draining iterator that removes the specified range and yields the removed items.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the starting point is greater than the end point or if the end point is greater than the length.
+    pub fn drain(&mut self, range: std::ops::Range<usize>) -> Drain<'_, T, PREALLOC> {
+        assert!(range.start <= range.end && range.end <= self.len);
+        Drain {
+            vec: self,
+            range_start: range.start,
+            range_end: range.end,
+            index: range.start,
+        }
+    }
+
+    /// Copies the elements to a new `Vec<T>`.
+    pub fn to_vec(&self) -> Vec<T>
+    where
+        T: Clone,
+    {
+        self.as_slice().to_vec()
+    }
+
     // --- Internal helper methods ---
 
     /// Calculate the number of shelves needed for a given capacity.
@@ -1115,6 +1451,74 @@ impl<T, const PREALLOC: usize> Drop for IntoIter<T, PREALLOC> {
         }
         // Prevent the Vec from dropping elements again
         self.vec.len = 0;
+    }
+}
+
+/// A draining iterator for `SegmentedVec`.
+///
+/// This struct is created by the `drain` method on `SegmentedVec`.
+pub struct Drain<'a, T, const PREALLOC: usize> {
+    vec: &'a mut SegmentedVec<T, PREALLOC>,
+    range_start: usize,
+    range_end: usize,
+    index: usize,
+}
+
+impl<'a, T, const PREALLOC: usize> Iterator for Drain<'a, T, PREALLOC> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.range_end {
+            None
+        } else {
+            let value = unsafe { std::ptr::read(self.vec.unchecked_at(self.index)) };
+            self.index += 1;
+            Some(value)
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.range_end - self.index;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<'a, T, const PREALLOC: usize> DoubleEndedIterator for Drain<'a, T, PREALLOC> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.index >= self.range_end {
+            None
+        } else {
+            self.range_end -= 1;
+            Some(unsafe { std::ptr::read(self.vec.unchecked_at(self.range_end)) })
+        }
+    }
+}
+
+impl<'a, T, const PREALLOC: usize> ExactSizeIterator for Drain<'a, T, PREALLOC> {}
+
+impl<'a, T, const PREALLOC: usize> Drop for Drain<'a, T, PREALLOC> {
+    fn drop(&mut self) {
+        // Drop any remaining elements in the range
+        for i in self.index..self.range_end {
+            unsafe {
+                std::ptr::drop_in_place(self.vec.unchecked_at_mut(i));
+            }
+        }
+
+        // Shift elements after the range to fill the gap
+        let original_range_end = self.range_end;
+        let original_len = self.vec.len;
+        let drain_count = original_range_end - self.range_start;
+
+        for i in 0..(original_len - original_range_end) {
+            unsafe {
+                let src = self.vec.unchecked_at(original_range_end + i) as *const T;
+                let dst = self.vec.unchecked_at_mut(self.range_start + i) as *mut T;
+                std::ptr::copy_nonoverlapping(src, dst, 1);
+            }
+        }
+
+        self.vec.len = original_len - drain_count;
     }
 }
 

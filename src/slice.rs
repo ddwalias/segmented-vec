@@ -243,6 +243,153 @@ impl<'a, T, const PREALLOC: usize> SegmentedSlice<'a, T, PREALLOC> {
     {
         self.iter().cloned().collect()
     }
+
+    /// Returns a reference to an element without bounds checking.
+    ///
+    /// # Safety
+    ///
+    /// Calling this method with an out-of-bounds index is undefined behavior.
+    #[inline]
+    pub unsafe fn get_unchecked(&self, index: usize) -> &T {
+        debug_assert!(index < self.len());
+        unsafe { self.vec.unchecked_at(self.start + index) }
+    }
+
+    /// Checks if the elements of this slice are sorted.
+    ///
+    /// That is, for each element `a` and its following element `b`, `a <= b` must hold.
+    pub fn is_sorted(&self) -> bool
+    where
+        T: PartialOrd,
+    {
+        self.is_sorted_by(|a, b| a <= b)
+    }
+
+    /// Checks if the elements of this slice are sorted using the given comparator function.
+    pub fn is_sorted_by<F>(&self, mut compare: F) -> bool
+    where
+        F: FnMut(&T, &T) -> bool,
+    {
+        let len = self.len();
+        if len <= 1 {
+            return true;
+        }
+        for i in 0..len - 1 {
+            let a = unsafe { self.vec.unchecked_at(self.start + i) };
+            let b = unsafe { self.vec.unchecked_at(self.start + i + 1) };
+            if !compare(a, b) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Checks if the elements of this slice are sorted using the given key extraction function.
+    pub fn is_sorted_by_key<K, F>(&self, mut f: F) -> bool
+    where
+        F: FnMut(&T) -> K,
+        K: PartialOrd,
+    {
+        self.is_sorted_by(|a, b| f(a) <= f(b))
+    }
+
+    /// Returns the index of the partition point according to the given predicate.
+    ///
+    /// The slice is assumed to be partitioned according to the given predicate.
+    /// This returns the first index where the predicate returns `false`.
+    pub fn partition_point<P>(&self, mut pred: P) -> usize
+    where
+        P: FnMut(&T) -> bool,
+    {
+        let mut left = 0;
+        let mut right = self.len();
+
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let elem = unsafe { self.vec.unchecked_at(self.start + mid) };
+            if pred(elem) {
+                left = mid + 1;
+            } else {
+                right = mid;
+            }
+        }
+        left
+    }
+
+    /// Returns an iterator over all contiguous windows of length `size`.
+    ///
+    /// The windows overlap. If the slice is shorter than `size`, the iterator returns no values.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size` is 0.
+    pub fn windows(&self, size: usize) -> Windows<'a, T, PREALLOC> {
+        assert!(size != 0);
+        Windows {
+            vec: self.vec,
+            start: self.start,
+            end: self.end,
+            size,
+        }
+    }
+
+    /// Returns an iterator over `chunk_size` elements of the slice at a time.
+    ///
+    /// The chunks are slices and do not overlap. If `chunk_size` does not divide the length
+    /// of the slice, then the last chunk will not have length `chunk_size`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `chunk_size` is 0.
+    pub fn chunks(&self, chunk_size: usize) -> Chunks<'a, T, PREALLOC> {
+        assert!(chunk_size != 0);
+        Chunks {
+            vec: self.vec,
+            start: self.start,
+            end: self.end,
+            chunk_size,
+        }
+    }
+
+    /// Returns an iterator over `chunk_size` elements of the slice at a time, starting at the end.
+    ///
+    /// The chunks are slices and do not overlap. If `chunk_size` does not divide the length
+    /// of the slice, then the last chunk will not have length `chunk_size`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `chunk_size` is 0.
+    pub fn rchunks(&self, chunk_size: usize) -> RChunks<'a, T, PREALLOC> {
+        assert!(chunk_size != 0);
+        RChunks {
+            vec: self.vec,
+            start: self.start,
+            end: self.end,
+            chunk_size,
+        }
+    }
+
+    /// Returns an iterator over `chunk_size` elements of the slice at a time.
+    ///
+    /// If `chunk_size` does not divide the length, the last up to `chunk_size-1`
+    /// elements will be omitted and can be retrieved from the `remainder` function
+    /// of the iterator.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `chunk_size` is 0.
+    pub fn chunks_exact(&self, chunk_size: usize) -> ChunksExact<'a, T, PREALLOC> {
+        assert!(chunk_size != 0);
+        let remainder_start = self.start + (self.len() / chunk_size) * chunk_size;
+        ChunksExact {
+            vec: self.vec,
+            start: self.start,
+            end: remainder_start,
+            remainder_end: self.end,
+            chunk_size,
+        }
+    }
+
 }
 
 impl<'a, T: std::fmt::Debug, const PREALLOC: usize> std::fmt::Debug for SegmentedSlice<'a, T, PREALLOC> {
@@ -610,6 +757,175 @@ impl<'a, T, const PREALLOC: usize> SegmentedSliceMut<'a, T, PREALLOC> {
             end: self.end,
         }
     }
+
+    /// Returns a reference to an element without bounds checking.
+    ///
+    /// # Safety
+    ///
+    /// Calling this method with an out-of-bounds index is undefined behavior.
+    #[inline]
+    pub unsafe fn get_unchecked(&self, index: usize) -> &T {
+        debug_assert!(index < self.len());
+        unsafe { self.vec.unchecked_at(self.start + index) }
+    }
+
+    /// Returns a mutable reference to an element without bounds checking.
+    ///
+    /// # Safety
+    ///
+    /// Calling this method with an out-of-bounds index is undefined behavior.
+    #[inline]
+    pub unsafe fn get_unchecked_mut(&mut self, index: usize) -> &mut T {
+        debug_assert!(index < self.len());
+        unsafe { self.vec.unchecked_at_mut(self.start + index) }
+    }
+
+    /// Returns `true` if `needle` is a prefix of the slice.
+    pub fn starts_with(&self, needle: &[T]) -> bool
+    where
+        T: PartialEq,
+    {
+        self.as_slice().starts_with(needle)
+    }
+
+    /// Returns `true` if `needle` is a suffix of the slice.
+    pub fn ends_with(&self, needle: &[T]) -> bool
+    where
+        T: PartialEq,
+    {
+        self.as_slice().ends_with(needle)
+    }
+
+    /// Checks if the elements of this slice are sorted.
+    pub fn is_sorted(&self) -> bool
+    where
+        T: PartialOrd,
+    {
+        self.as_slice().is_sorted()
+    }
+
+    /// Checks if the elements of this slice are sorted using the given comparator function.
+    pub fn is_sorted_by<F>(&self, compare: F) -> bool
+    where
+        F: FnMut(&T, &T) -> bool,
+    {
+        self.as_slice().is_sorted_by(compare)
+    }
+
+    /// Checks if the elements of this slice are sorted using the given key extraction function.
+    pub fn is_sorted_by_key<K, F>(&self, f: F) -> bool
+    where
+        F: FnMut(&T) -> K,
+        K: PartialOrd,
+    {
+        self.as_slice().is_sorted_by_key(f)
+    }
+
+    /// Returns the index of the partition point according to the given predicate.
+    pub fn partition_point<P>(&self, pred: P) -> usize
+    where
+        P: FnMut(&T) -> bool,
+    {
+        self.as_slice().partition_point(pred)
+    }
+
+    /// Rotates the slice in-place such that the first `mid` elements move to the end.
+    ///
+    /// After calling `rotate_left`, the element previously at index `mid` is now at index `0`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `mid > len`.
+    pub fn rotate_left(&mut self, mid: usize) {
+        assert!(mid <= self.len());
+        if mid == 0 || mid == self.len() {
+            return;
+        }
+        // Use the reversal algorithm: reverse first part, reverse second part, reverse all
+        self.reverse_range(0, mid);
+        self.reverse_range(mid, self.len());
+        self.reverse();
+    }
+
+    /// Rotates the slice in-place such that the last `k` elements move to the front.
+    ///
+    /// After calling `rotate_right`, the element previously at index `len - k` is now at index `0`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `k > len`.
+    pub fn rotate_right(&mut self, k: usize) {
+        assert!(k <= self.len());
+        if k == 0 || k == self.len() {
+            return;
+        }
+        self.rotate_left(self.len() - k);
+    }
+
+    /// Helper to reverse a range within the slice.
+    fn reverse_range(&mut self, start: usize, end: usize) {
+        let mut left = start;
+        let mut right = end;
+        while left < right {
+            right -= 1;
+            self.swap(left, right);
+            left += 1;
+        }
+    }
+
+    /// Divides one mutable slice into two at an index.
+    ///
+    /// The first will contain all indices from `[0, mid)` and the second will contain
+    /// all indices from `[mid, len)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `mid > len`.
+    ///
+    /// # Note
+    ///
+    /// Due to borrowing rules, this method consumes self and returns two new slices.
+    pub fn split_at_mut(self, mid: usize) -> (SegmentedSliceMut<'a, T, PREALLOC>, SegmentedSliceMut<'a, T, PREALLOC>) {
+        assert!(mid <= self.len());
+        let start = self.start;
+        let end = self.end;
+        // Safety: We consume self and split the range, so no aliasing occurs.
+        // We need to use raw pointers to create two mutable references.
+        let vec_ptr = self.vec as *mut SegmentedVec<T, PREALLOC>;
+        // Note: SegmentedSliceMut doesn't implement Drop, so we don't need to call forget
+        unsafe {
+            (
+                SegmentedSliceMut {
+                    vec: &mut *vec_ptr,
+                    start,
+                    end: start + mid,
+                },
+                SegmentedSliceMut {
+                    vec: &mut *vec_ptr,
+                    start: start + mid,
+                    end,
+                },
+            )
+        }
+    }
+
+    /// Returns an iterator over `chunk_size` elements of the slice at a time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `chunk_size` is 0.
+    pub fn chunks(&self, chunk_size: usize) -> Chunks<'_, T, PREALLOC> {
+        self.as_slice().chunks(chunk_size)
+    }
+
+    /// Returns an iterator over all contiguous windows of length `size`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `size` is 0.
+    pub fn windows(&self, size: usize) -> Windows<'_, T, PREALLOC> {
+        self.as_slice().windows(size)
+    }
 }
 
 impl<'a, T: std::fmt::Debug, const PREALLOC: usize> std::fmt::Debug for SegmentedSliceMut<'a, T, PREALLOC> {
@@ -789,5 +1105,278 @@ impl<'a, T: 'a, const PREALLOC: usize> SliceIndex<'a, T, PREALLOC> for RangeToIn
     fn index(self, slice: SegmentedSlice<'a, T, PREALLOC>) -> SegmentedSlice<'a, T, PREALLOC> {
         assert!(self.end < slice.len());
         SegmentedSlice::from_range(slice.vec, slice.start, slice.start + self.end + 1)
+    }
+}
+
+// --- Additional Iterators ---
+
+/// An iterator over overlapping windows of elements.
+pub struct Windows<'a, T, const PREALLOC: usize> {
+    vec: &'a SegmentedVec<T, PREALLOC>,
+    start: usize,
+    end: usize,
+    size: usize,
+}
+
+impl<'a, T, const PREALLOC: usize> Iterator for Windows<'a, T, PREALLOC> {
+    type Item = SegmentedSlice<'a, T, PREALLOC>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.start + self.size > self.end {
+            None
+        } else {
+            let slice = SegmentedSlice::from_range(self.vec, self.start, self.start + self.size);
+            self.start += 1;
+            Some(slice)
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.end.saturating_sub(self.start).saturating_sub(self.size - 1);
+        (len, Some(len))
+    }
+
+    fn count(self) -> usize {
+        self.len()
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        self.start = self.start.saturating_add(n);
+        self.next()
+    }
+}
+
+impl<'a, T, const PREALLOC: usize> DoubleEndedIterator for Windows<'a, T, PREALLOC> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.start + self.size > self.end {
+            None
+        } else {
+            self.end -= 1;
+            Some(SegmentedSlice::from_range(self.vec, self.end - self.size + 1, self.end + 1))
+        }
+    }
+}
+
+impl<'a, T, const PREALLOC: usize> ExactSizeIterator for Windows<'a, T, PREALLOC> {}
+
+impl<'a, T, const PREALLOC: usize> Clone for Windows<'a, T, PREALLOC> {
+    fn clone(&self) -> Self {
+        Windows {
+            vec: self.vec,
+            start: self.start,
+            end: self.end,
+            size: self.size,
+        }
+    }
+}
+
+/// An iterator over non-overlapping chunks of elements.
+pub struct Chunks<'a, T, const PREALLOC: usize> {
+    vec: &'a SegmentedVec<T, PREALLOC>,
+    start: usize,
+    end: usize,
+    chunk_size: usize,
+}
+
+impl<'a, T, const PREALLOC: usize> Iterator for Chunks<'a, T, PREALLOC> {
+    type Item = SegmentedSlice<'a, T, PREALLOC>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.start >= self.end {
+            None
+        } else {
+            let chunk_end = std::cmp::min(self.start + self.chunk_size, self.end);
+            let slice = SegmentedSlice::from_range(self.vec, self.start, chunk_end);
+            self.start = chunk_end;
+            Some(slice)
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.start >= self.end {
+            (0, Some(0))
+        } else {
+            let remaining = self.end - self.start;
+            let len = remaining.div_ceil(self.chunk_size);
+            (len, Some(len))
+        }
+    }
+
+    fn count(self) -> usize {
+        self.len()
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        let skip = n.saturating_mul(self.chunk_size);
+        self.start = self.start.saturating_add(skip);
+        self.next()
+    }
+}
+
+impl<'a, T, const PREALLOC: usize> DoubleEndedIterator for Chunks<'a, T, PREALLOC> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.start >= self.end {
+            None
+        } else {
+            let remaining = self.end - self.start;
+            let last_chunk_size = if remaining.is_multiple_of(self.chunk_size) {
+                self.chunk_size
+            } else {
+                remaining % self.chunk_size
+            };
+            let chunk_start = self.end - last_chunk_size;
+            let slice = SegmentedSlice::from_range(self.vec, chunk_start, self.end);
+            self.end = chunk_start;
+            Some(slice)
+        }
+    }
+}
+
+impl<'a, T, const PREALLOC: usize> ExactSizeIterator for Chunks<'a, T, PREALLOC> {}
+
+impl<'a, T, const PREALLOC: usize> Clone for Chunks<'a, T, PREALLOC> {
+    fn clone(&self) -> Self {
+        Chunks {
+            vec: self.vec,
+            start: self.start,
+            end: self.end,
+            chunk_size: self.chunk_size,
+        }
+    }
+}
+
+/// An iterator over non-overlapping chunks of elements, starting from the end.
+pub struct RChunks<'a, T, const PREALLOC: usize> {
+    vec: &'a SegmentedVec<T, PREALLOC>,
+    start: usize,
+    end: usize,
+    chunk_size: usize,
+}
+
+impl<'a, T, const PREALLOC: usize> Iterator for RChunks<'a, T, PREALLOC> {
+    type Item = SegmentedSlice<'a, T, PREALLOC>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.start >= self.end {
+            None
+        } else {
+            let remaining = self.end - self.start;
+            let chunk_size = std::cmp::min(self.chunk_size, remaining);
+            let chunk_start = self.end - chunk_size;
+            let slice = SegmentedSlice::from_range(self.vec, chunk_start, self.end);
+            self.end = chunk_start;
+            Some(slice)
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.start >= self.end {
+            (0, Some(0))
+        } else {
+            let remaining = self.end - self.start;
+            let len = remaining.div_ceil(self.chunk_size);
+            (len, Some(len))
+        }
+    }
+
+    fn count(self) -> usize {
+        self.len()
+    }
+}
+
+impl<'a, T, const PREALLOC: usize> DoubleEndedIterator for RChunks<'a, T, PREALLOC> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.start >= self.end {
+            None
+        } else {
+            let chunk_end = std::cmp::min(self.start + self.chunk_size, self.end);
+            let slice = SegmentedSlice::from_range(self.vec, self.start, chunk_end);
+            self.start = chunk_end;
+            Some(slice)
+        }
+    }
+}
+
+impl<'a, T, const PREALLOC: usize> ExactSizeIterator for RChunks<'a, T, PREALLOC> {}
+
+impl<'a, T, const PREALLOC: usize> Clone for RChunks<'a, T, PREALLOC> {
+    fn clone(&self) -> Self {
+        RChunks {
+            vec: self.vec,
+            start: self.start,
+            end: self.end,
+            chunk_size: self.chunk_size,
+        }
+    }
+}
+
+/// An iterator over exact-size chunks of elements.
+pub struct ChunksExact<'a, T, const PREALLOC: usize> {
+    vec: &'a SegmentedVec<T, PREALLOC>,
+    start: usize,
+    end: usize,
+    remainder_end: usize,
+    chunk_size: usize,
+}
+
+impl<'a, T, const PREALLOC: usize> ChunksExact<'a, T, PREALLOC> {
+    /// Returns the remainder of the original slice that was not consumed.
+    pub fn remainder(&self) -> SegmentedSlice<'a, T, PREALLOC> {
+        SegmentedSlice::from_range(self.vec, self.end, self.remainder_end)
+    }
+}
+
+impl<'a, T, const PREALLOC: usize> Iterator for ChunksExact<'a, T, PREALLOC> {
+    type Item = SegmentedSlice<'a, T, PREALLOC>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.start + self.chunk_size > self.end {
+            None
+        } else {
+            let slice = SegmentedSlice::from_range(self.vec, self.start, self.start + self.chunk_size);
+            self.start += self.chunk_size;
+            Some(slice)
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.end.saturating_sub(self.start);
+        let len = remaining / self.chunk_size;
+        (len, Some(len))
+    }
+
+    fn count(self) -> usize {
+        self.len()
+    }
+
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        let skip = n.saturating_mul(self.chunk_size);
+        self.start = self.start.saturating_add(skip);
+        self.next()
+    }
+}
+
+impl<'a, T, const PREALLOC: usize> DoubleEndedIterator for ChunksExact<'a, T, PREALLOC> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.start + self.chunk_size > self.end {
+            None
+        } else {
+            self.end -= self.chunk_size;
+            Some(SegmentedSlice::from_range(self.vec, self.end, self.end + self.chunk_size))
+        }
+    }
+}
+
+impl<'a, T, const PREALLOC: usize> ExactSizeIterator for ChunksExact<'a, T, PREALLOC> {}
+
+impl<'a, T, const PREALLOC: usize> Clone for ChunksExact<'a, T, PREALLOC> {
+    fn clone(&self) -> Self {
+        ChunksExact {
+            vec: self.vec,
+            start: self.start,
+            end: self.end,
+            remainder_end: self.remainder_end,
+            chunk_size: self.chunk_size,
+        }
     }
 }
