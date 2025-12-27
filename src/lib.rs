@@ -162,10 +162,10 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
     /// Returns `None` if the index is out of bounds.
     #[inline]
     pub fn get(&self, index: usize) -> Option<&T> {
-        if index >= self.len {
-            None
-        } else {
+        if index < self.len {
             Some(unsafe { self.unchecked_at(index) })
+        } else {
+            None
         }
     }
 
@@ -174,10 +174,10 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
     /// Returns `None` if the index is out of bounds.
     #[inline]
     pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
-        if index >= self.len {
-            None
-        } else {
+        if index < self.len {
             Some(unsafe { self.unchecked_at_mut(index) })
+        } else {
+            None
         }
     }
 
@@ -211,6 +211,90 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
         } else {
             self.get_mut(self.len - 1)
         }
+    }
+
+    /// Returns `true` if the slice contains an element with the given value.
+    #[inline]
+    pub fn contains(&self, x: &T) -> bool
+    where
+        T: PartialEq,
+    {
+        self.as_slice().contains(x)
+    }
+
+    /// Returns `true` if `needle` is a prefix of the vector.
+    pub fn starts_with(&self, needle: &[T]) -> bool
+    where
+        T: PartialEq,
+    {
+        self.as_slice().starts_with(needle)
+    }
+
+    /// Returns `true` if `needle` is a suffix of the vector.
+    pub fn ends_with(&self, needle: &[T]) -> bool
+    where
+        T: PartialEq,
+    {
+        self.as_slice().ends_with(needle)
+    }
+
+    /// Binary searches this vector for a given element.
+    ///
+    /// If the value is found, returns `Ok(index)`. If not found, returns
+    /// `Err(index)` where `index` is the position where the element could be inserted.
+    pub fn binary_search(&self, x: &T) -> Result<usize, usize>
+    where
+        T: Ord,
+    {
+        self.as_slice().binary_search(x)
+    }
+
+    /// Binary searches this vector with a comparator function.
+    pub fn binary_search_by<F>(&self, f: F) -> Result<usize, usize>
+    where
+        F: FnMut(&T) -> Ordering,
+    {
+        self.as_slice().binary_search_by(f)
+    }
+
+    /// Binary searches this vector with a key extraction function.
+    pub fn binary_search_by_key<B, F>(&self, b: &B, f: F) -> Result<usize, usize>
+    where
+        F: FnMut(&T) -> B,
+        B: Ord,
+    {
+        self.as_slice().binary_search_by_key(b, f)
+    }
+
+    /// Swaps two elements in the vector.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `a` or `b` are out of bounds.
+    #[inline]
+    pub fn swap(&mut self, a: usize, b: usize) {
+        self.as_mut_slice().swap(a, b)
+    }
+
+    /// Reverses the order of elements in the vector.
+    pub fn reverse(&mut self) {
+        self.as_mut_slice().reverse()
+    }
+
+    /// Fills the vector with the given value.
+    pub fn fill(&mut self, value: T)
+    where
+        T: Clone,
+    {
+        self.as_mut_slice().fill(value)
+    }
+
+    /// Fills the vector with values produced by a function.
+    pub fn fill_with<F>(&mut self, f: F)
+    where
+        F: FnMut() -> T,
+    {
+        self.as_mut_slice().fill_with(f)
     }
 
     /// Clears the vector, removing all elements.
@@ -295,8 +379,6 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
     #[inline]
     pub fn as_slice(&self) -> SegmentedSlice<'_, T, PREALLOC> {
         SegmentedSlice::new(self)
-        let a = Vec::new();
-        a.sort();
     }
 
     /// Returns a mutable slice view of the entire vector.
@@ -401,7 +483,7 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
     where
         T: Ord,
     {
-        self.sort_by(|a, b| a.cmp(b));
+        self.as_mut_slice().sort();
     }
 
     /// Sorts the vector in place with a comparator function.
@@ -420,16 +502,11 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
     /// vec.sort_by(|a, b| b.cmp(a)); // reverse order
     /// assert_eq!(vec.iter().copied().collect::<Vec<_>>(), vec![9, 6, 5, 4, 3, 2, 1, 1]);
     /// ```
-    pub fn sort_by<F>(&mut self, mut compare: F)
+    pub fn sort_by<F>(&mut self, compare: F)
     where
         F: FnMut(&T, &T) -> Ordering,
     {
-        if self.len <= 1 {
-            return;
-        }
-        let len = self.len;
-        let mut is_less = |a: &T, b: &T| compare(a, b) == Ordering::Less;
-        sort::merge_sort(self, 0, len, &mut is_less);
+        self.as_mut_slice().sort_by(compare);
     }
 
     /// Sorts the vector in place with a key extraction function.
@@ -448,12 +525,12 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
     /// assert_eq!(vec.iter().copied().collect::<Vec<_>>(), vec![1, 1, 2, -3, -4, 5, 6, -9]);
     /// ```
     #[inline]
-    pub fn sort_by_key<K, F>(&mut self, mut f: F)
+    pub fn sort_by_key<K, F>(&mut self, f: F)
     where
         F: FnMut(&T) -> K,
         K: Ord,
     {
-        self.sort_by(|a, b| f(a).cmp(&f(b)));
+        self.as_mut_slice().sort_by_key(f);
     }
 
     /// Sorts the vector in place using an unstable sorting algorithm.
@@ -477,7 +554,7 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
     where
         T: Ord,
     {
-        self.sort_unstable_by(|a, b| a.cmp(b));
+        self.as_mut_slice().sort_unstable();
     }
 
     /// Sorts the vector in place with a comparator function using an unstable sorting algorithm.
@@ -496,16 +573,11 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
     /// vec.sort_unstable_by(|a, b| b.cmp(a)); // reverse order
     /// assert_eq!(vec.iter().copied().collect::<Vec<_>>(), vec![9, 6, 5, 4, 3, 2, 1, 1]);
     /// ```
-    pub fn sort_unstable_by<F>(&mut self, mut compare: F)
+    pub fn sort_unstable_by<F>(&mut self, compare: F)
     where
         F: FnMut(&T, &T) -> Ordering,
     {
-        if self.len <= 1 {
-            return;
-        }
-        let len = self.len;
-        let mut is_less = |a: &T, b: &T| compare(a, b) == Ordering::Less;
-        sort::quicksort(self, 0, len, &mut is_less);
+        self.as_mut_slice().sort_unstable_by(compare);
     }
 
     /// Sorts the vector in place with a key extraction function using an unstable sorting algorithm.
@@ -528,12 +600,12 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
     /// }
     /// ```
     #[inline]
-    pub fn sort_unstable_by_key<K, F>(&mut self, mut f: F)
+    pub fn sort_unstable_by_key<K, F>(&mut self, f: F)
     where
         F: FnMut(&T) -> K,
         K: Ord,
     {
-        self.sort_unstable_by(|a, b| f(a).cmp(&f(b)));
+        self.as_mut_slice().sort_unstable_by_key(f);
     }
 
     // --- Internal helper methods ---
