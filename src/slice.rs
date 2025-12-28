@@ -29,7 +29,7 @@ use crate::SegmentedVec;
 pub struct SegmentedSlice<'a, T, const PREALLOC: usize> {
     vec: &'a SegmentedVec<T, PREALLOC>,
     start: usize,
-    end: usize,
+    len: usize,
 }
 
 impl<'a, T, const PREALLOC: usize> SegmentedSlice<'a, T, PREALLOC> {
@@ -39,7 +39,7 @@ impl<'a, T, const PREALLOC: usize> SegmentedSlice<'a, T, PREALLOC> {
         Self {
             vec,
             start: 0,
-            end: vec.len(),
+            len: vec.len(),
         }
     }
 
@@ -47,19 +47,19 @@ impl<'a, T, const PREALLOC: usize> SegmentedSlice<'a, T, PREALLOC> {
     #[inline]
     pub(crate) fn from_range(vec: &'a SegmentedVec<T, PREALLOC>, start: usize, end: usize) -> Self {
         debug_assert!(start <= end && end <= vec.len());
-        Self { vec, start, end }
+        Self { vec, start, len: end - start }
     }
 
     /// Returns the number of elements in the slice.
     #[inline]
     pub const fn len(&self) -> usize {
-        self.end - self.start
+        self.len
     }
 
     /// Returns `true` if the slice is empty.
     #[inline]
     pub const fn is_empty(&self) -> bool {
-        self.start == self.end
+        self.len == 0
     }
 
     /// Returns a reference to the element at the given index, or `None` if out of bounds.
@@ -96,7 +96,7 @@ impl<'a, T, const PREALLOC: usize> SegmentedSlice<'a, T, PREALLOC> {
         } else {
             Some((
                 unsafe { self.vec.unchecked_at(self.start) },
-                SegmentedSlice::from_range(self.vec, self.start + 1, self.end),
+                SegmentedSlice::from_range(self.vec, self.start + 1, self.start + self.len),
             ))
         }
     }
@@ -107,9 +107,10 @@ impl<'a, T, const PREALLOC: usize> SegmentedSlice<'a, T, PREALLOC> {
         if self.is_empty() {
             None
         } else {
+            let end = self.start + self.len;
             Some((
-                unsafe { self.vec.unchecked_at(self.end - 1) },
-                SegmentedSlice::from_range(self.vec, self.start, self.end - 1),
+                unsafe { self.vec.unchecked_at(end - 1) },
+                SegmentedSlice::from_range(self.vec, self.start, end - 1),
             ))
         }
     }
@@ -127,7 +128,7 @@ impl<'a, T, const PREALLOC: usize> SegmentedSlice<'a, T, PREALLOC> {
         assert!(mid <= self.len());
         (
             SegmentedSlice::from_range(self.vec, self.start, self.start + mid),
-            SegmentedSlice::from_range(self.vec, self.start + mid, self.end),
+            SegmentedSlice::from_range(self.vec, self.start + mid, self.start + self.len),
         )
     }
 
@@ -137,7 +138,7 @@ impl<'a, T, const PREALLOC: usize> SegmentedSlice<'a, T, PREALLOC> {
         SliceIter {
             vec: self.vec,
             start: self.start,
-            end: self.end,
+            end: self.start + self.len,
         }
     }
 
@@ -328,7 +329,7 @@ impl<'a, T, const PREALLOC: usize> SegmentedSlice<'a, T, PREALLOC> {
         Windows {
             vec: self.vec,
             start: self.start,
-            end: self.end,
+            end: self.start + self.len,
             size,
         }
     }
@@ -346,7 +347,7 @@ impl<'a, T, const PREALLOC: usize> SegmentedSlice<'a, T, PREALLOC> {
         Chunks {
             vec: self.vec,
             start: self.start,
-            end: self.end,
+            end: self.start + self.len,
             chunk_size,
         }
     }
@@ -364,7 +365,7 @@ impl<'a, T, const PREALLOC: usize> SegmentedSlice<'a, T, PREALLOC> {
         RChunks {
             vec: self.vec,
             start: self.start,
-            end: self.end,
+            end: self.start + self.len,
             chunk_size,
         }
     }
@@ -380,12 +381,13 @@ impl<'a, T, const PREALLOC: usize> SegmentedSlice<'a, T, PREALLOC> {
     /// Panics if `chunk_size` is 0.
     pub fn chunks_exact(&self, chunk_size: usize) -> ChunksExact<'a, T, PREALLOC> {
         assert!(chunk_size != 0);
-        let remainder_start = self.start + (self.len() / chunk_size) * chunk_size;
+        let end = self.start + self.len;
+        let remainder_start = self.start + (self.len / chunk_size) * chunk_size;
         ChunksExact {
             vec: self.vec,
             start: self.start,
             end: remainder_start,
-            remainder_end: self.end,
+            remainder_end: end,
             chunk_size,
         }
     }
@@ -471,34 +473,34 @@ impl<'a, T, const PREALLOC: usize> IntoIterator for &SegmentedSlice<'a, T, PREAL
 pub struct SegmentedSliceMut<'a, T, const PREALLOC: usize> {
     vec: &'a mut SegmentedVec<T, PREALLOC>,
     start: usize,
-    end: usize,
+    len: usize,
 }
 
 impl<'a, T, const PREALLOC: usize> SegmentedSliceMut<'a, T, PREALLOC> {
     /// Creates a new mutable slice covering the entire vector.
     #[inline]
     pub(crate) fn new(vec: &'a mut SegmentedVec<T, PREALLOC>) -> Self {
-        let end = vec.len();
-        Self { vec, start: 0, end }
+        let len = vec.len();
+        Self { vec, start: 0, len }
     }
 
     /// Creates a new mutable slice covering a range of the vector.
     #[inline]
     pub(crate) fn from_range(vec: &'a mut SegmentedVec<T, PREALLOC>, start: usize, end: usize) -> Self {
         debug_assert!(start <= end && end <= vec.len());
-        Self { vec, start, end }
+        Self { vec, start, len: end - start }
     }
 
     /// Returns the number of elements in the slice.
     #[inline]
     pub const fn len(&self) -> usize {
-        self.end - self.start
+        self.len
     }
 
     /// Returns `true` if the slice is empty.
     #[inline]
     pub const fn is_empty(&self) -> bool {
-        self.start == self.end
+        self.len == 0
     }
 
     /// Returns a reference to the element at the given index, or `None` if out of bounds.
@@ -585,7 +587,7 @@ impl<'a, T, const PREALLOC: usize> SegmentedSliceMut<'a, T, PREALLOC> {
         SliceIter {
             vec: self.vec,
             start: self.start,
-            end: self.end,
+            end: self.start + self.len,
         }
     }
 
@@ -594,7 +596,7 @@ impl<'a, T, const PREALLOC: usize> SegmentedSliceMut<'a, T, PREALLOC> {
     pub fn iter_mut(&mut self) -> SliceIterMut<'_, T, PREALLOC> {
         SliceIterMut {
             vec: self.vec,
-            end: self.end,
+            end: self.start + self.len,
             index: self.start,
         }
     }
@@ -699,7 +701,7 @@ impl<'a, T, const PREALLOC: usize> SegmentedSliceMut<'a, T, PREALLOC> {
             return;
         }
         let mut is_less = |a: &T, b: &T| compare(a, b) == Ordering::Less;
-        crate::sort::merge_sort(self.vec, self.start, self.end, &mut is_less);
+        crate::sort::merge_sort(self.vec, self.start, self.start + self.len, &mut is_less);
     }
 
     /// Sorts the slice with a key extraction function.
@@ -728,7 +730,7 @@ impl<'a, T, const PREALLOC: usize> SegmentedSliceMut<'a, T, PREALLOC> {
             return;
         }
         let mut is_less = |a: &T, b: &T| compare(a, b) == Ordering::Less;
-        crate::sort::quicksort(self.vec, self.start, self.end, &mut is_less);
+        crate::sort::quicksort(self.vec, self.start, self.start + self.len, &mut is_less);
     }
 
     /// Sorts the slice with a key extraction function using an unstable algorithm.
@@ -754,7 +756,7 @@ impl<'a, T, const PREALLOC: usize> SegmentedSliceMut<'a, T, PREALLOC> {
         SegmentedSlice {
             vec: self.vec,
             start: self.start,
-            end: self.end,
+            len: self.len,
         }
     }
 
@@ -888,7 +890,7 @@ impl<'a, T, const PREALLOC: usize> SegmentedSliceMut<'a, T, PREALLOC> {
     pub fn split_at_mut(self, mid: usize) -> (SegmentedSliceMut<'a, T, PREALLOC>, SegmentedSliceMut<'a, T, PREALLOC>) {
         assert!(mid <= self.len());
         let start = self.start;
-        let end = self.end;
+        let len = self.len;
         // Safety: We consume self and split the range, so no aliasing occurs.
         // We need to use raw pointers to create two mutable references.
         let vec_ptr = self.vec as *mut SegmentedVec<T, PREALLOC>;
@@ -898,12 +900,12 @@ impl<'a, T, const PREALLOC: usize> SegmentedSliceMut<'a, T, PREALLOC> {
                 SegmentedSliceMut {
                     vec: &mut *vec_ptr,
                     start,
-                    end: start + mid,
+                    len: mid,
                 },
                 SegmentedSliceMut {
                     vec: &mut *vec_ptr,
                     start: start + mid,
-                    end,
+                    len: len - mid,
                 },
             )
         }
@@ -1067,7 +1069,7 @@ impl<'a, T: 'a, const PREALLOC: usize> SliceIndex<'a, T, PREALLOC> for RangeFrom
 
     fn index(self, slice: SegmentedSlice<'a, T, PREALLOC>) -> SegmentedSlice<'a, T, PREALLOC> {
         assert!(self.start <= slice.len());
-        SegmentedSlice::from_range(slice.vec, slice.start + self.start, slice.end)
+        SegmentedSlice::from_range(slice.vec, slice.start + self.start, slice.start + slice.len)
     }
 }
 
