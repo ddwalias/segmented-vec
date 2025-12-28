@@ -20,8 +20,8 @@ categories = ["data-structures", "no-std"]
 [dependencies]
 
 [dev-dependencies]
-criterion = "0.5"
-rand = "0.8"
+criterion = "0.8.1"
+rand = "0.9.2"
 
 [[bench]]
 name = "comparison"
