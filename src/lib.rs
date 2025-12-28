@@ -413,12 +413,34 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
     ///
     /// This does not deallocate the dynamic segments.
     pub fn clear(&mut self) {
-        // Drop all elements
-        for i in 0..self.len {
-            unsafe {
-                std::ptr::drop_in_place(self.unchecked_at_mut(i));
+        if self.len == 0 {
+            return;
+        }
+
+        if std::mem::needs_drop::<T>() {
+            // Drop elements in prealloc segment
+            if PREALLOC > 0 {
+                let count = self.len.min(PREALLOC);
+                let ptr = unsafe { (*self.prealloc_segment.as_mut_ptr()).as_mut_ptr() };
+                unsafe { std::ptr::drop_in_place(std::slice::from_raw_parts_mut(ptr, count)) };
+            }
+
+            // Drop elements in dynamic segments
+            if self.len > PREALLOC {
+                let mut remaining = self.len - PREALLOC;
+                for shelf in 0..self.dynamic_segments.len() {
+                    let size = Self::shelf_size(shelf as u32);
+                    let count = remaining.min(size);
+                    let ptr = unsafe { self.dynamic_segments.get_unchecked(shelf).as_ptr() };
+                    unsafe { std::ptr::drop_in_place(std::slice::from_raw_parts_mut(ptr, count)) };
+                    remaining -= count;
+                    if remaining == 0 {
+                        break;
+                    }
+                }
             }
         }
+
         self.len = 0;
         // Reset write pointer cache
         if PREALLOC > 0 {
@@ -437,15 +459,60 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
         if new_len >= self.len {
             return;
         }
-        // Drop elements beyond new_len
-        for i in new_len..self.len {
-            unsafe {
-                std::ptr::drop_in_place(self.unchecked_at_mut(i));
+
+        if std::mem::needs_drop::<T>() {
+            // Drop elements in prealloc segment (from new_len to min(self.len, PREALLOC))
+            if PREALLOC > 0 && new_len < PREALLOC {
+                let start = new_len;
+                let end = self.len.min(PREALLOC);
+                if start < end {
+                    let ptr = unsafe { (*self.prealloc_segment.as_mut_ptr()).as_mut_ptr().add(start) };
+                    unsafe { std::ptr::drop_in_place(std::slice::from_raw_parts_mut(ptr, end - start)) };
+                }
+            }
+
+            // Drop elements in dynamic segments
+            if self.len > PREALLOC {
+                let dynamic_new_len = new_len.saturating_sub(PREALLOC);
+                let dynamic_old_len = self.len - PREALLOC;
+
+                if dynamic_new_len < dynamic_old_len {
+                    let mut pos = 0usize;
+                    for shelf in 0..self.dynamic_segments.len() {
+                        let size = Self::shelf_size(shelf as u32);
+                        let seg_end = pos + size;
+
+                        // Calculate overlap with [dynamic_new_len, dynamic_old_len)
+                        let drop_start = dynamic_new_len.max(pos);
+                        let drop_end = dynamic_old_len.min(seg_end);
+
+                        if drop_start < drop_end {
+                            let offset = drop_start - pos;
+                            let count = drop_end - drop_start;
+                            let ptr = unsafe { self.dynamic_segments.get_unchecked(shelf).as_ptr().add(offset) };
+                            unsafe { std::ptr::drop_in_place(std::slice::from_raw_parts_mut(ptr, count)) };
+                        }
+
+                        pos = seg_end;
+                        if pos >= dynamic_old_len {
+                            break;
+                        }
+                    }
+                }
             }
         }
+
         self.len = new_len;
         // Update write pointer cache
-        self.init_write_ptr();
+        if new_len > 0 {
+            self.init_write_ptr();
+        } else if PREALLOC > 0 {
+            self.write_ptr = unsafe { (*self.prealloc_segment.as_mut_ptr()).as_mut_ptr() };
+            self.segment_remaining = PREALLOC;
+        } else {
+            self.write_ptr = std::ptr::null_mut();
+            self.segment_remaining = 0;
+        }
     }
 
     /// Reserves capacity for at least `additional` more elements.
@@ -605,6 +672,8 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
                 unsafe { std::ptr::write(dest.add(i), src[i].clone()) };
             }
             self.len += to_copy;
+            self.write_ptr = unsafe { dest.add(to_copy) };
+            self.segment_remaining = prealloc_remaining - to_copy;
             src = &src[to_copy..];
         }
 
@@ -622,12 +691,9 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
                 unsafe { std::ptr::write(dest.add(i), src[i].clone()) };
             }
             self.len += to_copy;
+            self.segment_remaining -= to_copy;
             src = &src[to_copy..];
         }
-
-        // Reset write_ptr - will be lazily initialized on next push
-        self.write_ptr = std::ptr::null_mut();
-        self.segment_remaining = 0;
     }
 
     /// Extends the vector by copying elements from a slice (for `Copy` types).
@@ -649,13 +715,15 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
         if PREALLOC > 0 && self.len < PREALLOC {
             let prealloc_remaining = PREALLOC - self.len;
             let to_copy = src.len().min(prealloc_remaining);
-            let dest = unsafe {
-                (*self.prealloc_segment.as_mut_ptr())
+            unsafe {
+                let dest = (*self.prealloc_segment.as_mut_ptr())
                     .as_mut_ptr()
-                    .add(self.len)
+                    .add(self.len);
+                std::ptr::copy_nonoverlapping(src.as_ptr(), dest, to_copy);
+                self.write_ptr = dest.add(to_copy);
             };
-            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dest, to_copy) };
             self.len += to_copy;
+            self.segment_remaining = prealloc_remaining - to_copy;
             src = &src[to_copy..];
         }
 
@@ -663,20 +731,21 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
         while !src.is_empty() {
             let (shelf, box_idx, remaining) = Self::location_with_capacity(self.len);
             let to_copy = src.len().min(remaining);
-            let dest = unsafe {
-                self.dynamic_segments
+            self.segment_remaining = remaining;
+            unsafe {
+                let dest = self
+                    .dynamic_segments
                     .get_unchecked(shelf)
                     .as_ptr()
-                    .add(box_idx)
+                    .add(box_idx);
+                std::ptr::copy_nonoverlapping(src.as_ptr(), dest, to_copy);
+                self.write_ptr = self.write_ptr.add(to_copy);
             };
-            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dest, to_copy) };
+
             self.len += to_copy;
+            self.segment_remaining -= to_copy;
             src = &src[to_copy..];
         }
-
-        // Reset write_ptr - will be lazily initialized on next push
-        self.write_ptr = std::ptr::null_mut();
-        self.segment_remaining = 0;
     }
 
     /// Sorts the vector in place using a stable sorting algorithm.
@@ -1436,11 +1505,51 @@ impl<T, const PREALLOC: usize> IndexMut<usize> for SegmentedVec<T, PREALLOC> {
 
 impl<T: Clone, const PREALLOC: usize> Clone for SegmentedVec<T, PREALLOC> {
     fn clone(&self) -> Self {
+        if self.len == 0 {
+            return Self::new();
+        }
+
         let mut new_vec = Self::new();
         new_vec.reserve(self.len);
-        for i in 0..self.len {
-            new_vec.push(unsafe { self.unchecked_at(i) }.clone());
+
+        // Clone prealloc segment
+        if PREALLOC > 0 {
+            let count = self.len.min(PREALLOC);
+            let src = unsafe { (*self.prealloc_segment.as_ptr()).as_ptr() };
+            let dst = unsafe { (*new_vec.prealloc_segment.as_mut_ptr()).as_mut_ptr() };
+            for i in 0..count {
+                unsafe { std::ptr::write(dst.add(i), (*src.add(i)).clone()) };
+            }
+            new_vec.len = count;
         }
+
+        // Clone dynamic segments
+        if self.len > PREALLOC {
+            let mut remaining = self.len - PREALLOC;
+            for shelf in 0..self.dynamic_segments.len() {
+                let size = Self::shelf_size(shelf as u32);
+                let count = remaining.min(size);
+                let src = unsafe { self.dynamic_segments.get_unchecked(shelf).as_ptr() };
+                let dst = unsafe { new_vec.dynamic_segments.get_unchecked(shelf).as_ptr() };
+                for i in 0..count {
+                    unsafe { std::ptr::write(dst.add(i), (*src.add(i)).clone()) };
+                }
+                new_vec.len += count;
+                remaining -= count;
+                if remaining == 0 {
+                    break;
+                }
+            }
+        }
+
+        // Set up write pointer
+        if new_vec.len < new_vec.capacity() {
+            new_vec.init_write_ptr();
+        } else {
+            new_vec.write_ptr = std::ptr::null_mut();
+            new_vec.segment_remaining = 0;
+        }
+
         new_vec
     }
 }
@@ -2449,5 +2558,25 @@ mod tests {
         let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
         vec.extend_from_copy_slice(&[]);
         assert!(vec.is_empty());
+
+        // Test extend to non-boundary, then push (regression test)
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.extend_from_copy_slice(&[1, 2, 3]); // 3 elements, not at boundary
+        assert_eq!(vec.len(), 3);
+        vec.push(4); // Should use fast path, not crash in push_slow
+        vec.push(5);
+        vec.push(6);
+        assert_eq!(vec.len(), 6);
+        for i in 0..6 {
+            assert_eq!(vec[i], (i + 1) as i32);
+        }
+
+        // Test extend to exact capacity boundary, then push
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.extend_from_copy_slice(&[1, 2, 3, 4]); // Fills prealloc exactly
+        assert_eq!(vec.len(), 4);
+        vec.push(5); // Should correctly allocate new segment
+        assert_eq!(vec.len(), 5);
+        assert_eq!(vec[4], 5);
     }
 }
