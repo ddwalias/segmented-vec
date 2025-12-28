@@ -47,6 +47,10 @@ pub struct SegmentedVec<T, const PREALLOC: usize = 0> {
     prealloc_segment: MaybeUninit<[T; PREALLOC]>,
     dynamic_segments: Vec<NonNull<T>>,
     len: usize,
+    /// Cached pointer to the next write position (for fast push)
+    write_ptr: *mut T,
+    /// Number of elements remaining in the current segment
+    segment_remaining: usize,
     _marker: PhantomData<T>,
 }
 
@@ -81,7 +85,30 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
             prealloc_segment: MaybeUninit::uninit(),
             dynamic_segments: Vec::new(),
             len: 0,
+            write_ptr: std::ptr::null_mut(),
+            segment_remaining: 0,
             _marker: PhantomData,
+        }
+    }
+
+    /// Initialize or update the write pointer cache.
+    #[inline]
+    fn init_write_ptr(&mut self) {
+        if PREALLOC > 0 && self.len < PREALLOC {
+            self.write_ptr = unsafe { (*self.prealloc_segment.as_mut_ptr()).as_mut_ptr().add(self.len) };
+            self.segment_remaining = PREALLOC - self.len;
+        } else if !self.dynamic_segments.is_empty() {
+            let shelf_index = Self::shelf_index(self.len);
+            let box_index = Self::box_index(self.len, shelf_index);
+            let shelf_size = Self::shelf_size(shelf_index);
+            self.write_ptr = unsafe { self.dynamic_segments[shelf_index as usize].as_ptr().add(box_index) };
+            self.segment_remaining = shelf_size - box_index;
+        } else if PREALLOC > 0 {
+            self.write_ptr = unsafe { (*self.prealloc_segment.as_mut_ptr()).as_mut_ptr() };
+            self.segment_remaining = PREALLOC;
+        } else {
+            self.write_ptr = std::ptr::null_mut();
+            self.segment_remaining = 0;
         }
     }
 
@@ -128,11 +155,32 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
     /// ```
     #[inline]
     pub fn push(&mut self, value: T) {
+        // Fast path: we have space in the current segment
+        if self.segment_remaining > 0 {
+            unsafe {
+                std::ptr::write(self.write_ptr, value);
+                self.write_ptr = self.write_ptr.add(1);
+            }
+            self.segment_remaining -= 1;
+            self.len += 1;
+            return;
+        }
+
+        // Slow path: need to grow or move to next segment
+        self.push_slow(value);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn push_slow(&mut self, value: T) {
         let index = self.len;
         self.grow_capacity(index + 1);
+        self.init_write_ptr();
         unsafe {
-            self.unchecked_write(index, value);
+            std::ptr::write(self.write_ptr, value);
+            self.write_ptr = self.write_ptr.add(1);
         }
+        self.segment_remaining -= 1;
         self.len = index + 1;
     }
 
@@ -154,10 +202,27 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
         if self.len == 0 {
             return None;
         }
-        let index = self.len - 1;
-        let value = unsafe { self.unchecked_read(index) };
-        self.len = index;
-        Some(value)
+        self.len -= 1;
+        // Update write pointer cache - go back one position
+        if self.segment_remaining < Self::current_segment_size(self.len) {
+            unsafe { self.write_ptr = self.write_ptr.sub(1); }
+            self.segment_remaining += 1;
+            Some(unsafe { std::ptr::read(self.write_ptr) })
+        } else {
+            // We crossed a segment boundary, recalculate
+            self.init_write_ptr();
+            Some(unsafe { self.unchecked_read(self.len) })
+        }
+    }
+
+    /// Get the size of the segment containing the given index.
+    #[inline]
+    fn current_segment_size(index: usize) -> usize {
+        if PREALLOC > 0 && index < PREALLOC {
+            PREALLOC
+        } else {
+            Self::shelf_size(Self::shelf_index(index))
+        }
     }
 
     /// Returns a reference to the element at the given index.
@@ -311,6 +376,14 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
             }
         }
         self.len = 0;
+        // Reset write pointer cache
+        if PREALLOC > 0 {
+            self.write_ptr = unsafe { (*self.prealloc_segment.as_mut_ptr()).as_mut_ptr() };
+            self.segment_remaining = PREALLOC;
+        } else {
+            self.write_ptr = std::ptr::null_mut();
+            self.segment_remaining = 0;
+        }
     }
 
     /// Shortens the vector, keeping the first `new_len` elements.
@@ -327,11 +400,18 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
             }
         }
         self.len = new_len;
+        // Update write pointer cache
+        self.init_write_ptr();
     }
 
     /// Reserves capacity for at least `additional` more elements.
     pub fn reserve(&mut self, additional: usize) {
+        let old_capacity = self.capacity();
         self.grow_capacity(self.len + additional);
+        // Initialize write pointer if we didn't have capacity before
+        if old_capacity == 0 && self.capacity() > 0 && self.segment_remaining == 0 {
+            self.init_write_ptr();
+        }
     }
 
     /// Shrinks the capacity to match the current length.
@@ -344,24 +424,26 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
     /// Returns an iterator over references to the elements.
     #[inline]
     pub fn iter(&self) -> Iter<'_, T, PREALLOC> {
+        // Initialize with null pointers - first next() call will set up the segment
         Iter {
             vec: self,
+            ptr: std::ptr::null(),
+            segment_end: std::ptr::null(),
             index: 0,
             shelf_index: 0,
-            box_index: 0,
-            shelf_size: if PREALLOC == 0 { 1 } else { PREALLOC * 2 },
         }
     }
 
     /// Returns an iterator over mutable references to the elements.
     #[inline]
     pub fn iter_mut(&mut self) -> IterMut<'_, T, PREALLOC> {
+        // Initialize with null pointers - first next() call will set up the segment
         IterMut {
             vec: self,
+            ptr: std::ptr::null_mut(),
+            segment_end: std::ptr::null_mut(),
             index: 0,
             shelf_index: 0,
-            box_index: 0,
-            shelf_size: if PREALLOC == 0 { 1 } else { PREALLOC * 2 },
         }
     }
 
@@ -1030,29 +1112,6 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
         }
     }
 
-    /// Write a value to an index without reading the old value.
-    ///
-    /// # Safety
-    ///
-    /// The capacity must be sufficient for this index.
-    #[inline]
-    unsafe fn unchecked_write(&mut self, index: usize, value: T) {
-        unsafe {
-            if index < PREALLOC {
-                std::ptr::write(&mut (*self.prealloc_segment.as_mut_ptr())[index], value);
-            } else {
-                let shelf_index = Self::shelf_index(index);
-                let box_index = Self::box_index(index, shelf_index);
-                std::ptr::write(
-                    self.dynamic_segments[shelf_index as usize]
-                        .as_ptr()
-                        .add(box_index),
-                    value,
-                );
-            }
-        }
-    }
-
     /// Read a value from an index.
     ///
     /// # Safety
@@ -1283,49 +1342,67 @@ impl<T, const PREALLOC: usize> Extend<T> for SegmentedVec<T, PREALLOC> {
 /// An iterator over references to elements of a `SegmentedVec`.
 pub struct Iter<'a, T, const PREALLOC: usize> {
     vec: &'a SegmentedVec<T, PREALLOC>,
+    /// Current pointer within segment
+    ptr: *const T,
+    /// End of current segment (min of segment capacity and vec.len)
+    segment_end: *const T,
+    /// Current logical index
     index: usize,
+    /// Current shelf index (for dynamic segments)
     shelf_index: u32,
-    box_index: usize,
-    shelf_size: usize,
 }
 
 impl<'a, T, const PREALLOC: usize> Iterator for Iter<'a, T, PREALLOC> {
     type Item = &'a T;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
+        if self.ptr < self.segment_end {
+            let result = unsafe { &*self.ptr };
+            self.ptr = unsafe { self.ptr.add(1) };
+            self.index += 1;
+            return Some(result);
+        }
+        self.next_segment()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.vec.len.saturating_sub(self.index);
+        (remaining, Some(remaining))
+    }
+}
+
+impl<'a, T, const PREALLOC: usize> Iter<'a, T, PREALLOC> {
+    #[inline]
+    fn next_segment(&mut self) -> Option<&'a T> {
         if self.index >= self.vec.len {
             return None;
         }
 
+        // Move to next segment
         if self.index < PREALLOC {
-            let ptr = unsafe { &(*self.vec.prealloc_segment.as_ptr())[self.index] };
-            self.index += 1;
-            if self.index == PREALLOC {
-                self.box_index = 0;
-                self.shelf_index = 0;
-                self.shelf_size = PREALLOC * 2;
-            }
-            return Some(ptr);
-        }
-
-        let ptr = unsafe {
-            &*self.vec.dynamic_segments[self.shelf_index as usize]
-                .as_ptr()
-                .add(self.box_index)
-        };
-        self.index += 1;
-        self.box_index += 1;
-        if self.box_index == self.shelf_size {
+            // In prealloc segment
+            let ptr = unsafe { (*self.vec.prealloc_segment.as_ptr()).as_ptr().add(self.index) };
+            let remaining = PREALLOC - self.index;
+            let segment_len = remaining.min(self.vec.len - self.index);
+            self.ptr = ptr;
+            self.segment_end = unsafe { ptr.add(segment_len) };
+        } else {
+            // In dynamic segments
+            let shelf_idx = self.shelf_index as usize;
+            let shelf_size = SegmentedVec::<T, PREALLOC>::shelf_size(self.shelf_index);
+            let ptr = self.vec.dynamic_segments[shelf_idx].as_ptr();
+            let segment_len = shelf_size.min(self.vec.len - self.index);
+            self.ptr = ptr;
+            self.segment_end = unsafe { ptr.add(segment_len) };
             self.shelf_index += 1;
-            self.box_index = 0;
-            self.shelf_size *= 2;
         }
-        Some(ptr)
-    }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.vec.len - self.index;
-        (remaining, Some(remaining))
+        let result = unsafe { &*self.ptr };
+        self.ptr = unsafe { self.ptr.add(1) };
+        self.index += 1;
+        Some(result)
     }
 }
 
@@ -1334,52 +1411,68 @@ impl<'a, T, const PREALLOC: usize> ExactSizeIterator for Iter<'a, T, PREALLOC> {
 /// An iterator over mutable references to elements of a `SegmentedVec`.
 pub struct IterMut<'a, T, const PREALLOC: usize> {
     vec: &'a mut SegmentedVec<T, PREALLOC>,
+    /// Current pointer within segment
+    ptr: *mut T,
+    /// End of current segment (min of segment capacity and vec.len)
+    segment_end: *mut T,
+    /// Current logical index
     index: usize,
+    /// Current shelf index (for dynamic segments)
     shelf_index: u32,
-    box_index: usize,
-    shelf_size: usize,
 }
 
 impl<'a, T, const PREALLOC: usize> Iterator for IterMut<'a, T, PREALLOC> {
     type Item = &'a mut T;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
+        if self.ptr < self.segment_end {
+            let result = self.ptr;
+            self.ptr = unsafe { self.ptr.add(1) };
+            self.index += 1;
+            return Some(unsafe { &mut *result });
+        }
+        self.next_segment()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.vec.len.saturating_sub(self.index);
+        (remaining, Some(remaining))
+    }
+}
+
+impl<'a, T, const PREALLOC: usize> IterMut<'a, T, PREALLOC> {
+    #[inline]
+    fn next_segment(&mut self) -> Option<&'a mut T> {
         if self.index >= self.vec.len {
             return None;
         }
 
+        // Move to next segment
         if self.index < PREALLOC {
-            // Safety: We're iterating forward only once per element
-            let ptr = unsafe { &mut (*self.vec.prealloc_segment.as_mut_ptr())[self.index] };
-            self.index += 1;
-            if self.index == PREALLOC {
-                self.box_index = 0;
-                self.shelf_index = 0;
-                self.shelf_size = PREALLOC * 2;
-            }
-            // Safety: We're extending the lifetime, but we never return the same index twice
-            return Some(unsafe { &mut *(ptr as *mut T) });
-        }
-
-        let ptr = unsafe {
-            &mut *self.vec.dynamic_segments[self.shelf_index as usize]
-                .as_ptr()
-                .add(self.box_index)
-        };
-        self.index += 1;
-        self.box_index += 1;
-        if self.box_index == self.shelf_size {
+            // In prealloc segment
+            let ptr = unsafe { (*self.vec.prealloc_segment.as_mut_ptr()).as_mut_ptr().add(self.index) };
+            let remaining = PREALLOC - self.index;
+            let segment_len = remaining.min(self.vec.len - self.index);
+            self.ptr = ptr;
+            self.segment_end = unsafe { ptr.add(segment_len) };
+        } else {
+            // In dynamic segments
+            let shelf_idx = self.shelf_index as usize;
+            let shelf_size = SegmentedVec::<T, PREALLOC>::shelf_size(self.shelf_index);
+            // as_ptr() returns *mut T since NonNull<T> stores *mut T
+            let ptr = self.vec.dynamic_segments[shelf_idx].as_ptr();
+            let segment_len = shelf_size.min(self.vec.len - self.index);
+            self.ptr = ptr;
+            self.segment_end = unsafe { ptr.add(segment_len) };
             self.shelf_index += 1;
-            self.box_index = 0;
-            self.shelf_size *= 2;
         }
-        // Safety: We're extending the lifetime, but we never return the same index twice
-        Some(unsafe { &mut *(ptr as *mut T) })
-    }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.vec.len - self.index;
-        (remaining, Some(remaining))
+        let result = self.ptr;
+        self.ptr = unsafe { self.ptr.add(1) };
+        self.index += 1;
+        Some(unsafe { &mut *result })
     }
 }
 
