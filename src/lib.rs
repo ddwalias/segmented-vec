@@ -70,6 +70,37 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
         PREALLOC.trailing_zeros()
     };
 
+    /// Minimum capacity for the first dynamic segment when PREALLOC=0.
+    /// Avoids tiny allocations that heap allocators round up anyway.
+    /// - 8 for 1-byte elements (allocators round up small requests)
+    /// - 4 for moderate elements (<= 1 KiB)
+    /// - 1 for large elements (avoid wasting space)
+    const MIN_NON_ZERO_CAP: usize = {
+        let size = std::mem::size_of::<T>();
+        if size == 1 {
+            8
+        } else if size <= 1024 {
+            4
+        } else {
+            1
+        }
+    };
+
+    const MIN_CAP_EXP: u32 = Self::MIN_NON_ZERO_CAP.trailing_zeros();
+
+    const BIAS: usize = if PREALLOC > 0 {
+        PREALLOC
+    } else {
+        Self::MIN_NON_ZERO_CAP
+    };
+
+    /// Offset to subtract from MSB to get shelf index.
+    const SHELF_OFFSET: u32 = if PREALLOC == 0 {
+        Self::MIN_CAP_EXP
+    } else {
+        Self::PREALLOC_EXP + 1
+    };
+
     /// Creates a new empty `SegmentedVec`.
     ///
     /// # Example
@@ -95,14 +126,16 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
     #[inline]
     fn init_write_ptr(&mut self) {
         if PREALLOC > 0 && self.len < PREALLOC {
-            self.write_ptr = unsafe { (*self.prealloc_segment.as_mut_ptr()).as_mut_ptr().add(self.len) };
+            self.write_ptr = unsafe {
+                (*self.prealloc_segment.as_mut_ptr())
+                    .as_mut_ptr()
+                    .add(self.len)
+            };
             self.segment_remaining = PREALLOC - self.len;
         } else if !self.dynamic_segments.is_empty() {
-            let shelf_index = Self::shelf_index(self.len);
-            let box_index = Self::box_index(self.len, shelf_index);
-            let shelf_size = Self::shelf_size(shelf_index);
-            self.write_ptr = unsafe { self.dynamic_segments[shelf_index as usize].as_ptr().add(box_index) };
-            self.segment_remaining = shelf_size - box_index;
+            let (shelf, box_idx, remaining) = Self::location_with_capacity(self.len);
+            self.write_ptr = unsafe { self.dynamic_segments[shelf].as_ptr().add(box_idx) };
+            self.segment_remaining = remaining;
         } else if PREALLOC > 0 {
             self.write_ptr = unsafe { (*self.prealloc_segment.as_mut_ptr()).as_mut_ptr() };
             self.segment_remaining = PREALLOC;
@@ -125,17 +158,9 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
     }
 
     /// Returns the current capacity of the vector.
+    #[inline]
     pub fn capacity(&self) -> usize {
-        if self.dynamic_segments.is_empty() {
-            PREALLOC
-        } else {
-            let shelf_count = self.dynamic_segments.len() as u32;
-            if PREALLOC == 0 {
-                (1usize << shelf_count) - 1
-            } else {
-                (1usize << (Self::PREALLOC_EXP + 1 + shelf_count)) - PREALLOC
-            }
-        }
+        Self::compute_capacity(self.dynamic_segments.len() as u32)
     }
 
     /// Appends an element to the back of the vector.
@@ -173,15 +198,35 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
     #[cold]
     #[inline(never)]
     fn push_slow(&mut self, value: T) {
-        let index = self.len;
-        self.grow_capacity(index + 1);
-        self.init_write_ptr();
-        unsafe {
-            std::ptr::write(self.write_ptr, value);
-            self.write_ptr = self.write_ptr.add(1);
+        let new_len = self.len + 1;
+
+        // Special case: first push into prealloc segment
+        if PREALLOC > 0 && self.len == 0 {
+            unsafe {
+                let ptr = (*self.prealloc_segment.as_mut_ptr()).as_mut_ptr();
+                std::ptr::write(ptr, value);
+                self.write_ptr = ptr.add(1);
+            }
+            self.segment_remaining = PREALLOC - 1;
+            self.len = 1;
+            return;
         }
-        self.segment_remaining -= 1;
-        self.len = index + 1;
+
+        // We're at a segment boundary (box_index = 0), so biased = len + BIAS is a power of 2
+        // Calculate shelf directly without full location()
+        let biased = self.len + Self::BIAS;
+        let shelf = (biased.trailing_zeros() - Self::SHELF_OFFSET) as usize;
+        let shelf_size = Self::shelf_size(shelf as u32);
+
+        self.grow_capacity(new_len);
+
+        unsafe {
+            let ptr = self.dynamic_segments.get_unchecked(shelf).as_ptr();
+            std::ptr::write(ptr, value);
+            self.write_ptr = ptr.add(1);
+        }
+        self.segment_remaining = shelf_size - 1;
+        self.len = new_len;
     }
 
     /// Removes the last element from the vector and returns it, or `None` if empty.
@@ -205,7 +250,9 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
         self.len -= 1;
         // Update write pointer cache - go back one position
         if self.segment_remaining < Self::current_segment_size(self.len) {
-            unsafe { self.write_ptr = self.write_ptr.sub(1); }
+            unsafe {
+                self.write_ptr = self.write_ptr.sub(1);
+            }
             self.segment_remaining += 1;
             Some(unsafe { std::ptr::read(self.write_ptr) })
         } else {
@@ -218,11 +265,8 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
     /// Get the size of the segment containing the given index.
     #[inline]
     fn current_segment_size(index: usize) -> usize {
-        if PREALLOC > 0 && index < PREALLOC {
-            PREALLOC
-        } else {
-            Self::shelf_size(Self::shelf_index(index))
-        }
+        // Calculates the value of the most significant bit of (index + bias).
+        1 << (index + Self::BIAS).ilog2()
     }
 
     /// Returns a reference to the element at the given index.
@@ -541,10 +585,98 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
     where
         T: Clone,
     {
-        self.reserve(other.len());
-        for item in other {
-            self.push(item.clone());
+        if other.is_empty() {
+            return;
         }
+        self.reserve(other.len());
+
+        let mut src = other;
+
+        // Fill prealloc segment if there's room
+        if PREALLOC > 0 && self.len < PREALLOC {
+            let prealloc_remaining = PREALLOC - self.len;
+            let to_copy = src.len().min(prealloc_remaining);
+            let dest = unsafe {
+                (*self.prealloc_segment.as_mut_ptr())
+                    .as_mut_ptr()
+                    .add(self.len)
+            };
+            for i in 0..to_copy {
+                unsafe { std::ptr::write(dest.add(i), src[i].clone()) };
+            }
+            self.len += to_copy;
+            src = &src[to_copy..];
+        }
+
+        // Fill dynamic segments
+        while !src.is_empty() {
+            let (shelf, box_idx, remaining) = Self::location_with_capacity(self.len);
+            let to_copy = src.len().min(remaining);
+            let dest = unsafe {
+                self.dynamic_segments
+                    .get_unchecked(shelf)
+                    .as_ptr()
+                    .add(box_idx)
+            };
+            for i in 0..to_copy {
+                unsafe { std::ptr::write(dest.add(i), src[i].clone()) };
+            }
+            self.len += to_copy;
+            src = &src[to_copy..];
+        }
+
+        // Reset write_ptr - will be lazily initialized on next push
+        self.write_ptr = std::ptr::null_mut();
+        self.segment_remaining = 0;
+    }
+
+    /// Extends the vector by copying elements from a slice (for `Copy` types).
+    ///
+    /// This is more efficient than `extend_from_slice` for `Copy` types
+    /// as it uses bulk memory copy operations.
+    pub fn extend_from_copy_slice(&mut self, other: &[T])
+    where
+        T: Copy,
+    {
+        if other.is_empty() {
+            return;
+        }
+        self.reserve(other.len());
+
+        let mut src = other;
+
+        // Fill prealloc segment if there's room
+        if PREALLOC > 0 && self.len < PREALLOC {
+            let prealloc_remaining = PREALLOC - self.len;
+            let to_copy = src.len().min(prealloc_remaining);
+            let dest = unsafe {
+                (*self.prealloc_segment.as_mut_ptr())
+                    .as_mut_ptr()
+                    .add(self.len)
+            };
+            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dest, to_copy) };
+            self.len += to_copy;
+            src = &src[to_copy..];
+        }
+
+        // Fill dynamic segments
+        while !src.is_empty() {
+            let (shelf, box_idx, remaining) = Self::location_with_capacity(self.len);
+            let to_copy = src.len().min(remaining);
+            let dest = unsafe {
+                self.dynamic_segments
+                    .get_unchecked(shelf)
+                    .as_ptr()
+                    .add(box_idx)
+            };
+            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), dest, to_copy) };
+            self.len += to_copy;
+            src = &src[to_copy..];
+        }
+
+        // Reset write_ptr - will be lazily initialized on next push
+        self.write_ptr = std::ptr::null_mut();
+        self.segment_remaining = 0;
     }
 
     /// Sorts the vector in place using a stable sorting algorithm.
@@ -1035,7 +1167,8 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
             return 0;
         }
         if PREALLOC == 0 {
-            (box_count + 1).next_power_of_two().trailing_zeros()
+            let val = box_count + Self::MIN_NON_ZERO_CAP;
+            val.next_power_of_two().trailing_zeros() - Self::MIN_CAP_EXP
         } else {
             let val = box_count + PREALLOC;
             val.next_power_of_two().trailing_zeros() - Self::PREALLOC_EXP - 1
@@ -1046,30 +1179,37 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
     #[inline]
     fn shelf_size(shelf_index: u32) -> usize {
         if PREALLOC == 0 {
-            1usize << shelf_index
+            Self::MIN_NON_ZERO_CAP << shelf_index
         } else {
             1usize << (shelf_index + Self::PREALLOC_EXP + 1)
         }
     }
 
-    /// Calculate which shelf a list index falls into.
+    /// Calculate which shelf and box index a list index falls into.
+    /// Returns (shelf_index, box_index).
     #[inline]
-    fn shelf_index(list_index: usize) -> u32 {
-        if PREALLOC == 0 {
-            (list_index + 1).ilog2()
-        } else {
-            (list_index + PREALLOC).ilog2() - Self::PREALLOC_EXP - 1
-        }
+    fn location(list_index: usize) -> (usize, usize) {
+        let biased = list_index + Self::BIAS;
+        let msb = biased.ilog2();
+        let shelf = msb - Self::SHELF_OFFSET;
+        // Clear the most significant bit to get box_index
+        let box_idx = biased ^ (1usize << msb);
+        (shelf as usize, box_idx)
     }
 
-    /// Calculate the index within a shelf for a given list index.
+    /// Calculate shelf, box index, and remaining capacity in one go.
+    /// Returns (shelf_index, box_index, segment_remaining).
     #[inline]
-    fn box_index(list_index: usize, shelf_index: u32) -> usize {
-        if PREALLOC == 0 {
-            (list_index + 1) - (1usize << shelf_index)
-        } else {
-            list_index + PREALLOC - (1usize << (Self::PREALLOC_EXP + 1 + shelf_index))
-        }
+    fn location_with_capacity(list_index: usize) -> (usize, usize, usize) {
+        let biased = list_index + Self::BIAS;
+        let msb = biased.ilog2();
+        let shelf = msb - Self::SHELF_OFFSET;
+        let box_idx = biased ^ (1usize << msb);
+        // segment_remaining = shelf_size - box_idx = (1 << msb) - box_idx
+        //                   = (1 << msb) - (biased - (1 << msb))
+        //                   = (2 << msb) - biased
+        let segment_remaining = (2usize << msb) - biased;
+        (shelf as usize, box_idx, segment_remaining)
     }
 
     /// Get an unchecked reference to an element.
@@ -1083,11 +1223,12 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
             if index < PREALLOC {
                 &(*self.prealloc_segment.as_ptr())[index]
             } else {
-                let shelf_index = Self::shelf_index(index);
-                let box_index = Self::box_index(index, shelf_index);
-                &*self.dynamic_segments[shelf_index as usize]
+                let (shelf, box_idx) = Self::location(index);
+                &*self
+                    .dynamic_segments
+                    .get_unchecked(shelf)
                     .as_ptr()
-                    .add(box_index)
+                    .add(box_idx)
             }
         }
     }
@@ -1103,11 +1244,12 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
             if index < PREALLOC {
                 &mut (*self.prealloc_segment.as_mut_ptr())[index]
             } else {
-                let shelf_index = Self::shelf_index(index);
-                let box_index = Self::box_index(index, shelf_index);
-                &mut *self.dynamic_segments[shelf_index as usize]
+                let (shelf, box_idx) = Self::location(index);
+                &mut *self
+                    .dynamic_segments
+                    .get_unchecked(shelf)
                     .as_ptr()
-                    .add(box_index)
+                    .add(box_idx)
             }
         }
     }
@@ -1123,12 +1265,12 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
             if index < PREALLOC {
                 std::ptr::read(&(*self.prealloc_segment.as_ptr())[index])
             } else {
-                let shelf_index = Self::shelf_index(index);
-                let box_index = Self::box_index(index, shelf_index);
+                let (shelf, box_idx) = Self::location(index);
                 std::ptr::read(
-                    self.dynamic_segments[shelf_index as usize]
+                    self.dynamic_segments
+                        .get_unchecked(shelf)
                         .as_ptr()
-                        .add(box_index),
+                        .add(box_idx),
                 )
             }
         }
@@ -1154,6 +1296,18 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
                 };
                 self.dynamic_segments.push(ptr);
             }
+        }
+    }
+
+    /// Compute total capacity given the number of dynamic shelves.
+    #[inline]
+    fn compute_capacity(shelf_count: u32) -> usize {
+        if shelf_count == 0 {
+            PREALLOC
+        } else if PREALLOC == 0 {
+            (Self::MIN_NON_ZERO_CAP << shelf_count) - Self::MIN_NON_ZERO_CAP
+        } else {
+            (1usize << (Self::PREALLOC_EXP + 1 + shelf_count)) - PREALLOC
         }
     }
 
@@ -1216,12 +1370,12 @@ impl<T, const PREALLOC: usize> sort::IndexedAccess<T> for SegmentedVec<T, PREALL
         if index < PREALLOC {
             unsafe { (*self.prealloc_segment.as_ptr()).as_ptr().add(index) }
         } else {
-            let shelf_index = Self::shelf_index(index);
-            let box_index = Self::box_index(index, shelf_index);
+            let (shelf, box_idx) = Self::location(index);
             unsafe {
-                self.dynamic_segments[shelf_index as usize]
+                self.dynamic_segments
+                    .get_unchecked(shelf)
                     .as_ptr()
-                    .add(box_index)
+                    .add(box_idx)
             }
         }
     }
@@ -1236,12 +1390,12 @@ impl<T, const PREALLOC: usize> sort::IndexedAccess<T> for SegmentedVec<T, PREALL
                     .add(index)
             }
         } else {
-            let shelf_index = Self::shelf_index(index);
-            let box_index = Self::box_index(index, shelf_index);
+            let (shelf, box_idx) = Self::location(index);
             unsafe {
-                self.dynamic_segments[shelf_index as usize]
+                self.dynamic_segments
+                    .get_unchecked(shelf)
                     .as_ptr()
-                    .add(box_index)
+                    .add(box_idx)
             }
         }
     }
@@ -1383,7 +1537,11 @@ impl<'a, T, const PREALLOC: usize> Iter<'a, T, PREALLOC> {
         // Move to next segment
         if self.index < PREALLOC {
             // In prealloc segment
-            let ptr = unsafe { (*self.vec.prealloc_segment.as_ptr()).as_ptr().add(self.index) };
+            let ptr = unsafe {
+                (*self.vec.prealloc_segment.as_ptr())
+                    .as_ptr()
+                    .add(self.index)
+            };
             let remaining = PREALLOC - self.index;
             let segment_len = remaining.min(self.vec.len - self.index);
             self.ptr = ptr;
@@ -1452,7 +1610,11 @@ impl<'a, T, const PREALLOC: usize> IterMut<'a, T, PREALLOC> {
         // Move to next segment
         if self.index < PREALLOC {
             // In prealloc segment
-            let ptr = unsafe { (*self.vec.prealloc_segment.as_mut_ptr()).as_mut_ptr().add(self.index) };
+            let ptr = unsafe {
+                (*self.vec.prealloc_segment.as_mut_ptr())
+                    .as_mut_ptr()
+                    .add(self.index)
+            };
             let remaining = PREALLOC - self.index;
             let segment_len = remaining.min(self.vec.len - self.index);
             self.ptr = ptr;
@@ -2229,5 +2391,63 @@ mod tests {
 
         let slice = vec.as_slice();
         assert_eq!(slice, (0..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_min_non_zero_cap() {
+        // For u8 (1 byte), first segment should be 8 elements
+        let mut vec_u8: SegmentedVec<u8, 0> = SegmentedVec::new();
+        vec_u8.push(1);
+        assert_eq!(vec_u8.capacity(), 8);
+
+        // For i32 (4 bytes, <= 1024), first segment should be 4 elements
+        let mut vec_i32: SegmentedVec<i32, 0> = SegmentedVec::new();
+        vec_i32.push(1);
+        assert_eq!(vec_i32.capacity(), 4);
+
+        // Verify indexing still works correctly with the larger first segment
+        for i in 0u8..100 {
+            vec_u8.push(i);
+        }
+        for i in 0..101 {
+            assert_eq!(vec_u8[i], if i == 0 { 1 } else { (i - 1) as u8 });
+        }
+    }
+
+    #[test]
+    fn test_extend_from_copy_slice() {
+        // Test with PREALLOC=0
+        let mut vec: SegmentedVec<i32, 0> = SegmentedVec::new();
+        let data: Vec<i32> = (0..100).collect();
+        vec.extend_from_copy_slice(&data);
+        assert_eq!(vec.len(), 100);
+        for i in 0..100 {
+            assert_eq!(vec[i], i as i32);
+        }
+
+        // Test with PREALLOC=4, starting empty
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.extend_from_copy_slice(&data);
+        assert_eq!(vec.len(), 100);
+        for i in 0..100 {
+            assert_eq!(vec[i], i as i32);
+        }
+
+        // Test with PREALLOC=4, starting with some elements
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.push(999);
+        vec.push(998);
+        vec.extend_from_copy_slice(&data[..10]);
+        assert_eq!(vec.len(), 12);
+        assert_eq!(vec[0], 999);
+        assert_eq!(vec[1], 998);
+        for i in 0..10 {
+            assert_eq!(vec[i + 2], i as i32);
+        }
+
+        // Test empty slice
+        let mut vec: SegmentedVec<i32, 4> = SegmentedVec::new();
+        vec.extend_from_copy_slice(&[]);
+        assert!(vec.is_empty());
     }
 }
