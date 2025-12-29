@@ -1,7 +1,7 @@
 [package]
 name = "segmented-vec"
-version = "0.1.0"
-edition = "2024"
+version = "0.1.1"
+edition = "2021"
 authors = ["ddwalias"]
 description = "A vector with stable element addresses using segmented allocation and O(1) index-to-segment mapping"
 license = "Apache-2.0"
