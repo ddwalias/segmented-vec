@@ -5,6 +5,10 @@ use rand::prelude::*;
 use segmented_vec::SegmentedVec;
 
 // Test sizes for benchmarks
+#[cfg(feature = "ci")]
+const SIZES: &[usize] = &[100, 1_000];
+
+#[cfg(not(feature = "ci"))]
 const SIZES: &[usize] = &[100, 1_000, 10_000, 100_000];
 
 // ============================================================================
@@ -378,9 +382,13 @@ fn bench_contains(c: &mut Criterion) {
         // Search for element in the middle
         let target = (size / 2) as i32;
 
-        group.bench_with_input(BenchmarkId::new("slice", size), &(&vec_data, target), |b, (v, t)| {
-            b.iter(|| black_box(v.contains(t)));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("slice", size),
+            &(&vec_data, target),
+            |b, (v, t)| {
+                b.iter(|| black_box(v.contains(t)));
+            },
+        );
 
         group.bench_with_input(
             BenchmarkId::new("SegmentedSlice", size),
@@ -419,17 +427,21 @@ fn bench_chunks(c: &mut Criterion) {
             });
         });
 
-        group.bench_with_input(BenchmarkId::new("SegmentedSlice", size), &seg_data, |b, v| {
-            b.iter(|| {
-                let mut sum = 0i64;
-                for chunk in v.chunks(64) {
-                    for &x in chunk.iter() {
-                        sum += x as i64;
+        group.bench_with_input(
+            BenchmarkId::new("SegmentedSlice", size),
+            &seg_data,
+            |b, v| {
+                b.iter(|| {
+                    let mut sum = 0i64;
+                    for chunk in v.chunks(64) {
+                        for &x in chunk.iter() {
+                            sum += x as i64;
+                        }
                     }
-                }
-                black_box(sum)
-            });
-        });
+                    black_box(sum)
+                });
+            },
+        );
     }
 
     group.finish();
@@ -538,7 +550,9 @@ fn bench_swap_remove(c: &mut Criterion) {
                 || {
                     let v: Vec<i32> = (0..size as i32).collect();
                     let mut rng = StdRng::seed_from_u64(42);
-                    let indices: Vec<usize> = (0..remove_count).map(|i| rng.gen_range(0..(size - i))).collect();
+                    let indices: Vec<usize> = (0..remove_count)
+                        .map(|i| rng.gen_range(0..(size - i)))
+                        .collect();
                     (v, indices)
                 },
                 |(mut v, indices)| {
@@ -556,7 +570,9 @@ fn bench_swap_remove(c: &mut Criterion) {
                 || {
                     let v: SegmentedVec<i32, 64> = (0..size as i32).collect();
                     let mut rng = StdRng::seed_from_u64(42);
-                    let indices: Vec<usize> = (0..remove_count).map(|i| rng.gen_range(0..(size - i))).collect();
+                    let indices: Vec<usize> = (0..remove_count)
+                        .map(|i| rng.gen_range(0..(size - i)))
+                        .collect();
                     (v, indices)
                 },
                 |(mut v, indices)| {

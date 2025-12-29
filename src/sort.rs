@@ -18,8 +18,7 @@ pub fn insertion_sort<T, F>(
     start: usize,
     end: usize,
     is_less: &mut F,
-)
-where
+) where
     F: FnMut(&T, &T) -> bool,
 {
     for i in (start + 1)..end {
@@ -199,7 +198,12 @@ where
 ///
 /// Partitions `v[start..end]` around the pivot at `v[start]`.
 /// Returns the final position of the pivot.
-fn partition<T, F>(v: &mut impl IndexedAccess<T>, start: usize, end: usize, is_less: &mut F) -> usize
+fn partition<T, F>(
+    v: &mut impl IndexedAccess<T>,
+    start: usize,
+    end: usize,
+    is_less: &mut F,
+) -> usize
 where
     F: FnMut(&T, &T) -> bool,
 {
@@ -372,8 +376,7 @@ fn merge<T, F>(
 
         while s > 0 && l > start {
             // SAFETY: scratch[s-1] is initialized, v.get_ptr(l-1) is valid.
-            let take_right =
-                unsafe { is_less(scratch[s - 1].assume_init_ref(), v.get_ref(l - 1)) };
+            let take_right = unsafe { is_less(scratch[s - 1].assume_init_ref(), v.get_ref(l - 1)) };
 
             w -= 1;
             if take_right {

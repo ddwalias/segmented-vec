@@ -1,6 +1,6 @@
 [package]
 name = "segmented-vec"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["ddwalias"]
 description = "A vector with stable element addresses using segmented allocation and O(1) index-to-segment mapping"
@@ -16,6 +16,9 @@ keywords = [
   "no-reallocation",
 ]
 categories = ["data-structures", "no-std"]
+
+[features]
+ci = []
 
 [dependencies]
 

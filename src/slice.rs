@@ -4,7 +4,9 @@
 //! behave like `&[T]` and `&mut [T]` but work with non-contiguous memory.
 
 use std::cmp::Ordering;
-use std::ops::{Index, IndexMut, Range, RangeFrom, RangeFull, RangeInclusive, RangeTo, RangeToInclusive};
+use std::ops::{
+    Index, IndexMut, Range, RangeFrom, RangeFull, RangeInclusive, RangeTo, RangeToInclusive,
+};
 
 use crate::SegmentedVec;
 
@@ -47,7 +49,11 @@ impl<'a, T, const PREALLOC: usize> SegmentedSlice<'a, T, PREALLOC> {
     #[inline]
     pub(crate) fn from_range(vec: &'a SegmentedVec<T, PREALLOC>, start: usize, end: usize) -> Self {
         debug_assert!(start <= end && end <= vec.len());
-        Self { vec, start, len: end - start }
+        Self {
+            vec,
+            start,
+            len: end - start,
+        }
     }
 
     /// Returns the number of elements in the slice.
@@ -124,7 +130,13 @@ impl<'a, T, const PREALLOC: usize> SegmentedSlice<'a, T, PREALLOC> {
     ///
     /// Panics if `mid > len`.
     #[inline]
-    pub fn split_at(&self, mid: usize) -> (SegmentedSlice<'a, T, PREALLOC>, SegmentedSlice<'a, T, PREALLOC>) {
+    pub fn split_at(
+        &self,
+        mid: usize,
+    ) -> (
+        SegmentedSlice<'a, T, PREALLOC>,
+        SegmentedSlice<'a, T, PREALLOC>,
+    ) {
         assert!(mid <= self.len());
         (
             SegmentedSlice::from_range(self.vec, self.start, self.start + mid),
@@ -391,10 +403,11 @@ impl<'a, T, const PREALLOC: usize> SegmentedSlice<'a, T, PREALLOC> {
             chunk_size,
         }
     }
-
 }
 
-impl<'a, T: std::fmt::Debug, const PREALLOC: usize> std::fmt::Debug for SegmentedSlice<'a, T, PREALLOC> {
+impl<'a, T: std::fmt::Debug, const PREALLOC: usize> std::fmt::Debug
+    for SegmentedSlice<'a, T, PREALLOC>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_list().entries(self.iter()).finish()
     }
@@ -418,7 +431,9 @@ impl<'a, T: PartialEq, const PREALLOC: usize> PartialEq<[T]> for SegmentedSlice<
     }
 }
 
-impl<'a, T: PartialEq, const PREALLOC: usize> PartialEq<Vec<T>> for SegmentedSlice<'a, T, PREALLOC> {
+impl<'a, T: PartialEq, const PREALLOC: usize> PartialEq<Vec<T>>
+    for SegmentedSlice<'a, T, PREALLOC>
+{
     fn eq(&self, other: &Vec<T>) -> bool {
         self == other.as_slice()
     }
@@ -486,9 +501,17 @@ impl<'a, T, const PREALLOC: usize> SegmentedSliceMut<'a, T, PREALLOC> {
 
     /// Creates a new mutable slice covering a range of the vector.
     #[inline]
-    pub(crate) fn from_range(vec: &'a mut SegmentedVec<T, PREALLOC>, start: usize, end: usize) -> Self {
+    pub(crate) fn from_range(
+        vec: &'a mut SegmentedVec<T, PREALLOC>,
+        start: usize,
+        end: usize,
+    ) -> Self {
         debug_assert!(start <= end && end <= vec.len());
-        Self { vec, start, len: end - start }
+        Self {
+            vec,
+            start,
+            len: end - start,
+        }
     }
 
     /// Returns the number of elements in the slice.
@@ -887,7 +910,13 @@ impl<'a, T, const PREALLOC: usize> SegmentedSliceMut<'a, T, PREALLOC> {
     /// # Note
     ///
     /// Due to borrowing rules, this method consumes self and returns two new slices.
-    pub fn split_at_mut(self, mid: usize) -> (SegmentedSliceMut<'a, T, PREALLOC>, SegmentedSliceMut<'a, T, PREALLOC>) {
+    pub fn split_at_mut(
+        self,
+        mid: usize,
+    ) -> (
+        SegmentedSliceMut<'a, T, PREALLOC>,
+        SegmentedSliceMut<'a, T, PREALLOC>,
+    ) {
         assert!(mid <= self.len());
         let start = self.start;
         let len = self.len;
@@ -930,7 +959,9 @@ impl<'a, T, const PREALLOC: usize> SegmentedSliceMut<'a, T, PREALLOC> {
     }
 }
 
-impl<'a, T: std::fmt::Debug, const PREALLOC: usize> std::fmt::Debug for SegmentedSliceMut<'a, T, PREALLOC> {
+impl<'a, T: std::fmt::Debug, const PREALLOC: usize> std::fmt::Debug
+    for SegmentedSliceMut<'a, T, PREALLOC>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_list().entries(self.iter()).finish()
     }
@@ -1134,7 +1165,10 @@ impl<'a, T, const PREALLOC: usize> Iterator for Windows<'a, T, PREALLOC> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.end.saturating_sub(self.start).saturating_sub(self.size - 1);
+        let len = self
+            .end
+            .saturating_sub(self.start)
+            .saturating_sub(self.size - 1);
         (len, Some(len))
     }
 
@@ -1154,7 +1188,11 @@ impl<'a, T, const PREALLOC: usize> DoubleEndedIterator for Windows<'a, T, PREALL
             None
         } else {
             self.end -= 1;
-            Some(SegmentedSlice::from_range(self.vec, self.end - self.size + 1, self.end + 1))
+            Some(SegmentedSlice::from_range(
+                self.vec,
+                self.end - self.size + 1,
+                self.end + 1,
+            ))
         }
     }
 }
@@ -1335,7 +1373,8 @@ impl<'a, T, const PREALLOC: usize> Iterator for ChunksExact<'a, T, PREALLOC> {
         if self.start + self.chunk_size > self.end {
             None
         } else {
-            let slice = SegmentedSlice::from_range(self.vec, self.start, self.start + self.chunk_size);
+            let slice =
+                SegmentedSlice::from_range(self.vec, self.start, self.start + self.chunk_size);
             self.start += self.chunk_size;
             Some(slice)
         }
@@ -1364,7 +1403,11 @@ impl<'a, T, const PREALLOC: usize> DoubleEndedIterator for ChunksExact<'a, T, PR
             None
         } else {
             self.end -= self.chunk_size;
-            Some(SegmentedSlice::from_range(self.vec, self.end, self.end + self.chunk_size))
+            Some(SegmentedSlice::from_range(
+                self.vec,
+                self.end,
+                self.end + self.chunk_size,
+            ))
         }
     }
 }

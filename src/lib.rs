@@ -416,7 +416,7 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
             if PREALLOC > 0 {
                 let count = self.len.min(PREALLOC);
                 let ptr = unsafe { (*self.prealloc_segment.as_mut_ptr()).as_mut_ptr() };
-                unsafe { std::ptr::drop_in_place(std::slice::from_raw_parts_mut(ptr, count)) };
+                unsafe { std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(ptr, count)) };
             }
 
             // Drop elements in dynamic segments
@@ -426,7 +426,9 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
                     let size = Self::shelf_size(shelf as u32);
                     let count = remaining.min(size);
                     let ptr = unsafe { self.dynamic_segments.get_unchecked(shelf).as_ptr() };
-                    unsafe { std::ptr::drop_in_place(std::slice::from_raw_parts_mut(ptr, count)) };
+                    unsafe {
+                        std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(ptr, count))
+                    };
                     remaining -= count;
                     if remaining == 0 {
                         break;
@@ -467,7 +469,10 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
                             .add(start)
                     };
                     unsafe {
-                        std::ptr::drop_in_place(std::slice::from_raw_parts_mut(ptr, end - start))
+                        std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
+                            ptr,
+                            end - start,
+                        ))
                     };
                 }
             }
@@ -497,7 +502,9 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
                                     .add(offset)
                             };
                             unsafe {
-                                std::ptr::drop_in_place(std::slice::from_raw_parts_mut(ptr, count))
+                                std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
+                                    ptr, count,
+                                ))
                             };
                         }
 
@@ -677,8 +684,8 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
                     .as_mut_ptr()
                     .add(self.len)
             };
-            for i in 0..to_copy {
-                unsafe { std::ptr::write(dest.add(i), src[i].clone()) };
+            for (i, item) in src.iter().take(to_copy).enumerate() {
+                unsafe { std::ptr::write(dest.add(i), item.clone()) };
             }
             self.len += to_copy;
             src = &src[to_copy..];
@@ -694,8 +701,8 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
                     .as_ptr()
                     .add(box_idx)
             };
-            for i in 0..to_copy {
-                unsafe { std::ptr::write(dest.add(i), src[i].clone()) };
+            for (i, item) in src.iter().take(to_copy).enumerate() {
+                unsafe { std::ptr::write(dest.add(i), item.clone()) };
             }
             self.len += to_copy;
             src = &src[to_copy..];
