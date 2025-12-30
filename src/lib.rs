@@ -49,8 +49,10 @@ pub struct SegmentedVec<T, const PREALLOC: usize = 0> {
     len: usize,
     /// Cached pointer to the next write position (for fast push)
     write_ptr: *mut T,
-    /// Number of elements remaining in the current segment
+    /// Pointer to the end of the current segment
     segment_end: *mut T,
+    /// Pointer to the base of the current segment
+    segment_base: *mut T,
     _marker: PhantomData<T>,
 }
 
@@ -118,6 +120,7 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
             len: 0,
             write_ptr: std::ptr::null_mut(),
             segment_end: std::ptr::null_mut(),
+            segment_base: std::ptr::null_mut(),
             _marker: PhantomData,
         }
     }
@@ -127,19 +130,23 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
     fn init_write_ptr(&mut self) {
         if PREALLOC > 0 && self.len < PREALLOC {
             let base = unsafe { (*self.prealloc_segment.as_mut_ptr()).as_mut_ptr() };
+            self.segment_base = base;
             self.write_ptr = unsafe { base.add(self.len) };
             self.segment_end = unsafe { base.add(PREALLOC) };
         } else if !self.dynamic_segments.is_empty() {
             let (shelf, box_idx) = Self::location(self.len);
             let shelf_size = Self::shelf_size(shelf as u32);
             let base = unsafe { self.dynamic_segments.get_unchecked(shelf).as_ptr() };
+            self.segment_base = base;
             self.write_ptr = unsafe { base.add(box_idx) };
             self.segment_end = unsafe { base.add(shelf_size) };
         } else if PREALLOC > 0 {
             let base = unsafe { (*self.prealloc_segment.as_mut_ptr()).as_mut_ptr() };
+            self.segment_base = base;
             self.write_ptr = base;
             self.segment_end = unsafe { base.add(PREALLOC) };
         } else {
+            self.segment_base = std::ptr::null_mut();
             self.write_ptr = std::ptr::null_mut();
             self.segment_end = std::ptr::null_mut();
         }
@@ -204,6 +211,7 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
             unsafe {
                 let base = (*self.prealloc_segment.as_mut_ptr()).as_mut_ptr();
                 std::ptr::write(base, value);
+                self.segment_base = base;
                 self.write_ptr = base.add(1);
                 self.segment_end = base.add(PREALLOC);
             }
@@ -222,6 +230,7 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
         unsafe {
             let base = self.dynamic_segments.get_unchecked(shelf).as_ptr();
             std::ptr::write(base, value);
+            self.segment_base = base;
             self.write_ptr = base.add(1);
             self.segment_end = base.add(shelf_size);
         }
@@ -243,23 +252,39 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
     /// ```
     #[inline]
     pub fn pop(&mut self) -> Option<T> {
+        // Fast path: current segment still have elements
+        if self.write_ptr > self.segment_base {
+            unsafe {
+                let new_len = self.len - 1;
+                self.len = new_len;
+                // Move back to the last written element
+                self.write_ptr = self.write_ptr.sub(1);
+                // Return the value
+                Some(std::ptr::read(self.write_ptr))
+            }
+        } else {
+            // Slow path: current segment doesn't have any element left, cross the boundary
+            self.pop_slow_path()
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn pop_slow_path(&mut self) -> Option<T> {
         if self.len == 0 {
             return None;
         }
-        self.len -= 1;
 
-        // Check if we're at a segment boundary (biased len is a power of 2)
-        let biased = self.len + Self::BIAS;
-        if biased & (biased - 1) == 0 {
-            // Crossed a segment boundary, recalculate
+        unsafe {
+            // Because write_ptr == segment_base, the element we want
+            // is actually at the very first slot of this segment.
+            let val = std::ptr::read(self.write_ptr);
+
+            let new_len = self.len - 1;
+            self.len = new_len;
             self.init_write_ptr();
-            Some(unsafe { self.unchecked_read(self.len) })
-        } else {
-            // Same segment, just decrement write_ptr
-            unsafe {
-                self.write_ptr = self.write_ptr.sub(1);
-            }
-            Some(unsafe { std::ptr::read(self.write_ptr) })
+
+            Some(val)
         }
     }
 
