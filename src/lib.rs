@@ -37,7 +37,10 @@ use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ops::{Index, IndexMut};
-use std::ptr::NonNull;
+
+/// Maximum number of dynamic segments supported.
+/// With exponentially growing segments, 64 segments can hold more than 2^64 elements.
+const MAX_SEGMENTS: usize = 64;
 
 /// A segmented vector with stable pointers.
 ///
@@ -45,7 +48,8 @@ use std::ptr::NonNull;
 /// Elements beyond the preallocation are stored in dynamically allocated segments.
 pub struct SegmentedVec<T, const PREALLOC: usize = 0> {
     prealloc_segment: MaybeUninit<[T; PREALLOC]>,
-    dynamic_segments: Vec<NonNull<T>>,
+    dynamic_segments: [*mut T; MAX_SEGMENTS],
+    segment_count: usize,
     len: usize,
     /// Cached pointer to the next write position (for fast push)
     write_ptr: *mut T,
@@ -116,7 +120,8 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
     pub const fn new() -> Self {
         Self {
             prealloc_segment: MaybeUninit::uninit(),
-            dynamic_segments: Vec::new(),
+            dynamic_segments: [std::ptr::null_mut(); MAX_SEGMENTS],
+            segment_count: 0,
             len: 0,
             write_ptr: std::ptr::null_mut(),
             segment_end: std::ptr::null_mut(),
@@ -133,10 +138,10 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
             self.segment_base = base;
             self.write_ptr = unsafe { base.add(self.len) };
             self.segment_end = unsafe { base.add(PREALLOC) };
-        } else if !self.dynamic_segments.is_empty() {
+        } else if self.segment_count > 0 {
             let (shelf, box_idx) = Self::location(self.len);
             let shelf_size = Self::shelf_size(shelf as u32);
-            let base = unsafe { self.dynamic_segments.get_unchecked(shelf).as_ptr() };
+            let base = unsafe { *self.dynamic_segments.get_unchecked(shelf) };
             self.segment_base = base;
             self.write_ptr = unsafe { base.add(box_idx) };
             self.segment_end = unsafe { base.add(shelf_size) };
@@ -167,7 +172,7 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
     /// Returns the current capacity of the vector.
     #[inline]
     pub fn capacity(&self) -> usize {
-        Self::compute_capacity(self.dynamic_segments.len() as u32)
+        Self::compute_capacity(self.segment_count as u32)
     }
 
     /// Appends an element to the back of the vector.
@@ -225,13 +230,11 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
         let shelf = (biased.trailing_zeros() - Self::SHELF_OFFSET) as usize;
         let shelf_size = Self::shelf_size(shelf as u32);
 
-        let old_segments_len = self.dynamic_segments.len();
-
-        let base = if shelf >= old_segments_len {
+        let base = if shelf >= self.segment_count {
             self.grow_once();
-            unsafe { self.dynamic_segments.last().unwrap_unchecked().as_ptr() }
+            unsafe { *self.dynamic_segments.get_unchecked(self.segment_count - 1) }
         } else {
-            unsafe { self.dynamic_segments.get_unchecked(shelf).as_ptr() }
+            unsafe { *self.dynamic_segments.get_unchecked(shelf) }
         };
 
         unsafe {
@@ -453,10 +456,10 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
             // Drop elements in dynamic segments
             if self.len > PREALLOC {
                 let mut remaining = self.len - PREALLOC;
-                for shelf in 0..self.dynamic_segments.len() {
+                for shelf in 0..self.segment_count {
                     let size = Self::shelf_size(shelf as u32);
                     let count = remaining.min(size);
-                    let ptr = unsafe { self.dynamic_segments.get_unchecked(shelf).as_ptr() };
+                    let ptr = unsafe { *self.dynamic_segments.get_unchecked(shelf) };
                     unsafe {
                         std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(ptr, count))
                     };
@@ -515,7 +518,7 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
 
                 if dynamic_new_len < dynamic_old_len {
                     let mut pos = 0usize;
-                    for shelf in 0..self.dynamic_segments.len() {
+                    for shelf in 0..self.segment_count {
                         let size = Self::shelf_size(shelf as u32);
                         let seg_end = pos + size;
 
@@ -527,10 +530,7 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
                             let offset = drop_start - pos;
                             let count = drop_end - drop_start;
                             let ptr = unsafe {
-                                self.dynamic_segments
-                                    .get_unchecked(shelf)
-                                    .as_ptr()
-                                    .add(offset)
+                                (*self.dynamic_segments.get_unchecked(shelf)).add(offset)
                             };
                             unsafe {
                                 std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
@@ -726,12 +726,7 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
         while !src.is_empty() {
             let (shelf, box_idx, remaining) = Self::location_with_capacity(self.len);
             let to_copy = src.len().min(remaining);
-            let dest = unsafe {
-                self.dynamic_segments
-                    .get_unchecked(shelf)
-                    .as_ptr()
-                    .add(box_idx)
-            };
+            let dest = unsafe { (*self.dynamic_segments.get_unchecked(shelf)).add(box_idx) };
             for (i, item) in src.iter().take(to_copy).enumerate() {
                 unsafe { std::ptr::write(dest.add(i), item.clone()) };
             }
@@ -782,11 +777,7 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
             let (shelf, box_idx, remaining) = Self::location_with_capacity(self.len);
             let to_copy = src.len().min(remaining);
             unsafe {
-                let dest = self
-                    .dynamic_segments
-                    .get_unchecked(shelf)
-                    .as_ptr()
-                    .add(box_idx);
+                let dest = (*self.dynamic_segments.get_unchecked(shelf)).add(box_idx);
                 std::ptr::copy_nonoverlapping(src.as_ptr(), dest, to_copy);
             };
             self.len += to_copy;
@@ -1347,11 +1338,7 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
                 &(*self.prealloc_segment.as_ptr())[index]
             } else {
                 let (shelf, box_idx) = Self::location(index);
-                &*self
-                    .dynamic_segments
-                    .get_unchecked(shelf)
-                    .as_ptr()
-                    .add(box_idx)
+                &*(*self.dynamic_segments.get_unchecked(shelf)).add(box_idx)
             }
         }
     }
@@ -1368,11 +1355,7 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
                 &mut (*self.prealloc_segment.as_mut_ptr())[index]
             } else {
                 let (shelf, box_idx) = Self::location(index);
-                &mut *self
-                    .dynamic_segments
-                    .get_unchecked(shelf)
-                    .as_ptr()
-                    .add(box_idx)
+                &mut *(*self.dynamic_segments.get_unchecked(shelf)).add(box_idx)
             }
         }
     }
@@ -1389,50 +1372,58 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
                 std::ptr::read(&(*self.prealloc_segment.as_ptr())[index])
             } else {
                 let (shelf, box_idx) = Self::location(index);
-                std::ptr::read(
-                    self.dynamic_segments
-                        .get_unchecked(shelf)
-                        .as_ptr()
-                        .add(box_idx),
-                )
+                std::ptr::read((*self.dynamic_segments.get_unchecked(shelf)).add(box_idx))
             }
         }
     }
 
     fn grow_once(&mut self) {
-        self.dynamic_segments.reserve(1);
+        assert!(
+            self.segment_count < MAX_SEGMENTS,
+            "Maximum segment count exceeded"
+        );
 
-        let size = Self::shelf_size(self.dynamic_segments.len() as u32);
+        let size = Self::shelf_size(self.segment_count as u32);
         let layout = Layout::array::<T>(size).expect("Layout overflow");
         let ptr = if layout.size() == 0 {
-            NonNull::dangling()
+            std::ptr::dangling_mut::<T>()
         } else {
             let ptr = unsafe { alloc::alloc(layout) };
-            NonNull::new(ptr as *mut T).expect("Allocation failed")
+            if ptr.is_null() {
+                panic!("Allocation failed");
+            }
+            ptr as *mut T
         };
-        self.dynamic_segments.push(ptr);
+        self.dynamic_segments[self.segment_count] = ptr;
+        self.segment_count += 1;
     }
 
     /// Grow capacity to accommodate at least `new_capacity` elements.
     fn grow_capacity(&mut self, new_capacity: usize) {
-        let new_shelf_count = Self::shelf_count(new_capacity);
-        let old_shelf_count = self.dynamic_segments.len() as u32;
+        let new_shelf_count = Self::shelf_count(new_capacity) as usize;
+        let old_shelf_count = self.segment_count;
 
         if new_shelf_count > old_shelf_count {
-            self.dynamic_segments
-                .reserve((new_shelf_count - old_shelf_count) as usize);
+            assert!(
+                new_shelf_count <= MAX_SEGMENTS,
+                "Maximum segment count exceeded"
+            );
 
             for i in old_shelf_count..new_shelf_count {
-                let size = Self::shelf_size(i);
+                let size = Self::shelf_size(i as u32);
                 let layout = Layout::array::<T>(size).expect("Layout overflow");
                 let ptr = if layout.size() == 0 {
-                    NonNull::dangling()
+                    std::ptr::dangling_mut::<T>()
                 } else {
                     let ptr = unsafe { alloc::alloc(layout) };
-                    NonNull::new(ptr as *mut T).expect("Allocation failed")
+                    if ptr.is_null() {
+                        panic!("Allocation failed");
+                    }
+                    ptr as *mut T
                 };
-                self.dynamic_segments.push(ptr);
+                self.dynamic_segments[i] = ptr;
             }
+            self.segment_count = new_shelf_count;
         }
     }
 
@@ -1452,19 +1443,17 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
     fn shrink_capacity(&mut self, new_capacity: usize) {
         if new_capacity <= PREALLOC {
             // Free all dynamic segments
-            self.free_shelves(self.dynamic_segments.len() as u32, 0);
-            self.dynamic_segments.clear();
-            self.dynamic_segments.shrink_to_fit();
+            self.free_shelves(self.segment_count as u32, 0);
+            self.segment_count = 0;
             return;
         }
 
         let new_shelf_count = Self::shelf_count(new_capacity);
-        let old_shelf_count = self.dynamic_segments.len() as u32;
+        let old_shelf_count = self.segment_count as u32;
 
         if new_shelf_count < old_shelf_count {
             self.free_shelves(old_shelf_count, new_shelf_count);
-            self.dynamic_segments.truncate(new_shelf_count as usize);
-            self.dynamic_segments.shrink_to_fit();
+            self.segment_count = new_shelf_count as usize;
         }
     }
 
@@ -1475,12 +1464,10 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
             let layout = Layout::array::<T>(size).expect("Layout overflow");
             if layout.size() > 0 {
                 unsafe {
-                    alloc::dealloc(
-                        self.dynamic_segments[i as usize].as_ptr() as *mut u8,
-                        layout,
-                    );
+                    alloc::dealloc(self.dynamic_segments[i as usize] as *mut u8, layout);
                 }
             }
+            self.dynamic_segments[i as usize] = std::ptr::null_mut();
         }
     }
 }
@@ -1490,7 +1477,7 @@ impl<T, const PREALLOC: usize> Drop for SegmentedVec<T, PREALLOC> {
         // Drop all elements
         self.clear();
         // Free all dynamic segments
-        self.free_shelves(self.dynamic_segments.len() as u32, 0);
+        self.free_shelves(self.segment_count as u32, 0);
     }
 }
 
@@ -1508,12 +1495,7 @@ impl<T, const PREALLOC: usize> sort::IndexedAccess<T> for SegmentedVec<T, PREALL
             unsafe { (*self.prealloc_segment.as_ptr()).as_ptr().add(index) }
         } else {
             let (shelf, box_idx) = Self::location(index);
-            unsafe {
-                self.dynamic_segments
-                    .get_unchecked(shelf)
-                    .as_ptr()
-                    .add(box_idx)
-            }
+            unsafe { (*self.dynamic_segments.get_unchecked(shelf)).add(box_idx) }
         }
     }
 
@@ -1528,12 +1510,7 @@ impl<T, const PREALLOC: usize> sort::IndexedAccess<T> for SegmentedVec<T, PREALL
             }
         } else {
             let (shelf, box_idx) = Self::location(index);
-            unsafe {
-                self.dynamic_segments
-                    .get_unchecked(shelf)
-                    .as_ptr()
-                    .add(box_idx)
-            }
+            unsafe { (*self.dynamic_segments.get_unchecked(shelf)).add(box_idx) }
         }
     }
 
@@ -1594,11 +1571,11 @@ impl<T: Clone, const PREALLOC: usize> Clone for SegmentedVec<T, PREALLOC> {
         // Clone dynamic segments
         if self.len > PREALLOC {
             let mut remaining = self.len - PREALLOC;
-            for shelf in 0..self.dynamic_segments.len() {
+            for shelf in 0..self.segment_count {
                 let size = Self::shelf_size(shelf as u32);
                 let count = remaining.min(size);
-                let src = unsafe { self.dynamic_segments.get_unchecked(shelf).as_ptr() };
-                let dst = unsafe { new_vec.dynamic_segments.get_unchecked(shelf).as_ptr() };
+                let src = unsafe { *self.dynamic_segments.get_unchecked(shelf) };
+                let dst = unsafe { *new_vec.dynamic_segments.get_unchecked(shelf) };
                 for i in 0..count {
                     unsafe { std::ptr::write(dst.add(i), (*src.add(i)).clone()) };
                 }
@@ -1727,7 +1704,7 @@ impl<'a, T, const PREALLOC: usize> Iter<'a, T, PREALLOC> {
             // In dynamic segments
             let shelf_idx = self.shelf_index as usize;
             let shelf_size = SegmentedVec::<T, PREALLOC>::shelf_size(self.shelf_index);
-            let ptr = self.vec.dynamic_segments[shelf_idx].as_ptr();
+            let ptr = self.vec.dynamic_segments[shelf_idx];
             let segment_len = shelf_size.min(self.vec.len - self.index);
             self.ptr = ptr;
             self.segment_end = unsafe { ptr.add(segment_len) };
@@ -1800,8 +1777,7 @@ impl<'a, T, const PREALLOC: usize> IterMut<'a, T, PREALLOC> {
             // In dynamic segments
             let shelf_idx = self.shelf_index as usize;
             let shelf_size = SegmentedVec::<T, PREALLOC>::shelf_size(self.shelf_index);
-            // as_ptr() returns *mut T since NonNull<T> stores *mut T
-            let ptr = self.vec.dynamic_segments[shelf_idx].as_ptr();
+            let ptr = self.vec.dynamic_segments[shelf_idx];
             let segment_len = shelf_size.min(self.vec.len - self.index);
             self.ptr = ptr;
             self.segment_end = unsafe { ptr.add(segment_len) };
