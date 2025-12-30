@@ -225,10 +225,16 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
         let shelf = (biased.trailing_zeros() - Self::SHELF_OFFSET) as usize;
         let shelf_size = Self::shelf_size(shelf as u32);
 
-        self.grow_capacity(new_len);
+        let old_segments_len = self.dynamic_segments.len();
+
+        let base = if shelf >= old_segments_len {
+            self.grow_once();
+            unsafe { self.dynamic_segments.last().unwrap_unchecked().as_ptr() }
+        } else {
+            unsafe { self.dynamic_segments.get_unchecked(shelf).as_ptr() }
+        };
 
         unsafe {
-            let base = self.dynamic_segments.get_unchecked(shelf).as_ptr();
             std::ptr::write(base, value);
             self.segment_base = base;
             self.write_ptr = base.add(1);
@@ -1391,6 +1397,20 @@ impl<T, const PREALLOC: usize> SegmentedVec<T, PREALLOC> {
                 )
             }
         }
+    }
+
+    fn grow_once(&mut self) {
+        self.dynamic_segments.reserve(1);
+
+        let size = Self::shelf_size(self.dynamic_segments.len() as u32);
+        let layout = Layout::array::<T>(size).expect("Layout overflow");
+        let ptr = if layout.size() == 0 {
+            NonNull::dangling()
+        } else {
+            let ptr = unsafe { alloc::alloc(layout) };
+            NonNull::new(ptr as *mut T).expect("Allocation failed")
+        };
+        self.dynamic_segments.push(ptr);
     }
 
     /// Grow capacity to accommodate at least `new_capacity` elements.
