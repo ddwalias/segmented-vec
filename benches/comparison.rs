@@ -1,8 +1,9 @@
 //! Benchmarks comparing SegmentedVec/SegmentedSlice with std Vec/slice.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::prelude::*;
 use segmented_vec::SegmentedVec;
+use std::hint::black_box;
 
 // Test sizes for benchmarks
 #[cfg(feature = "ci")]
@@ -93,7 +94,9 @@ fn bench_pop(c: &mut Criterion) {
             b.iter_batched(
                 || (0..size as i32).collect::<Vec<_>>(),
                 |mut v| {
-                    while v.pop().is_some() {}
+                    while let Some(val) = v.pop() {
+                        black_box(val);
+                    }
                     black_box(v)
                 },
                 criterion::BatchSize::SmallInput,
@@ -104,7 +107,9 @@ fn bench_pop(c: &mut Criterion) {
             b.iter_batched(
                 || (0..size as i32).collect::<SegmentedVec<_, 64>>(),
                 |mut v| {
-                    while v.pop().is_some() {}
+                    while let Some(val) = v.pop() {
+                        black_box(val);
+                    }
                     black_box(v)
                 },
                 criterion::BatchSize::SmallInput,
@@ -131,8 +136,8 @@ fn bench_sequential_access(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("Vec", size), &vec_data, |b, v| {
             b.iter(|| {
                 let mut sum = 0i64;
-                for i in 0..v.len() {
-                    sum += v[i] as i64;
+                for num in v {
+                    sum += *num as i64;
                 }
                 black_box(sum)
             });
@@ -165,7 +170,7 @@ fn bench_random_access(c: &mut Criterion) {
 
         // Pre-generate random indices
         let mut rng = StdRng::seed_from_u64(42);
-        let indices: Vec<usize> = (0..size).map(|_| rng.gen_range(0..size)).collect();
+        let indices: Vec<usize> = (0..size).map(|_| rng.random_range(0..size)).collect();
 
         group.throughput(Throughput::Elements(size as u64));
 
@@ -242,7 +247,7 @@ fn bench_sort(c: &mut Criterion) {
     for &size in SIZES {
         // Generate random data
         let mut rng = StdRng::seed_from_u64(42);
-        let data: Vec<i32> = (0..size).map(|_| rng.r#gen()).collect();
+        let data: Vec<i32> = (0..size).map(|_| rng.random()).collect();
 
         group.throughput(Throughput::Elements(size as u64));
 
@@ -282,7 +287,7 @@ fn bench_sort_unstable(c: &mut Criterion) {
     for &size in SIZES {
         // Generate random data
         let mut rng = StdRng::seed_from_u64(42);
-        let data: Vec<i32> = (0..size).map(|_| rng.r#gen()).collect();
+        let data: Vec<i32> = (0..size).map(|_| rng.random()).collect();
 
         group.throughput(Throughput::Elements(size as u64));
 
@@ -325,7 +330,9 @@ fn bench_binary_search(c: &mut Criterion) {
 
         // Pre-generate search targets
         let mut rng = StdRng::seed_from_u64(42);
-        let targets: Vec<i32> = (0..1000).map(|_| rng.gen_range(0..size as i32)).collect();
+        let targets: Vec<i32> = (0..1000)
+            .map(|_| rng.random_range(0..size as i32))
+            .collect();
 
         group.throughput(Throughput::Elements(1000));
 
@@ -376,11 +383,11 @@ fn bench_contains(c: &mut Criterion) {
     let sizes = &[100, 1_000, 10_000];
 
     for &size in sizes {
-        let vec_data: Vec<i32> = (0..size as i32).collect();
-        let seg_data: SegmentedVec<i32, 64> = (0..size as i32).collect();
+        let vec_data: Vec<i32> = (0..size).collect();
+        let seg_data: SegmentedVec<i32, 64> = (0..size).collect();
 
         // Search for element in the middle
-        let target = (size / 2) as i32;
+        let target = size / 2;
 
         group.bench_with_input(
             BenchmarkId::new("slice", size),
@@ -501,7 +508,7 @@ fn bench_remove(c: &mut Criterion) {
     for &size in sizes {
         group.bench_with_input(BenchmarkId::new("Vec", size), &size, |b, &size| {
             b.iter_batched(
-                || (0..size as i32).collect::<Vec<_>>(),
+                || (0..size).collect::<Vec<_>>(),
                 |mut v| {
                     // Remove from the middle
                     for _ in 0..100.min(size) {
@@ -517,7 +524,7 @@ fn bench_remove(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("SegmentedVec", size), &size, |b, &size| {
             b.iter_batched(
-                || (0..size as i32).collect::<SegmentedVec<_, 64>>(),
+                || (0..size).collect::<SegmentedVec<_, 64>>(),
                 |mut v| {
                     // Remove from the middle
                     for _ in 0..100.min(size) {
@@ -551,7 +558,7 @@ fn bench_swap_remove(c: &mut Criterion) {
                     let v: Vec<i32> = (0..size as i32).collect();
                     let mut rng = StdRng::seed_from_u64(42);
                     let indices: Vec<usize> = (0..remove_count)
-                        .map(|i| rng.gen_range(0..(size - i)))
+                        .map(|i| rng.random_range(0..(size - i)))
                         .collect();
                     (v, indices)
                 },
@@ -571,7 +578,7 @@ fn bench_swap_remove(c: &mut Criterion) {
                     let v: SegmentedVec<i32, 64> = (0..size as i32).collect();
                     let mut rng = StdRng::seed_from_u64(42);
                     let indices: Vec<usize> = (0..remove_count)
-                        .map(|i| rng.gen_range(0..(size - i)))
+                        .map(|i| rng.random_range(0..(size - i)))
                         .collect();
                     (v, indices)
                 },
