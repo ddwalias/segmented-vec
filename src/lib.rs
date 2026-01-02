@@ -42,16 +42,17 @@ use std::ops::{Index, IndexMut};
 const MAX_SEGMENTS: usize = 64;
 
 /// A segmented vector with stable pointers.
+#[repr(C)]
 pub struct SegmentedVec<T> {
-    dynamic_segments: [*mut T; MAX_SEGMENTS],
-    segment_count: usize,
-    len: usize,
     /// Cached pointer to the next write position (for fast push)
     write_ptr: *mut T,
     /// Pointer to the end of the current segment
     segment_end: *mut T,
+    len: usize,
     /// Index of the current segment
     active_segment_index: usize,
+    segment_count: usize,
+    dynamic_segments: [*mut T; MAX_SEGMENTS],
     _marker: PhantomData<T>,
 }
 
