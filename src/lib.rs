@@ -251,13 +251,23 @@ impl<T> SegmentedVec<T> {
     /// Returns a reference to the first element, or `None` if empty.
     #[inline]
     pub fn first(&self) -> Option<&T> {
-        self.get(0)
+        if self.len == 0 {
+            None
+        } else {
+            // SAFETY: len > 0 means segment 0 exists with at least one element
+            Some(unsafe { &*self.dynamic_segments[0] })
+        }
     }
 
     /// Returns a mutable reference to the first element, or `None` if empty.
     #[inline]
     pub fn first_mut(&mut self) -> Option<&mut T> {
-        self.get_mut(0)
+        if self.len == 0 {
+            None
+        } else {
+            // SAFETY: len > 0 means segment 0 exists with at least one element
+            Some(unsafe { &mut *self.dynamic_segments[0] })
+        }
     }
 
     /// Returns a reference to the last element, or `None` if empty.
