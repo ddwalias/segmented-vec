@@ -266,7 +266,8 @@ impl<T> SegmentedVec<T> {
         if self.len == 0 {
             None
         } else {
-            self.get(self.len - 1)
+            // SAFETY: len > 0 means write_ptr points one past the last element
+            Some(unsafe { &*self.write_ptr.sub(1) })
         }
     }
 
@@ -276,7 +277,8 @@ impl<T> SegmentedVec<T> {
         if self.len == 0 {
             None
         } else {
-            self.get_mut(self.len - 1)
+            // SAFETY: len > 0 means write_ptr points one past the last element
+            Some(unsafe { &mut *self.write_ptr.sub(1) })
         }
     }
 
@@ -930,7 +932,8 @@ impl<T> SegmentedVec<T> {
         if index != last_index {
             unsafe {
                 let ptr_a = self.unchecked_at_mut(index) as *mut T;
-                let ptr_b = self.unchecked_at_mut(last_index) as *mut T;
+                // SAFETY: len > 0 means write_ptr points one past the last element
+                let ptr_b = self.write_ptr.sub(1);
                 std::ptr::swap(ptr_a, ptr_b);
             }
         }
