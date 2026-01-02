@@ -50,8 +50,8 @@ pub struct SegmentedVec<T> {
     write_ptr: *mut T,
     /// Pointer to the end of the current segment
     segment_end: *mut T,
-    /// Pointer to the base of the current segment
-    segment_base: *mut T,
+    /// Index of the current segment
+    active_segment_index: usize,
     _marker: PhantomData<T>,
 }
 
@@ -91,25 +91,9 @@ impl<T> SegmentedVec<T> {
             len: 0,
             write_ptr: std::ptr::null_mut(),
             segment_end: std::ptr::null_mut(),
-            segment_base: std::ptr::null_mut(),
+            // Optimization: Initialize to MAX so the first increment wrap around and make it 0
+            active_segment_index: usize::MAX,
             _marker: PhantomData,
-        }
-    }
-
-    /// Initialize or update the write pointer cache.
-    #[inline]
-    fn init_write_ptr(&mut self) {
-        if self.segment_count > 0 {
-            let (shelf, box_idx) = Self::location(self.len);
-            let shelf_size = Self::shelf_size(shelf as u32);
-            let base = unsafe { *self.dynamic_segments.get_unchecked(shelf) };
-            self.segment_base = base;
-            self.write_ptr = unsafe { base.add(box_idx) };
-            self.segment_end = unsafe { base.add(shelf_size) };
-        } else {
-            self.segment_base = std::ptr::null_mut();
-            self.write_ptr = std::ptr::null_mut();
-            self.segment_end = std::ptr::null_mut();
         }
     }
 
@@ -165,28 +149,25 @@ impl<T> SegmentedVec<T> {
     #[cold]
     #[inline(never)]
     fn push_slow(&mut self, value: T) {
-        let new_len = self.len + 1;
+        self.active_segment_index = self.active_segment_index.wrapping_add(1);
 
-        // We're at a segment boundary (box_index = 0), so biased = len + BIAS is a power of 2
-        // Calculate shelf directly without full location()
-        let biased = self.len + Self::MIN_NON_ZERO_CAP;
-        let shelf = (biased.trailing_zeros() - Self::MIN_CAP_EXP) as usize;
-        let shelf_size = Self::shelf_size(shelf as u32);
-
-        let base = if shelf >= self.segment_count {
+        if self.active_segment_index >= self.segment_count {
             self.grow_once();
-            unsafe { *self.dynamic_segments.get_unchecked(self.segment_count - 1) }
-        } else {
-            unsafe { *self.dynamic_segments.get_unchecked(shelf) }
-        };
+        }
+
+        let idx = self.active_segment_index;
+
+        // Load the base pointer for the new segment
+        // SAFETY: grow_once guarantees this slot is populated.
+        let base = unsafe { *self.dynamic_segments.get_unchecked(idx) };
+        let shelf_size = Self::MIN_NON_ZERO_CAP << idx;
 
         unsafe {
             std::ptr::write(base, value);
-            self.segment_base = base;
             self.write_ptr = base.add(1);
             self.segment_end = base.add(shelf_size);
         }
-        self.len = new_len;
+        self.len += 1;
     }
 
     /// Removes the last element from the vector and returns it, or `None` if empty.
@@ -204,11 +185,17 @@ impl<T> SegmentedVec<T> {
     /// ```
     #[inline]
     pub fn pop(&mut self) -> Option<T> {
+        if self.len == 0 {
+            return None;
+        }
+
         // Fast path: current segment still have elements
-        if self.write_ptr > self.segment_base {
+        let segment_capacity = Self::MIN_NON_ZERO_CAP << self.active_segment_index;
+        // SAFETY: segment_end is always valid because len > 0
+        let segment_base = unsafe { self.segment_end.sub(segment_capacity) };
+        if self.write_ptr > segment_base {
+            self.len -= 1;
             unsafe {
-                let new_len = self.len - 1;
-                self.len = new_len;
                 // Move back to the last written element
                 self.write_ptr = self.write_ptr.sub(1);
                 // Return the value
@@ -223,21 +210,18 @@ impl<T> SegmentedVec<T> {
     #[cold]
     #[inline(never)]
     fn pop_slow_path(&mut self) -> Option<T> {
-        if self.len == 0 {
-            return None;
-        }
+        // Safe because caller checked len > 0, and we're at segment boundary,
+        // so active_segment_index must be > 0
+        self.active_segment_index -= 1;
+        let idx = self.active_segment_index;
 
-        unsafe {
-            // Because write_ptr == segment_base, the element we want
-            // is actually at the very first slot of this segment.
-            let val = std::ptr::read(self.write_ptr);
+        let base = unsafe { *self.dynamic_segments.get_unchecked(idx) };
+        let capacity = Self::MIN_NON_ZERO_CAP << idx;
 
-            let new_len = self.len - 1;
-            self.len = new_len;
-            self.init_write_ptr();
-
-            Some(val)
-        }
+        self.segment_end = unsafe { base.add(capacity) };
+        self.write_ptr = unsafe { self.segment_end.sub(1) };
+        self.len -= 1;
+        Some(unsafe { std::ptr::read(self.write_ptr) })
     }
 
     /// Returns a reference to the element at the given index.
@@ -407,6 +391,7 @@ impl<T> SegmentedVec<T> {
         // Reset write pointer cache
         self.write_ptr = std::ptr::null_mut();
         self.segment_end = std::ptr::null_mut();
+        self.active_segment_index = usize::MAX;
     }
 
     /// Shortens the vector, keeping the first `new_len` elements.
@@ -452,20 +437,44 @@ impl<T> SegmentedVec<T> {
         self.len = new_len;
         // Update write pointer cache
         if new_len > 0 {
-            self.init_write_ptr();
+            let biased = new_len + Self::MIN_NON_ZERO_CAP;
+            let msb = biased.ilog2();
+            let idx = (msb - Self::MIN_CAP_EXP) as usize;
+            self.active_segment_index = idx;
+
+            let capacity = 1usize << msb;
+            let offset = biased ^ capacity;
+            unsafe {
+                let base = *self.dynamic_segments.get_unchecked(idx);
+                self.write_ptr = base.add(offset);
+                self.segment_end = base.add(capacity);
+            }
         } else {
+            // Reset to "Genesis" state
             self.write_ptr = std::ptr::null_mut();
             self.segment_end = std::ptr::null_mut();
+            // Set to -1 so the next push wraps to 0
+            self.active_segment_index = usize::MAX;
         }
     }
 
     /// Reserves capacity for at least `additional` more elements.
     pub fn reserve(&mut self, additional: usize) {
-        let old_capacity = self.capacity();
         self.grow_capacity(self.len + additional);
         // Initialize write pointer if we didn't have capacity before
-        if old_capacity == 0 && self.capacity() > 0 && self.segment_end.is_null() {
-            self.init_write_ptr();
+        if self.write_ptr.is_null() {
+            unsafe {
+                // We just guaranteed segment 0 exists in the loop above.
+                let base = *self.dynamic_segments.get_unchecked(0);
+                self.write_ptr = base;
+                self.segment_end = base.add(Self::MIN_NON_ZERO_CAP);
+
+                // Set to 0 so we are valid.
+                // Note: push_slow expects MAX->0 transition, but since we set
+                // write_ptr here, the first push will hit the FAST path (write_ptr < end)
+                // and skip push_slow entirely.
+                self.active_segment_index = 0;
+            }
         }
     }
 
@@ -613,11 +622,19 @@ impl<T> SegmentedVec<T> {
         }
 
         // Set up write pointer cache for next push
-        if self.len < self.capacity() {
-            self.init_write_ptr();
-        } else {
-            self.write_ptr = std::ptr::null_mut();
-            self.segment_end = std::ptr::null_mut();
+        if self.len > 0 {
+            let biased = self.len + Self::MIN_NON_ZERO_CAP;
+            let msb = biased.ilog2();
+            let idx = (msb - Self::MIN_CAP_EXP) as usize;
+            self.active_segment_index = idx;
+
+            let capacity = 1usize << msb;
+            let offset = biased ^ capacity;
+            unsafe {
+                let base = *self.dynamic_segments.get_unchecked(idx);
+                self.write_ptr = base.add(offset);
+                self.segment_end = base.add(capacity);
+            }
         }
     }
 
@@ -649,11 +666,19 @@ impl<T> SegmentedVec<T> {
         }
 
         // Set up write pointer cache for next push
-        if self.len < self.capacity() {
-            self.init_write_ptr();
-        } else {
-            self.write_ptr = std::ptr::null_mut();
-            self.segment_end = std::ptr::null_mut();
+        if self.len > 0 {
+            let biased = self.len + Self::MIN_NON_ZERO_CAP;
+            let msb = biased.ilog2();
+            let idx = (msb - Self::MIN_CAP_EXP) as usize;
+            self.active_segment_index = idx;
+
+            let capacity = 1usize << msb;
+            let offset = biased ^ capacity;
+            unsafe {
+                let base = *self.dynamic_segments.get_unchecked(idx);
+                self.write_ptr = base.add(offset);
+                self.segment_end = base.add(capacity);
+            }
         }
     }
 
@@ -1392,11 +1417,19 @@ impl<T: Clone> Clone for SegmentedVec<T> {
         }
 
         // Set up write pointer
-        if new_vec.len < new_vec.capacity() {
-            new_vec.init_write_ptr();
-        } else {
-            new_vec.write_ptr = std::ptr::null_mut();
-            new_vec.segment_end = std::ptr::null_mut();
+        if new_vec.len > 0 {
+            let biased = new_vec.len + Self::MIN_NON_ZERO_CAP;
+            let msb = biased.ilog2();
+            let idx = (msb - Self::MIN_CAP_EXP) as usize;
+            new_vec.active_segment_index = idx;
+
+            let capacity = 1usize << msb;
+            let offset = biased ^ capacity;
+            unsafe {
+                let base = *new_vec.dynamic_segments.get_unchecked(idx);
+                new_vec.write_ptr = base.add(offset);
+                new_vec.segment_end = base.add(capacity);
+            }
         }
 
         new_vec
