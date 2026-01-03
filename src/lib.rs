@@ -472,24 +472,75 @@ impl<T> SegmentedVec<T> {
     where
         T: Ord,
     {
-        self.as_slice().binary_search(x)
+        self.binary_search_by(|p| p.cmp(x))
     }
 
     /// Binary searches this vector with a comparator function.
-    pub fn binary_search_by<F>(&self, f: F) -> Result<usize, usize>
+    pub fn binary_search_by<F>(&self, mut f: F) -> Result<usize, usize>
     where
         F: FnMut(&T) -> Ordering,
     {
-        self.as_slice().binary_search_by(f)
+        if self.len == 0 {
+            return Err(0);
+        }
+
+        // Check Active Segment (50% Probability)
+        // We calculate base pointer using ALU math because we need capacity later
+        let active_capacity = Self::MIN_NON_ZERO_CAP << self.active_segment_index;
+
+        // SAFETY: segment_end is valid because len > 0
+        let segment_base = unsafe { self.segment_end.sub(active_capacity) };
+        let first_elem = unsafe { &*segment_base };
+
+        // If the first element is <= Target, the target is in this segment
+        // (or this segment is where we need to insert).
+        if f(first_elem) != Ordering::Greater {
+            unsafe {
+                // IMPORTANT: Active segment length is determined by 'write_ptr', NOT capacity.
+                let segment_len = self.write_ptr.offset_from(segment_base) as usize;
+                let slice = std::slice::from_raw_parts(segment_base, segment_len);
+
+                let offset = active_capacity - Self::MIN_NON_ZERO_CAP;
+
+                return match slice.binary_search_by(f) {
+                    Ok(idx) => Ok(offset + idx),
+                    Err(idx) => Err(offset + idx),
+                };
+            }
+        }
+
+        // Reverse Linear Scan
+        // Target is smaller than the active segment. Check previous segments.
+        // Previous segments are GUARANTEED to be full.
+        let mut idx = self.active_segment_index;
+        while idx > 0 {
+            idx -= 1;
+            unsafe {
+                let segment_base = *self.dynamic_segments.get_unchecked(idx);
+                if f(&*segment_base) != Ordering::Greater {
+                    let capacity = Self::MIN_NON_ZERO_CAP << idx;
+                    let slice = std::slice::from_raw_parts(segment_base, capacity);
+
+                    let global_offset = capacity - Self::MIN_NON_ZERO_CAP;
+
+                    return match slice.binary_search_by(f) {
+                        Ok(i) => Ok(global_offset + i),
+                        Err(i) => Err(global_offset + i),
+                    };
+                }
+            }
+        }
+
+        Err(0)
     }
 
     /// Binary searches this vector with a key extraction function.
-    pub fn binary_search_by_key<B, F>(&self, b: &B, f: F) -> Result<usize, usize>
+    pub fn binary_search_by_key<B, F>(&self, b: &B, mut f: F) -> Result<usize, usize>
     where
         F: FnMut(&T) -> B,
         B: Ord,
     {
-        self.as_slice().binary_search_by_key(b, f)
+        self.binary_search_by(|k| f(k).cmp(b))
     }
 
     /// Swaps two elements in the vector.
