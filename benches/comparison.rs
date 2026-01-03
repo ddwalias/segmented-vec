@@ -410,6 +410,76 @@ fn bench_contains(c: &mut Criterion) {
 }
 
 // ============================================================================
+// starts_with benchmarks
+// ============================================================================
+
+fn bench_starts_with(c: &mut Criterion) {
+    let mut group = c.benchmark_group("starts_with");
+
+    for &size in SIZES {
+        let vec_data: Vec<i32> = (0..size as i32).collect();
+        let seg_data: SegmentedVec<i32> = (0..size as i32).collect();
+
+        // Prefix of various sizes
+        let prefix_size = 100.min(size);
+        let prefix: Vec<i32> = (0..prefix_size as i32).collect();
+
+        group.bench_with_input(
+            BenchmarkId::new("Vec", size),
+            &(&vec_data, &prefix),
+            |b, (v, p)| {
+                b.iter(|| black_box(v.starts_with(p)));
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("SegmentedVec", size),
+            &(&seg_data, &prefix),
+            |b, (v, p)| {
+                b.iter(|| black_box(v.starts_with(p)));
+            },
+        );
+    }
+
+    group.finish();
+}
+
+// ============================================================================
+// ends_with benchmarks
+// ============================================================================
+
+fn bench_ends_with(c: &mut Criterion) {
+    let mut group = c.benchmark_group("ends_with");
+
+    for &size in SIZES {
+        let vec_data: Vec<i32> = (0..size as i32).collect();
+        let seg_data: SegmentedVec<i32> = (0..size as i32).collect();
+
+        // Suffix of various sizes
+        let suffix_size = 100.min(size);
+        let suffix: Vec<i32> = ((size - suffix_size) as i32..size as i32).collect();
+
+        group.bench_with_input(
+            BenchmarkId::new("slice", size),
+            &(&vec_data, &suffix),
+            |b, (v, s)| {
+                b.iter(|| black_box(v.ends_with(s)));
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("SegmentedSlice", size),
+            &(&seg_data, &suffix),
+            |b, (v, s)| {
+                b.iter(|| black_box(v.ends_with(s)));
+            },
+        );
+    }
+
+    group.finish();
+}
+
+// ============================================================================
 // Chunk iteration benchmarks
 // ============================================================================
 
@@ -745,6 +815,8 @@ criterion_group!(
     bench_sort_unstable,
     bench_binary_search,
     bench_contains,
+    bench_starts_with,
+    bench_ends_with,
     bench_chunks,
     bench_insert_front,
     bench_remove,
