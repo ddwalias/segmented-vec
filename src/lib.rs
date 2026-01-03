@@ -358,7 +358,40 @@ impl<T> SegmentedVec<T> {
     where
         T: PartialEq,
     {
-        self.as_slice().starts_with(needle)
+        if needle.len() > self.len {
+            return false;
+        }
+
+        if needle.is_empty() {
+            return true;
+        }
+
+        let mut current_segment_capacity = Self::MIN_NON_ZERO_CAP;
+        let mut needle_cursor = 0;
+        let mut idx = 0;
+
+        while needle_cursor < needle.len() {
+            unsafe {
+                let segment_base = *self.dynamic_segments.get_unchecked(idx);
+
+                let remaining = needle.len() - needle_cursor;
+                let match_len = remaining.min(current_segment_capacity);
+
+                let haystack_slice = std::slice::from_raw_parts(segment_base, match_len);
+
+                let needle_slice = &needle[needle_cursor..needle_cursor + match_len];
+
+                if haystack_slice != needle_slice {
+                    return false;
+                }
+
+                needle_cursor += match_len;
+                idx += 1;
+                current_segment_capacity <<= 1;
+            }
+        }
+
+        true
     }
 
     /// Returns `true` if `needle` is a suffix of the vector.
@@ -366,7 +399,69 @@ impl<T> SegmentedVec<T> {
     where
         T: PartialEq,
     {
-        self.as_slice().ends_with(needle)
+        if needle.len() > self.len {
+            return false;
+        }
+
+        if needle.is_empty() {
+            return true;
+        }
+
+        let mut remaining = needle.len();
+        let mut idx = self.active_segment_index;
+
+        // Check active segment
+        unsafe {
+            let segment_base = *self.dynamic_segments.get_unchecked(idx);
+
+            // Calculate the length using pointer math
+            let segment_len = self.write_ptr.offset_from(segment_base) as usize;
+            let match_len = remaining.min(segment_len);
+
+            let haystack_start = self.write_ptr.sub(match_len);
+            let haystack_slice = std::slice::from_raw_parts(haystack_start, match_len);
+
+            let needle_start = remaining - match_len;
+            let needle_slice = &needle[needle_start..remaining];
+
+            if haystack_slice != needle_slice {
+                return false;
+            }
+
+            remaining -= match_len;
+            if remaining == 0 {
+                return true;
+            }
+
+            idx -= 1;
+        }
+
+        // Check other previous segments
+        loop {
+            unsafe {
+                let segment_base = *self.dynamic_segments.get_unchecked(idx);
+
+                let segment_capacity = Self::MIN_NON_ZERO_CAP << idx;
+                let match_len = remaining.min(segment_capacity);
+
+                let haystack_start = segment_base.add(segment_capacity - match_len);
+                let haystack_slice = std::slice::from_raw_parts(haystack_start, match_len);
+
+                let needle_start = remaining - match_len;
+                let needle_slice = &needle[needle_start..remaining];
+
+                if haystack_slice != needle_slice {
+                    return false;
+                }
+
+                remaining -= match_len;
+                if remaining == 0 {
+                    return true;
+                }
+
+                idx -= 1;
+            }
+        }
     }
 
     /// Binary searches this vector for a given element.
@@ -2365,6 +2460,90 @@ mod tests {
         let slice = vec.as_slice();
         assert!(slice.ends_with(&[7, 8, 9]));
         assert!(!slice.ends_with(&[6, 7, 8]));
+    }
+
+    #[test]
+    fn test_starts_with_edge_cases() {
+        // Empty vector
+        let empty: SegmentedVec<i32> = SegmentedVec::new();
+        assert!(empty.starts_with(&[])); // Empty needle always matches
+        assert!(!empty.starts_with(&[1])); // Non-empty needle on empty vec
+
+        // Empty needle
+        let mut vec: SegmentedVec<i32> = SegmentedVec::new();
+        vec.extend(0..10);
+        assert!(vec.starts_with(&[])); // Empty needle always matches
+
+        // Needle equals entire vector
+        let full: Vec<i32> = (0..10).collect();
+        assert!(vec.starts_with(&full));
+
+        // Needle longer than vector
+        let longer: Vec<i32> = (0..20).collect();
+        assert!(!vec.starts_with(&longer));
+
+        // Single element
+        assert!(vec.starts_with(&[0]));
+        assert!(!vec.starts_with(&[1]));
+    }
+
+    #[test]
+    fn test_ends_with_edge_cases() {
+        // Empty vector
+        let empty: SegmentedVec<i32> = SegmentedVec::new();
+        assert!(empty.ends_with(&[])); // Empty needle always matches
+        assert!(!empty.ends_with(&[1])); // Non-empty needle on empty vec
+
+        // Empty needle
+        let mut vec: SegmentedVec<i32> = SegmentedVec::new();
+        vec.extend(0..10);
+        assert!(vec.ends_with(&[])); // Empty needle always matches
+
+        // Needle equals entire vector
+        let full: Vec<i32> = (0..10).collect();
+        assert!(vec.ends_with(&full));
+
+        // Needle longer than vector
+        let longer: Vec<i32> = (0..20).collect();
+        assert!(!vec.ends_with(&longer));
+
+        // Single element
+        assert!(vec.ends_with(&[9]));
+        assert!(!vec.ends_with(&[8]));
+    }
+
+    #[test]
+    fn test_starts_with_across_segments() {
+        // Create a vector that spans multiple segments
+        let mut vec: SegmentedVec<i32> = SegmentedVec::new();
+        vec.extend(0..1000);
+
+        // Test prefix within first segment
+        assert!(vec.starts_with(&[0, 1, 2, 3, 4]));
+
+        // Test prefix that spans segments (first segment is 4 elements)
+        let prefix: Vec<i32> = (0..100).collect();
+        assert!(vec.starts_with(&prefix));
+
+        // Test wrong prefix
+        assert!(!vec.starts_with(&[1, 2, 3]));
+    }
+
+    #[test]
+    fn test_ends_with_across_segments() {
+        // Create a vector that spans multiple segments
+        let mut vec: SegmentedVec<i32> = SegmentedVec::new();
+        vec.extend(0..1000);
+
+        // Test suffix within last segment
+        assert!(vec.ends_with(&[997, 998, 999]));
+
+        // Test suffix that spans segments
+        let suffix: Vec<i32> = (900..1000).collect();
+        assert!(vec.ends_with(&suffix));
+
+        // Test wrong suffix
+        assert!(!vec.ends_with(&[996, 997, 998]));
     }
 
     #[test]
