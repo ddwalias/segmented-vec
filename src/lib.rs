@@ -550,7 +550,13 @@ impl<T> SegmentedVec<T> {
     /// Panics if `a` or `b` are out of bounds.
     #[inline]
     pub fn swap(&mut self, a: usize, b: usize) {
-        self.as_mut_slice().swap(a, b)
+        let ptr_b = &raw mut self[a];
+        let ptr_a = &raw mut self[b];
+        // Note that accessing the elements behind `a` and `b` is checked and will
+        // panic when out of bounds.
+        unsafe {
+            std::ptr::swap(ptr_b, ptr_a);
+        }
     }
 
     /// Reverses the order of elements in the vector.
