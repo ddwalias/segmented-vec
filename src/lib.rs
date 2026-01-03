@@ -190,10 +190,13 @@ impl<T> SegmentedVec<T> {
             return None;
         }
 
-        // Fast path: current segment still have elements
-        let segment_capacity = Self::MIN_NON_ZERO_CAP << self.active_segment_index;
-        // SAFETY: segment_end is always valid because len > 0
-        let segment_base = unsafe { self.segment_end.sub(segment_capacity) };
+        // Fast path: current segment still has elements
+        // SAFETY: len > 0 means active_segment_index is valid
+        let segment_base = unsafe {
+            *self
+                .dynamic_segments
+                .get_unchecked(self.active_segment_index)
+        };
         if self.write_ptr > segment_base {
             self.len -= 1;
             unsafe {
@@ -275,10 +278,23 @@ impl<T> SegmentedVec<T> {
     #[inline]
     pub fn last(&self) -> Option<&T> {
         if self.len == 0 {
-            None
-        } else {
-            // SAFETY: len > 0 means write_ptr points one past the last element
+            return None;
+        }
+
+        // Fast path: check if current segment has elements
+        // SAFETY: len > 0 means active_segment_index is valid
+        let segment_base = unsafe {
+            *self
+                .dynamic_segments
+                .get_unchecked(self.active_segment_index)
+        };
+
+        if self.write_ptr > segment_base {
+            // Last element is in the current segment
             Some(unsafe { &*self.write_ptr.sub(1) })
+        } else {
+            // Current segment is empty, last element is in previous segment
+            self.get(self.len - 1)
         }
     }
 
@@ -286,10 +302,23 @@ impl<T> SegmentedVec<T> {
     #[inline]
     pub fn last_mut(&mut self) -> Option<&mut T> {
         if self.len == 0 {
-            None
-        } else {
-            // SAFETY: len > 0 means write_ptr points one past the last element
+            return None;
+        }
+
+        // Fast path: check if current segment has elements
+        // SAFETY: len > 0 means active_segment_index is valid
+        let segment_base = unsafe {
+            *self
+                .dynamic_segments
+                .get_unchecked(self.active_segment_index)
+        };
+
+        if self.write_ptr > segment_base {
+            // Last element is in the current segment
             Some(unsafe { &mut *self.write_ptr.sub(1) })
+        } else {
+            // Current segment is empty, last element is in previous segment
+            self.get_mut(self.len - 1)
         }
     }
 
@@ -943,8 +972,10 @@ impl<T> SegmentedVec<T> {
         if index != last_index {
             unsafe {
                 let ptr_a = self.unchecked_at_mut(index) as *mut T;
-                // SAFETY: len > 0 means write_ptr points one past the last element
-                let ptr_b = self.write_ptr.sub(1);
+                // Can't use write_ptr.sub(1) here because write_ptr might be at
+                // a segment boundary (start of segment), in which case the last
+                // element is in the previous segment.
+                let ptr_b = self.unchecked_at_mut(last_index) as *mut T;
                 std::ptr::swap(ptr_a, ptr_b);
             }
         }
