@@ -561,7 +561,82 @@ impl<T> SegmentedVec<T> {
 
     /// Reverses the order of elements in the vector.
     pub fn reverse(&mut self) {
-        self.as_mut_slice().reverse()
+        if self.len < 2 {
+            return;
+        }
+
+        let mut remaining_total = self.len;
+
+        // front cursor
+        let mut f_segment_index = 0;
+        let mut f_segment_capacity = Self::MIN_NON_ZERO_CAP;
+        let mut f_segment_base = unsafe { *self.dynamic_segments.get_unchecked(0) };
+        let mut f_remaining = f_segment_capacity;
+
+        // back cursor
+        let mut b_segment_index = self.active_segment_index;
+        let mut b_segment_capacity = Self::MIN_NON_ZERO_CAP << b_segment_index;
+        let mut b_segment_base = unsafe { *self.dynamic_segments.get_unchecked(b_segment_index) };
+        let mut b_remaining = unsafe { self.write_ptr.offset_from(b_segment_base) as usize };
+        let mut b_segment_end = unsafe { self.write_ptr.sub(1) };
+
+        loop {
+            // front and back is in the same slice, use slice.reverse
+            if f_segment_index == b_segment_index {
+                unsafe {
+                    let slice = std::slice::from_raw_parts_mut(f_segment_base, remaining_total);
+                    slice.reverse();
+                }
+                return;
+            }
+
+            let count = f_remaining.min(b_remaining);
+
+            unsafe {
+                self.swap_chunks_reversed_simd(f_segment_base, b_segment_end, count);
+
+                f_segment_base = f_segment_base.add(count);
+                b_segment_end = b_segment_end.sub(count);
+            }
+
+            remaining_total -= count * 2;
+            if remaining_total == 0 {
+                return;
+            }
+
+            // Update Front
+            f_remaining -= count;
+            if f_remaining == 0 {
+                f_segment_index += 1;
+                f_segment_capacity <<= 1;
+                f_remaining = f_segment_capacity;
+                // Load next front segment
+                unsafe {
+                    f_segment_base = *self.dynamic_segments.get_unchecked(f_segment_index);
+                }
+            }
+
+            // Update Back
+            b_remaining -= count;
+            if b_remaining == 0 {
+                b_segment_index -= 1;
+                b_segment_capacity >>= 1;
+                b_remaining = b_segment_capacity;
+                unsafe {
+                    b_segment_base = *self.dynamic_segments.get_unchecked(b_segment_index);
+                    b_segment_end = b_segment_base.add(b_segment_capacity - 1);
+                }
+            }
+        }
+    }
+
+    /// SIMD swap helper.
+    #[inline(always)]
+    unsafe fn swap_chunks_reversed_simd(&mut self, base_a: *mut T, base_b: *mut T, count: usize) {
+        // LLVM will generate SIMD instructions
+        for i in 0..count {
+            std::ptr::swap(base_a.add(i), base_b.sub(i));
+        }
     }
 
     /// Fills the vector with the given value.
