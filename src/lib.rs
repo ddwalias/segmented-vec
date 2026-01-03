@@ -323,12 +323,34 @@ impl<T> SegmentedVec<T> {
     }
 
     /// Returns `true` if the slice contains an element with the given value.
+    ///
+    /// This iterates over the contiguous memory segments and uses the
+    /// standard library's vectorized `contains` on each segment.
     #[inline]
     pub fn contains(&self, x: &T) -> bool
     where
         T: PartialEq,
     {
-        self.as_slice().contains(x)
+        let mut remaining = self.len;
+        let mut segment_idx = 0;
+
+        while remaining > 0 {
+            let segment_capacity = Self::MIN_NON_ZERO_CAP << segment_idx;
+            let segment_len = segment_capacity.min(remaining);
+
+            // SAFETY: segment_idx is valid while remaining > 0
+            let base = unsafe { *self.dynamic_segments.get_unchecked(segment_idx) };
+            let slice = unsafe { std::slice::from_raw_parts(base, segment_len) };
+
+            if slice.contains(x) {
+                return true;
+            }
+
+            segment_idx += 1;
+            remaining -= segment_len;
+        }
+
+        false
     }
 
     /// Returns `true` if `needle` is a prefix of the vector.
