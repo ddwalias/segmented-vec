@@ -718,25 +718,39 @@ impl<T> SegmentedVec<T> {
         }
 
         if std::mem::needs_drop::<T>() {
-            // Drop elements in dynamic segments
-            let mut remaining = self.len;
-            for shelf in 0..self.segment_count {
-                let size = Self::shelf_size(shelf as u32);
-                let count = remaining.min(size);
-                let ptr = unsafe { *self.dynamic_segments.get_unchecked(shelf) };
-                unsafe { std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(ptr, count)) };
-                remaining -= count;
-                if remaining == 0 {
-                    break;
+            // Clear non-active segments
+            for i in 0..self.active_segment_index {
+                unsafe {
+                    let base = *self.dynamic_segments.get_unchecked(i);
+                    let capacity = Self::MIN_NON_ZERO_CAP << i;
+
+                    // Create a standard mutable slice
+                    let slice = std::slice::from_raw_parts_mut(base, capacity);
+                    std::ptr::drop_in_place(slice);
                 }
+            }
+
+            // Clear the active segment
+            unsafe {
+                let base = *self
+                    .dynamic_segments
+                    .get_unchecked(self.active_segment_index);
+
+                let count = self.write_ptr.offset_from(base) as usize;
+                let slice = std::slice::from_raw_parts_mut(base, count);
+                std::ptr::drop_in_place(slice);
             }
         }
 
         self.len = 0;
-        // Reset write pointer cache
-        self.write_ptr = std::ptr::null_mut();
-        self.segment_end = std::ptr::null_mut();
-        self.active_segment_index = usize::MAX;
+        //Because original len > 0, we know that there's at least a segment
+        unsafe {
+            // Point to Segment 0 so next push is O(1)
+            let base = *self.dynamic_segments.get_unchecked(0);
+            self.write_ptr = base;
+            self.segment_end = base.add(Self::MIN_NON_ZERO_CAP);
+            self.active_segment_index = 0;
+        }
     }
 
     /// Shortens the vector, keeping the first `new_len` elements.
