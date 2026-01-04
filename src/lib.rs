@@ -644,15 +644,69 @@ impl<T> SegmentedVec<T> {
     where
         T: Clone,
     {
-        self.as_mut_slice().fill(value)
+        if self.len == 0 {
+            return;
+        }
+
+        // Fill non-active segments
+        for i in 0..self.active_segment_index {
+            unsafe {
+                let base = *self.dynamic_segments.get_unchecked(i);
+                let capacity = Self::MIN_NON_ZERO_CAP << i;
+
+                // Create a standard mutable slice
+                let slice = std::slice::from_raw_parts_mut(base, capacity);
+
+                // We must clone here because we need 'value' for subsequent segments
+                slice.fill(value.clone());
+            }
+        }
+
+        // Fill the active segment
+        unsafe {
+            let base = *self
+                .dynamic_segments
+                .get_unchecked(self.active_segment_index);
+
+            let count = self.write_ptr.offset_from(base) as usize;
+            let slice = std::slice::from_raw_parts_mut(base, count);
+
+            // Optimization: Move the final 'value' in, avoiding one clone
+            slice.fill(value);
+        }
     }
 
     /// Fills the vector with values produced by a function.
-    pub fn fill_with<F>(&mut self, f: F)
+    pub fn fill_with<F>(&mut self, mut f: F)
     where
         F: FnMut() -> T,
     {
-        self.as_mut_slice().fill_with(f)
+        if self.len == 0 {
+            return;
+        }
+
+        // Fill non-active segments
+        for i in 0..self.active_segment_index {
+            unsafe {
+                let base = *self.dynamic_segments.get_unchecked(i);
+                let capacity = Self::MIN_NON_ZERO_CAP << i;
+
+                // Create a standard mutable slice
+                let slice = std::slice::from_raw_parts_mut(base, capacity);
+                slice.fill_with(&mut f);
+            }
+        }
+
+        // Fill the active segment
+        unsafe {
+            let base = *self
+                .dynamic_segments
+                .get_unchecked(self.active_segment_index);
+
+            let count = self.write_ptr.offset_from(base) as usize;
+            let slice = std::slice::from_raw_parts_mut(base, count);
+            slice.fill_with(&mut f);
+        }
     }
 
     /// Clears the vector, removing all elements.
