@@ -212,6 +212,20 @@ impl<T> SegmentedVec<T> {
     #[cold]
     #[inline(never)]
     fn push_slow(&mut self, value: T) {
+        // For ZSTs, we only need one segment ever
+        if std::mem::size_of::<T>() == 0 {
+            if self.buf.segment_count() == 0 {
+                self.buf.grow_one();
+                self.active_segment_index = 0;
+            }
+            // For ZST, write to dangling pointer (no-op for memory, but consumes value)
+            unsafe {
+                std::ptr::write(std::ptr::NonNull::dangling().as_ptr(), value);
+            }
+            self.len += 1;
+            return;
+        }
+
         self.active_segment_index = self.active_segment_index.wrapping_add(1);
 
         if self.active_segment_index >= self.buf.segment_count() {
@@ -247,6 +261,13 @@ impl<T> SegmentedVec<T> {
     pub fn pop(&mut self) -> Option<T> {
         if self.len == 0 {
             return None;
+        }
+
+        // For ZSTs, just decrement len and return a new instance
+        if std::mem::size_of::<T>() == 0 {
+            self.len -= 1;
+            // Read from dangling pointer - no-op for ZST, creates value from nothing
+            return Some(unsafe { std::ptr::read(std::ptr::NonNull::dangling().as_ptr()) });
         }
 
         let segment_base = unsafe { self.buf.segment_ptr(self.active_segment_index) };

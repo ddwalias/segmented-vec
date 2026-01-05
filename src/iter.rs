@@ -21,6 +21,15 @@ impl<'a, T> Iterator for Iter<'a, T> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
+        // For ZSTs, just check index vs len
+        if std::mem::size_of::<T>() == 0 {
+            if self.index < self.vec.len() {
+                self.index += 1;
+                return Some(unsafe { &*std::ptr::NonNull::dangling().as_ptr() });
+            }
+            return None;
+        }
+
         if self.ptr < self.segment_end {
             let result = unsafe { &*self.ptr };
             self.ptr = unsafe { self.ptr.add(1) };
@@ -84,6 +93,15 @@ impl<'a, T> Iterator for IterMut<'a, T> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
+        // For ZSTs, just check index vs len
+        if std::mem::size_of::<T>() == 0 {
+            if self.index < self.vec.len() {
+                self.index += 1;
+                return Some(unsafe { &mut *std::ptr::NonNull::dangling().as_ptr() });
+            }
+            return None;
+        }
+
         if self.ptr < self.segment_end {
             let result = self.ptr;
             self.ptr = unsafe { self.ptr.add(1) };
