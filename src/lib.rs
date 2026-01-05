@@ -756,64 +756,62 @@ impl<T> SegmentedVec<T> {
     /// Shortens the vector, keeping the first `new_len` elements.
     ///
     /// If `new_len` is greater than or equal to the current length, this has no effect.
-    pub fn truncate(&mut self, new_len: usize) {
-        if new_len >= self.len {
+    pub fn truncate(&mut self, len: usize) {
+        if len >= self.len {
             return;
         }
 
-        if std::mem::needs_drop::<T>() {
-            let dynamic_new_len = new_len;
-            let dynamic_old_len = self.len;
+        let biased = len + Self::MIN_NON_ZERO_CAP;
+        let msb = biased.ilog2();
+        let target_idx = (msb - Self::MIN_CAP_EXP) as usize;
+        let target_capacity = 1 << msb;
+        let target_offset = biased ^ target_capacity;
 
-            if dynamic_new_len < dynamic_old_len {
-                let mut pos = 0usize;
-                for shelf in 0..self.segment_count {
-                    let size = Self::shelf_size(shelf as u32);
-                    let seg_end = pos + size;
+        let old_idx = self.active_segment_index;
+        let old_write_ptr = self.write_ptr;
 
-                    // Calculate overlap with [dynamic_new_len, dynamic_old_len)
-                    let drop_start = dynamic_new_len.max(pos);
-                    let drop_end = dynamic_old_len.min(seg_end);
-
-                    if drop_start < drop_end {
-                        let offset = drop_start - pos;
-                        let count = drop_end - drop_start;
-                        let ptr =
-                            unsafe { (*self.dynamic_segments.get_unchecked(shelf)).add(offset) };
-                        unsafe {
-                            std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(ptr, count))
-                        };
-                    }
-
-                    pos = seg_end;
-                    if pos >= dynamic_old_len {
-                        break;
-                    }
-                }
-            }
+        self.len = len;
+        self.active_segment_index = target_idx;
+        unsafe {
+            let base = *self.dynamic_segments.get_unchecked(target_idx);
+            self.write_ptr = base.add(target_offset);
+            self.segment_end = base.add(target_capacity);
         }
 
-        self.len = new_len;
-        // Update write pointer cache
-        if new_len > 0 {
-            let biased = new_len + Self::MIN_NON_ZERO_CAP;
-            let msb = biased.ilog2();
-            let idx = (msb - Self::MIN_CAP_EXP) as usize;
-            self.active_segment_index = idx;
-
-            let capacity = 1usize << msb;
-            let offset = biased ^ capacity;
+        if std::mem::needs_drop::<T>() {
             unsafe {
-                let base = *self.dynamic_segments.get_unchecked(idx);
-                self.write_ptr = base.add(offset);
-                self.segment_end = base.add(capacity);
+                if target_idx == old_idx {
+                    //Same segment, we drop part of the last segment [new_write_ptr..old_write_ptr]
+                    let count = old_write_ptr.offset_from(self.write_ptr) as usize;
+                    std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
+                        self.write_ptr,
+                        count,
+                    ));
+                } else {
+                    // Cross segment
+                    // Drop the tail segments
+                    let tail_start = self.write_ptr;
+                    let tail_len = self.segment_end.offset_from(tail_start) as usize;
+                    std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
+                        tail_start, tail_len,
+                    ));
+                    // Drop the intermediate segments
+                    for i in (target_idx + 1)..old_idx {
+                        let segment_base = *self.dynamic_segments.get_unchecked(i);
+                        let segment_capacity = Self::MIN_NON_ZERO_CAP << i;
+                        std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
+                            segment_base,
+                            segment_capacity,
+                        ));
+                    }
+                    // Drop the head segment
+                    let head_base = *self.dynamic_segments.get_unchecked(old_idx);
+                    let head_len = old_write_ptr.offset_from(head_base) as usize;
+                    std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
+                        head_base, head_len,
+                    ));
+                }
             }
-        } else {
-            // Reset to "Genesis" state
-            self.write_ptr = std::ptr::null_mut();
-            self.segment_end = std::ptr::null_mut();
-            // Set to -1 so the next push wraps to 0
-            self.active_segment_index = usize::MAX;
         }
     }
 
