@@ -1518,7 +1518,10 @@ mod tests {
         let drained: Vec<i32> = vec.drain(3..7).collect();
         assert_eq!(drained, vec![3, 4, 5, 6]);
         assert_eq!(vec.len(), 6);
-        assert_eq!(vec.iter().copied().collect::<Vec<_>>(), vec![0, 1, 2, 7, 8, 9]);
+        assert_eq!(
+            vec.iter().copied().collect::<Vec<_>>(),
+            vec![0, 1, 2, 7, 8, 9]
+        );
     }
 
     #[test]
@@ -1533,7 +1536,10 @@ mod tests {
         let mut vec: SegmentedVec<i32> = SegmentedVec::new();
         vec.extend(0..5);
         vec.insert(2, 100);
-        assert_eq!(vec.iter().copied().collect::<Vec<_>>(), vec![0, 1, 100, 2, 3, 4]);
+        assert_eq!(
+            vec.iter().copied().collect::<Vec<_>>(),
+            vec![0, 1, 100, 2, 3, 4]
+        );
 
         let removed = vec.remove(2);
         assert_eq!(removed, 100);
