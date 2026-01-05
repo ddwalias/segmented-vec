@@ -1312,18 +1312,26 @@ impl<T> SegmentedVec<T> {
     /// Panics if `index >= len`.
     pub fn swap_remove(&mut self, index: usize) -> T {
         assert!(index < self.len);
-        let last_index = self.len - 1;
-        if index != last_index {
-            unsafe {
-                let ptr_a = self.unchecked_at_mut(index) as *mut T;
-                // Can't use write_ptr.sub(1) here because write_ptr might be at
-                // a segment boundary (start of segment), in which case the last
-                // element is in the previous segment.
-                let ptr_b = self.unchecked_at_mut(last_index) as *mut T;
-                std::ptr::swap(ptr_a, ptr_b);
-            }
+        if index == self.len - 1 {
+            // SAFETY: We asserted index < len, so len > 0. pop() will succeed.
+            return unsafe { self.pop().unwrap_unchecked() };
         }
-        self.pop().unwrap()
+
+        unsafe {
+            let biased = index + Self::MIN_NON_ZERO_CAP;
+            let msb = biased.ilog2();
+            let shelf_idx = (msb - Self::MIN_CAP_EXP) as usize;
+            let capacity = 1usize << msb;
+            let offset = biased ^ capacity;
+
+            let segment_base = *self.dynamic_segments.get_unchecked(shelf_idx);
+            let hole_ptr = segment_base.add(offset);
+            let result = std::ptr::read(hole_ptr);
+            let last_val = self.pop().unwrap_unchecked();
+            std::ptr::write(hole_ptr, last_val);
+
+            result
+        }
     }
 
     /// Retains only the elements specified by the predicate.
