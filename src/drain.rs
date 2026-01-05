@@ -99,12 +99,16 @@ impl<T> Drop for Drain<'_, T> {
         let vec = unsafe { self.vec.as_mut() };
         let drain_count = self.range_end - self.range_start;
 
-        // Use the original_len stored when Drain was created
-        for i in 0..(self.original_len - self.range_end) {
-            unsafe {
-                let src = vec.unchecked_at(self.range_end + i) as *const T;
-                let dst = vec.unchecked_at_mut(self.range_start + i) as *mut T;
-                std::ptr::copy_nonoverlapping(src, dst, 1);
+        // Only shift if we actually drained elements (drain_count > 0)
+        // and there are elements after the range to shift
+        if drain_count > 0 {
+            // Use the original_len stored when Drain was created
+            for i in 0..(self.original_len - self.range_end) {
+                unsafe {
+                    let src = vec.unchecked_at(self.range_end + i) as *const T;
+                    let dst = vec.unchecked_at_mut(self.range_start + i) as *mut T;
+                    std::ptr::copy_nonoverlapping(src, dst, 1);
+                }
             }
         }
 
