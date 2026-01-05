@@ -842,6 +842,35 @@ impl<T> SegmentedVec<T> {
         self.shrink_capacity(self.len);
     }
 
+    /// Shrinks the capacity with a lower bound.
+    ///
+    /// The capacity will remain at least as large as both the length
+    /// and the supplied value.
+    ///
+    /// If the current capacity is less than the lower limit, this is a no-op.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use segmented_vec::SegmentedVec;
+    ///
+    /// let mut vec: SegmentedVec<i32> = SegmentedVec::new();
+    /// vec.reserve(100);
+    /// vec.push(1);
+    /// vec.push(2);
+    /// vec.push(3);
+    /// assert!(vec.capacity() >= 100);
+    ///
+    /// vec.shrink_to(10);
+    /// assert!(vec.capacity() >= 10);
+    ///
+    /// vec.shrink_to(0);
+    /// assert!(vec.capacity() >= 3);
+    /// ```
+    pub fn shrink_to(&mut self, min_capacity: usize) {
+        self.shrink_capacity(min_capacity.max(self.len));
+    }
+
     /// Returns an iterator over references to the elements.
     #[inline]
     pub fn iter(&self) -> Iter<'_, T> {
