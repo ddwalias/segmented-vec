@@ -524,14 +524,27 @@ impl<T> SegmentedVec<T> {
         self.buf.shrink_to(min_capacity.max(self.len));
     }
 
-    /// Initialize write pointer if we didn't have capacity before.
+    /// Initialize write pointer if we didn't have capacity before,
+    /// or advance to next segment if at segment boundary.
     fn init_write_ptr_if_needed(&mut self) {
         if self.write_ptr.is_null() && self.buf.segment_count() > 0 {
+            // First allocation
             unsafe {
                 let base = self.buf.segment_ptr(0);
                 self.write_ptr = base;
                 self.segment_end = base.add(RawSegmentedVec::<T>::segment_capacity(0));
                 self.active_segment_index = 0;
+            }
+        } else if self.write_ptr == self.segment_end {
+            // At segment boundary, advance to next segment if available
+            let next_seg = self.active_segment_index.wrapping_add(1);
+            if next_seg < self.buf.segment_count() {
+                unsafe {
+                    let base = self.buf.segment_ptr(next_seg);
+                    self.write_ptr = base;
+                    self.segment_end = base.add(RawSegmentedVec::<T>::segment_capacity(next_seg));
+                    self.active_segment_index = next_seg;
+                }
             }
         }
     }
@@ -716,12 +729,103 @@ impl<T> SegmentedVec<T> {
     /// Panics if `index > len`.
     pub fn insert(&mut self, index: usize, element: T) {
         assert!(index <= self.len);
-        self.push(element);
-        if index < self.len - 1 {
-            for i in (index..self.len - 1).rev() {
-                self.swap(i, i + 1);
+
+        if std::mem::size_of::<T>() == 0 {
+            self.len += 1;
+            unsafe {
+                std::ptr::write(std::ptr::NonNull::dangling().as_ptr(), element);
+            }
+            return;
+        }
+
+        if index == self.len {
+            self.push(element);
+            return;
+        }
+
+        // Ensure capacity (also advances write_ptr to next segment if at boundary)
+        if self.write_ptr == self.segment_end {
+            self.reserve(1);
+        }
+
+        // Find segment containing index
+        let (mut seg_idx, offset) = RawSegmentedVec::<T>::location(index);
+        let mut seg_cap = RawSegmentedVec::<T>::segment_capacity(seg_idx);
+        let mut seg_base = unsafe { self.buf.segment_ptr(seg_idx) };
+
+        // Calculate how many elements are in this segment after `offset`
+        let active_seg = self.active_segment_index;
+        let seg_end = if seg_idx == active_seg {
+            unsafe { self.write_ptr.offset_from(seg_base) as usize }
+        } else {
+            seg_cap
+        };
+
+        // Save last element of current segment (will ripple forward)
+        let mut carry = unsafe { std::ptr::read(seg_base.add(seg_end - 1)) };
+
+        // Shift elements [offset, seg_end-1) right by 1
+        if seg_end - 1 > offset {
+            unsafe {
+                std::ptr::copy(
+                    seg_base.add(offset),
+                    seg_base.add(offset + 1),
+                    seg_end - 1 - offset,
+                );
             }
         }
+
+        // Write new element at insertion point
+        unsafe {
+            std::ptr::write(seg_base.add(offset), element);
+        }
+
+        // Ripple through subsequent full segments (not including active)
+        while seg_idx + 1 < active_seg {
+            seg_idx += 1;
+            seg_cap <<= 1;
+            seg_base = unsafe { self.buf.segment_ptr(seg_idx) };
+
+            // Save last element
+            let next_carry = unsafe { std::ptr::read(seg_base.add(seg_cap - 1)) };
+
+            // Shift all elements right by 1
+            unsafe {
+                std::ptr::copy(seg_base, seg_base.add(1), seg_cap - 1);
+            }
+
+            // Place carried element at start
+            unsafe {
+                std::ptr::write(seg_base, carry);
+            }
+
+            carry = next_carry;
+        }
+
+        // Handle active segment (if we haven't already processed it as the initial segment)
+        if seg_idx < active_seg {
+            let active_base = unsafe { self.buf.segment_ptr(active_seg) };
+            let active_len = unsafe { self.write_ptr.offset_from(active_base) as usize };
+
+            if active_len > 0 {
+                // Shift active segment elements right by 1
+                unsafe {
+                    std::ptr::copy(active_base, active_base.add(1), active_len);
+                }
+            }
+            // Place carry at start (or as only element if empty)
+            unsafe {
+                std::ptr::write(active_base, carry);
+            }
+        } else {
+            // We inserted into the active segment, write carry at write_ptr
+            unsafe {
+                std::ptr::write(self.write_ptr, carry);
+            }
+        }
+
+        self.len += 1;
+        self.write_ptr = unsafe { self.write_ptr.add(1) };
     }
 
     /// Removes and returns the element at position `index`.
