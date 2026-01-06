@@ -835,10 +835,89 @@ impl<T> SegmentedVec<T> {
     /// Panics if `index >= len`.
     pub fn remove(&mut self, index: usize) -> T {
         assert!(index < self.len);
-        for i in index..self.len - 1 {
-            self.swap(i, i + 1);
+
+        if std::mem::size_of::<T>() == 0 {
+            self.len -= 1;
+            return unsafe { std::ptr::read(std::ptr::NonNull::dangling().as_ptr()) };
         }
-        self.pop().unwrap()
+
+        // Removing last element is just pop
+        if index == self.len - 1 {
+            return unsafe { self.pop().unwrap_unchecked() };
+        }
+
+        // Find segment containing index
+        let (mut seg_idx, offset) = RawSegmentedVec::<T>::location(index);
+        let mut seg_cap = RawSegmentedVec::<T>::segment_capacity(seg_idx);
+        let mut seg_base = unsafe { self.buf.segment_ptr(seg_idx) };
+
+        // Save the element to remove
+        let removed = unsafe { std::ptr::read(seg_base.add(offset)) };
+
+        let active_seg = self.active_segment_index;
+
+        // Calculate segment end for initial segment
+        let seg_end = if seg_idx == active_seg {
+            unsafe { self.write_ptr.offset_from(seg_base) as usize }
+        } else {
+            seg_cap
+        };
+
+        // Shift elements [offset+1, seg_end) left by 1 in initial segment
+        if offset + 1 < seg_end {
+            unsafe {
+                std::ptr::copy(
+                    seg_base.add(offset + 1),
+                    seg_base.add(offset),
+                    seg_end - offset - 1,
+                );
+            }
+        }
+
+        // Ripple through subsequent segments
+        while seg_idx < active_seg {
+            let next_seg_idx = seg_idx + 1;
+            let next_seg_cap = seg_cap << 1;
+            let next_seg_base = unsafe { self.buf.segment_ptr(next_seg_idx) };
+
+            let next_seg_len = if next_seg_idx == active_seg {
+                unsafe { self.write_ptr.offset_from(next_seg_base) as usize }
+            } else {
+                next_seg_cap
+            };
+
+            // If next segment is empty, stop rippling
+            if next_seg_len == 0 {
+                break;
+            }
+
+            // Carry first element of next segment to last position of current segment
+            let carry = unsafe { std::ptr::read(next_seg_base) };
+            unsafe {
+                std::ptr::write(seg_base.add(seg_cap - 1), carry);
+            }
+
+            // Shift next segment elements left by 1
+            if next_seg_len > 1 {
+                unsafe {
+                    std::ptr::copy(
+                        next_seg_base.add(1),
+                        next_seg_base,
+                        next_seg_len - 1,
+                    );
+                }
+            }
+
+            seg_idx = next_seg_idx;
+            seg_cap = next_seg_cap;
+            seg_base = next_seg_base;
+        }
+
+        // Update length and write_ptr
+        self.len -= 1;
+        self.update_write_ptr_for_len();
+
+        removed
     }
 
     /// Removes an element from the vector and returns it.
