@@ -441,11 +441,16 @@ impl<T> SegmentedVec<T> {
             return;
         }
 
-        // Reset state BEFORE dropping to prevent double-free if drop panics
+        // Reset len BEFORE dropping to prevent double-free if drop panics
         self.len = 0;
-        self.write_ptr = std::ptr::null_mut();
-        self.segment_end = std::ptr::null_mut();
-        self.active_segment_index = usize::MAX;
+
+        // Reset write_ptr to segment 0 (keep capacity usable)
+        if self.buf.segment_count() > 0 {
+            let base = unsafe { self.buf.segment_ptr(0) };
+            self.write_ptr = base;
+            self.segment_end = unsafe { base.add(RawSegmentedVec::<T>::segment_capacity(0)) };
+            self.active_segment_index = 0;
+        }
 
         // Drop all elements
         if std::mem::needs_drop::<T>() {
@@ -477,11 +482,12 @@ impl<T> SegmentedVec<T> {
 
         // Update state BEFORE dropping to prevent double-free if drop panics
         self.len = len;
-        if len == 0 {
-            self.write_ptr = std::ptr::null_mut();
-            self.segment_end = std::ptr::null_mut();
-            self.active_segment_index = usize::MAX;
-        } else {
+        if len == 0 && self.buf.segment_count() > 0 {
+            let base = unsafe { self.buf.segment_ptr(0) };
+            self.write_ptr = base;
+            self.segment_end = unsafe { base.add(RawSegmentedVec::<T>::segment_capacity(0)) };
+            self.active_segment_index = 0;
+        } else if len > 0 {
             self.update_write_ptr_for_len();
         }
 
@@ -552,9 +558,12 @@ impl<T> SegmentedVec<T> {
     /// Updates write_ptr based on current len.
     pub(crate) fn update_write_ptr_for_len(&mut self) {
         if self.len == 0 {
-            self.write_ptr = std::ptr::null_mut();
-            self.segment_end = std::ptr::null_mut();
-            self.active_segment_index = usize::MAX;
+            if self.buf.segment_count() > 0 {
+                let base = unsafe { self.buf.segment_ptr(0) };
+                self.write_ptr = base;
+                self.segment_end = unsafe { base.add(RawSegmentedVec::<T>::segment_capacity(0)) };
+                self.active_segment_index = 0;
+            }
             return;
         }
         let (segment, offset) = RawSegmentedVec::<T>::location(self.len - 1);
@@ -565,6 +574,21 @@ impl<T> SegmentedVec<T> {
             self.segment_end = base.add(segment_size);
             self.write_ptr = base.add(offset + 1);
         }
+    }
+
+    /// Decrements write_ptr by 1, handling segment boundary.
+    #[inline]
+    fn decrement_write_ptr(&mut self) {
+        let active_base = unsafe { self.buf.segment_ptr(self.active_segment_index) };
+        if self.write_ptr == active_base && self.active_segment_index > 0 {
+            // Move back to previous segment
+            self.active_segment_index -= 1;
+            let prev_cap = RawSegmentedVec::<T>::segment_capacity(self.active_segment_index);
+            let prev_base = unsafe { self.buf.segment_ptr(self.active_segment_index) };
+            self.write_ptr = unsafe { prev_base.add(prev_cap) };
+            self.segment_end = self.write_ptr;
+        }
+        self.write_ptr = unsafe { self.write_ptr.sub(1) };
     }
 
     /// Sets the length without any checks.
@@ -915,7 +939,7 @@ impl<T> SegmentedVec<T> {
 
         // Update length and write_ptr
         self.len -= 1;
-        self.update_write_ptr_for_len();
+        self.decrement_write_ptr();
 
         removed
     }
@@ -943,7 +967,8 @@ impl<T> SegmentedVec<T> {
             std::ptr::copy_nonoverlapping(ptr_last, ptr_idx, 1);
 
             self.len -= 1;
-            self.update_write_ptr_for_len();
+            // len > 0 guaranteed since we handle last element case above
+            self.decrement_write_ptr();
             value
         }
     }
@@ -1160,11 +1185,12 @@ impl<T> SegmentedVec<T> {
             }
         }
         self.len = at;
-        if at == 0 {
-            self.write_ptr = std::ptr::null_mut();
-            self.segment_end = std::ptr::null_mut();
-            self.active_segment_index = usize::MAX;
-        } else {
+        if at == 0 && self.buf.segment_count() > 0 {
+            let base = unsafe { self.buf.segment_ptr(0) };
+            self.write_ptr = base;
+            self.segment_end = unsafe { base.add(RawSegmentedVec::<T>::segment_capacity(0)) };
+            self.active_segment_index = 0;
+        } else if at > 0 {
             self.update_write_ptr_for_len();
         }
         other
