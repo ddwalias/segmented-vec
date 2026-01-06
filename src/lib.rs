@@ -924,11 +924,7 @@ impl<T> SegmentedVec<T> {
             // Shift next segment elements left by 1
             if next_seg_len > 1 {
                 unsafe {
-                    std::ptr::copy(
-                        next_seg_base.add(1),
-                        next_seg_base,
-                        next_seg_len - 1,
-                    );
+                    std::ptr::copy(next_seg_base.add(1), next_seg_base, next_seg_len - 1);
                 }
             }
 
@@ -959,16 +955,13 @@ impl<T> SegmentedVec<T> {
         }
 
         unsafe {
-            let ptr_idx = self.buf.ptr_at(index);
+            let ptr_idx = self.unchecked_at_mut(index) as *mut T;
             let value = std::ptr::read(ptr_idx);
 
-            // Copy last element to the removed position
-            let ptr_last = self.buf.ptr_at(self.len - 1);
-            std::ptr::copy_nonoverlapping(ptr_last, ptr_idx, 1);
+            // Write last element to the removed position
+            let last_val = self.pop().unwrap_unchecked();
+            std::ptr::write(ptr_idx, last_val);
 
-            self.len -= 1;
-            // len > 0 guaranteed since we handle last element case above
-            self.decrement_write_ptr();
             value
         }
     }
