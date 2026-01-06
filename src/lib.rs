@@ -348,12 +348,24 @@ impl<T> SegmentedVec<T> {
             return None;
         }
 
+        if std::mem::size_of::<T>() == 0 {
+            return Some(unsafe { &*std::ptr::NonNull::dangling().as_ptr() });
+        }
+
         let segment_base = unsafe { self.buf.segment_ptr(self.active_segment_index) };
 
         if self.write_ptr > segment_base {
             Some(unsafe { &*self.write_ptr.sub(1) })
         } else {
-            self.get(self.len - 1)
+            // Cold path: write_ptr is at the start of the active segment,
+            // so the last element is in the previous (fully populated) segment.
+            let prev_segment_index = self.active_segment_index - 1;
+            let prev_cap = RawSegmentedVec::<T>::segment_capacity(prev_segment_index);
+
+            unsafe {
+                let prev_segment_base = self.buf.segment_ptr(prev_segment_index);
+                Some(&*prev_segment_base.add(prev_cap - 1))
+            }
         }
     }
 
@@ -364,12 +376,24 @@ impl<T> SegmentedVec<T> {
             return None;
         }
 
+        if std::mem::size_of::<T>() == 0 {
+            return Some(unsafe { &mut *std::ptr::NonNull::dangling().as_ptr() });
+        }
+
         let segment_base = unsafe { self.buf.segment_ptr(self.active_segment_index) };
 
         if self.write_ptr > segment_base {
             Some(unsafe { &mut *self.write_ptr.sub(1) })
         } else {
-            self.get_mut(self.len - 1)
+            // Cold path: write_ptr is at the start of the active segment,
+            // so the last element is in the previous (fully populated) segment.
+            let prev_segment_index = self.active_segment_index - 1;
+            let prev_cap = RawSegmentedVec::<T>::segment_capacity(prev_segment_index);
+
+            unsafe {
+                let prev_segment_base = self.buf.segment_ptr(prev_segment_index);
+                Some(&mut *prev_segment_base.add(prev_cap - 1))
+            }
         }
     }
 
