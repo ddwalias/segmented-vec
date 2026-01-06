@@ -403,22 +403,30 @@ impl<T> SegmentedVec<T> {
     where
         T: PartialEq,
     {
-        let mut remaining = self.len;
-        let mut segment_idx = 0;
+        if self.len == 0 {
+            return false;
+        }
 
-        while remaining > 0 {
-            let segment_capacity = RawSegmentedVec::<T>::segment_capacity(segment_idx);
-            let segment_len = segment_capacity.min(remaining);
-
-            let base = unsafe { self.buf.segment_ptr(segment_idx) };
-            let slice = unsafe { std::slice::from_raw_parts(base, segment_len) };
-
+        // Check active segment first (largest, benefits most from memchr)
+        let active_base = unsafe { self.buf.segment_ptr(self.active_segment_index) };
+        let active_len = unsafe { self.write_ptr.offset_from(active_base) as usize };
+        if active_len > 0 {
+            let slice = unsafe { std::slice::from_raw_parts(active_base, active_len) };
             if slice.contains(x) {
                 return true;
             }
+        }
 
-            segment_idx += 1;
-            remaining -= segment_len;
+        // Check previous segments in reverse order (all fully populated)
+        let mut segment_idx = self.active_segment_index;
+        while segment_idx > 0 {
+            segment_idx -= 1;
+            let segment_cap = RawSegmentedVec::<T>::segment_capacity(segment_idx);
+            let base = unsafe { self.buf.segment_ptr(segment_idx) };
+            let slice = unsafe { std::slice::from_raw_parts(base, segment_cap) };
+            if slice.contains(x) {
+                return true;
+            }
         }
 
         false
