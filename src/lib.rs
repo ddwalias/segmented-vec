@@ -436,13 +436,20 @@ impl<T> SegmentedVec<T> {
     ///
     /// This drops all elements but keeps the allocated memory.
     pub fn clear(&mut self) {
-        if self.len == 0 {
+        let old_len = self.len;
+        if old_len == 0 {
             return;
         }
 
+        // Reset state BEFORE dropping to prevent double-free if drop panics
+        self.len = 0;
+        self.write_ptr = std::ptr::null_mut();
+        self.segment_end = std::ptr::null_mut();
+        self.active_segment_index = usize::MAX;
+
         // Drop all elements
         if std::mem::needs_drop::<T>() {
-            let mut remaining = self.len;
+            let mut remaining = old_len;
             let mut segment_idx = 0;
 
             while remaining > 0 {
@@ -458,11 +465,6 @@ impl<T> SegmentedVec<T> {
                 remaining -= segment_len;
             }
         }
-
-        self.len = 0;
-        self.write_ptr = std::ptr::null_mut();
-        self.segment_end = std::ptr::null_mut();
-        self.active_segment_index = usize::MAX;
     }
 
     /// Shortens the vector, keeping the first `len` elements and dropping the rest.
@@ -471,15 +473,9 @@ impl<T> SegmentedVec<T> {
             return;
         }
 
-        // Drop elements beyond new length
-        if std::mem::needs_drop::<T>() {
-            for i in len..self.len {
-                unsafe {
-                    std::ptr::drop_in_place(self.unchecked_at_mut(i));
-                }
-            }
-        }
+        let old_len = self.len;
 
+        // Update state BEFORE dropping to prevent double-free if drop panics
         self.len = len;
         if len == 0 {
             self.write_ptr = std::ptr::null_mut();
@@ -487,6 +483,15 @@ impl<T> SegmentedVec<T> {
             self.active_segment_index = usize::MAX;
         } else {
             self.update_write_ptr_for_len();
+        }
+
+        // Drop elements beyond new length
+        if std::mem::needs_drop::<T>() {
+            for i in len..old_len {
+                unsafe {
+                    std::ptr::drop_in_place(self.unchecked_at_mut(i));
+                }
+            }
         }
     }
 
