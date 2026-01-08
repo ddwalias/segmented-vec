@@ -1396,21 +1396,103 @@ impl<T> SegmentedVec<T> {
     }
 
     /// Retains only the elements specified by the predicate, with mutable access.
+    ///
+    /// Uses two independent segment cursors (read and write) that traverse
+    /// linearly, avoiding per-element segment/offset calculations.
     pub fn retain_mut<F>(&mut self, mut f: F)
     where
         F: FnMut(&mut T) -> bool,
     {
-        let mut write_idx = 0;
-        for read_idx in 0..self.len {
-            let keep = unsafe { f(self.unchecked_at_mut(read_idx)) };
-            if keep {
-                if write_idx != read_idx {
-                    self.swap(write_idx, read_idx);
+        if self.len == 0 {
+            return;
+        }
+
+        // Handle ZST
+        if std::mem::size_of::<T>() == 0 {
+            let mut write_idx = 0;
+            for _ in 0..self.len {
+                let keep = unsafe { f(&mut *NonNull::<T>::dangling().as_ptr()) };
+                if keep {
+                    write_idx += 1;
                 }
-                write_idx += 1;
+            }
+            self.len = write_idx;
+            return;
+        }
+
+        let total_len = self.len;
+
+        // Initialize read cursor
+        let mut read_seg_idx: usize = 0;
+        let mut read_offset: usize = 0;
+        let mut read_seg_cap = RawSegmentedVec::<T>::segment_capacity(0);
+        let mut read_ptr = unsafe { self.buf.segment_ptr(0) };
+
+        // Initialize write cursor (same as read initially)
+        let mut write_seg_idx: usize = 0;
+        let mut write_offset: usize = 0;
+        let mut write_seg_cap = read_seg_cap;
+        let mut write_ptr = read_ptr;
+
+        let mut write_count: usize = 0;
+        let mut deleted_count: usize = 0;
+
+        for _ in 0..total_len {
+            // Get element at read cursor
+            let elem_ptr = unsafe { read_ptr.add(read_offset) };
+            let keep = unsafe { f(&mut *elem_ptr) };
+
+            if keep {
+                // Move element from read to write position if they differ
+                if deleted_count > 0 {
+                    unsafe {
+                        let write_elem_ptr = write_ptr.add(write_offset);
+                        // Move the element (read is now garbage, will be overwritten or truncated)
+                        std::ptr::copy_nonoverlapping(elem_ptr, write_elem_ptr, 1);
+                    }
+                }
+                write_count += 1;
+
+                // Advance write cursor
+                write_offset += 1;
+                if write_offset >= write_seg_cap {
+                    write_seg_idx += 1;
+                    write_offset = 0;
+                    if write_seg_idx < self.buf.segment_count() {
+                        write_seg_cap = RawSegmentedVec::<T>::segment_capacity(write_seg_idx);
+                        write_ptr = unsafe { self.buf.segment_ptr(write_seg_idx) };
+                    }
+                }
+            } else {
+                // Drop the element
+                unsafe {
+                    std::ptr::drop_in_place(elem_ptr);
+                }
+                deleted_count += 1;
+            }
+
+            // Advance read cursor
+            read_offset += 1;
+            if read_offset >= read_seg_cap {
+                read_seg_idx += 1;
+                read_offset = 0;
+                if read_seg_idx < self.buf.segment_count() {
+                    read_seg_cap = RawSegmentedVec::<T>::segment_capacity(read_seg_idx);
+                    read_ptr = unsafe { self.buf.segment_ptr(read_seg_idx) };
+                }
             }
         }
-        self.truncate(write_idx);
+
+        // Update length and write pointer
+        self.len = write_count;
+        if write_count == 0 && self.buf.segment_count() > 0 {
+            let base = unsafe { self.buf.segment_ptr(0) };
+            self.write_ptr = base;
+            self.segment_end = unsafe { base.add(RawSegmentedVec::<T>::segment_capacity(0)) };
+            self.active_segment_index = 0;
+        } else if write_count > 0 {
+            self.update_write_ptr_for_len();
+        }
     }
 
     /// Removes consecutive duplicate elements.
