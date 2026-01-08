@@ -2251,11 +2251,37 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
     /// Clears the vector, removing all elements.
     ///
     /// This drops all elements but keeps the allocated memory.
+    ///
+    /// Optimized to:
+    /// - Handle ZST separately (no segments involved)
+    /// - Split full segments (0..active_idx) from partial segment (active_idx)
+    /// - Derive active segment base from registers (segment_end - capacity) instead of memory lookups
     fn clear_internal(&mut self) {
         let old_len = self.len;
         if old_len == 0 {
             return;
         }
+
+        // Handle ZST - no actual memory to deal with
+        if std::mem::size_of::<T>() == 0 {
+            if std::mem::needs_drop::<T>() {
+                for _ in 0..old_len {
+                    unsafe {
+                        std::ptr::drop_in_place(NonNull::<T>::dangling().as_ptr());
+                    }
+                }
+            }
+            self.len = 0;
+            return;
+        }
+
+        // Capture drop parameters from registers BEFORE resetting state
+        let active_idx = self.active_segment_index;
+        let active_cap = RawSegmentedVec::<T, A>::segment_capacity(active_idx);
+        // Derive active segment base from segment_end (in register) instead of array lookup
+        let active_base = unsafe { self.segment_end.sub(active_cap) };
+        // Elements in active segment = write_ptr - base
+        let active_len = unsafe { self.write_ptr.offset_from(active_base) as usize };
 
         // Reset len BEFORE dropping to prevent double-free if drop panics
         self.len = 0;
@@ -2270,20 +2296,23 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
 
         // Drop all elements
         if std::mem::needs_drop::<T>() {
-            let mut remaining = old_len;
-            let mut segment_idx = 0;
-
-            while remaining > 0 {
-                let segment_cap = RawSegmentedVec::<T, A>::segment_capacity(segment_idx);
-                let segment_len = segment_cap.min(remaining);
-                let base = unsafe { self.buf.segment_ptr(segment_idx) };
-
+            // Drop full segments (0..active_idx) - no min() needed, they're all full
+            for seg_idx in 0..active_idx {
+                let seg_cap = RawSegmentedVec::<T, A>::segment_capacity(seg_idx);
+                let base = unsafe { self.buf.segment_ptr(seg_idx) };
                 unsafe {
-                    std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(base, segment_len));
+                    std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(base, seg_cap));
                 }
+            }
 
-                segment_idx += 1;
-                remaining -= segment_len;
+            // Drop partial active segment (already captured active_base and active_len)
+            if active_len > 0 {
+                unsafe {
+                    std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
+                        active_base,
+                        active_len,
+                    ));
+                }
             }
         }
     }
