@@ -1065,6 +1065,11 @@ impl<T> SegmentedVec<T> {
     }
 
     /// Fills the vector with elements by cloning `value`.
+    ///
+    /// Optimized based on type characteristics:
+    /// - For Copy/POD types: uses `slice.fill()` which optimizes to memset/SIMD
+    /// - For complex types: uses `clone_from` to reuse existing heap allocations
+    /// - The last element receives the moved value, saving one clone
     pub fn fill(&mut self, value: T)
     where
         T: Clone,
@@ -1073,15 +1078,54 @@ impl<T> SegmentedVec<T> {
             return;
         }
 
+        // For types without Drop (Copy/POD), slice.fill is optimal
+        // as it can be vectorized to memset/SIMD
+        if !std::mem::needs_drop::<T>() {
+            let mut remaining = self.len;
+            let mut segment_idx = 0;
+
+            while remaining > 0 {
+                let segment_cap = RawSegmentedVec::<T>::segment_capacity(segment_idx);
+                let segment_len = segment_cap.min(remaining);
+                let base = unsafe { self.buf.segment_ptr(segment_idx) };
+                let slice = unsafe { std::slice::from_raw_parts_mut(base, segment_len) };
+                slice.fill(value.clone());
+                segment_idx += 1;
+                remaining -= segment_len;
+            }
+            return;
+        }
+
+        // For complex types with Drop, use clone_from to reuse heap allocations
+        // and move the value into the last position to save one clone
+        let last_idx = self.len - 1;
         let mut remaining = self.len;
         let mut segment_idx = 0;
+        let mut global_idx = 0;
 
         while remaining > 0 {
             let segment_cap = RawSegmentedVec::<T>::segment_capacity(segment_idx);
             let segment_len = segment_cap.min(remaining);
             let base = unsafe { self.buf.segment_ptr(segment_idx) };
-            let slice = unsafe { std::slice::from_raw_parts_mut(base, segment_len) };
-            slice.fill(value.clone());
+
+            for i in 0..segment_len {
+                let current_idx = global_idx + i;
+                if current_idx == last_idx {
+                    // Move value into the last position, saving one clone
+                    unsafe {
+                        // Drop existing element and write the moved value
+                        std::ptr::drop_in_place(base.add(i));
+                        std::ptr::write(base.add(i), value);
+                    }
+                    return;
+                }
+                // Use clone_from to potentially reuse existing allocations
+                unsafe {
+                    (*base.add(i)).clone_from(&value);
+                }
+            }
+
+            global_idx += segment_len;
             segment_idx += 1;
             remaining -= segment_len;
         }
