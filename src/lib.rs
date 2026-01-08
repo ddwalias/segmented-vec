@@ -1161,18 +1161,124 @@ impl<T> SegmentedVec<T> {
     }
 
     /// Resizes the vector to `new_len` elements.
+    ///
+    /// Uses chunk-based filling for better performance:
+    /// - For Copy/POD types: uses `slice.fill()` which optimizes to memset/SIMD
+    /// - For complex types: writes clones directly to uninitialized memory
+    /// - The last element receives the moved value, saving one clone
     pub fn resize(&mut self, new_len: usize, value: T)
     where
         T: Clone,
     {
-        if new_len > self.len {
-            self.reserve(new_len - self.len);
-            while self.len < new_len {
-                self.push(value.clone());
-            }
-        } else {
+        if new_len <= self.len {
             self.truncate(new_len);
+            return;
         }
+
+        let old_len = self.len;
+        let additional = new_len - old_len;
+        self.reserve(additional);
+
+        // Handle ZST
+        if std::mem::size_of::<T>() == 0 {
+            for _ in 0..additional {
+                unsafe {
+                    std::ptr::write(NonNull::<T>::dangling().as_ptr(), value.clone());
+                }
+            }
+            self.len = new_len;
+            return;
+        }
+
+        // For types without Drop (Copy/POD), use slice.fill for SIMD optimization
+        if !std::mem::needs_drop::<T>() {
+            // Find starting segment and offset
+            let (mut seg_idx, mut offset) = if old_len == 0 {
+                (0, 0)
+            } else {
+                let (seg, off) = RawSegmentedVec::<T>::location(old_len - 1);
+                let seg_cap = RawSegmentedVec::<T>::segment_capacity(seg);
+                if off + 1 >= seg_cap {
+                    (seg + 1, 0)
+                } else {
+                    (seg, off + 1)
+                }
+            };
+
+            let mut remaining = additional;
+
+            while remaining > 0 {
+                let seg_cap = RawSegmentedVec::<T>::segment_capacity(seg_idx);
+                let available = seg_cap - offset;
+                let to_fill = remaining.min(available);
+                let base = unsafe { self.buf.segment_ptr(seg_idx) };
+
+                unsafe {
+                    let slice = std::slice::from_raw_parts_mut(base.add(offset), to_fill);
+                    slice.fill(value.clone());
+                }
+
+                remaining -= to_fill;
+                seg_idx += 1;
+                offset = 0;
+            }
+
+            self.len = new_len;
+            self.update_write_ptr_for_len();
+            return;
+        }
+
+        // For complex types with Drop, write clones individually
+        // Move value into the last position to save one clone
+        let (mut seg_idx, mut offset) = if old_len == 0 {
+            (0, 0)
+        } else {
+            let (seg, off) = RawSegmentedVec::<T>::location(old_len - 1);
+            let seg_cap = RawSegmentedVec::<T>::segment_capacity(seg);
+            if off + 1 >= seg_cap {
+                (seg + 1, 0)
+            } else {
+                (seg, off + 1)
+            }
+        };
+
+        let mut remaining = additional;
+
+        while remaining > 1 {
+            let seg_cap = RawSegmentedVec::<T>::segment_capacity(seg_idx);
+            let available = seg_cap - offset;
+            let to_fill = (remaining - 1).min(available); // Reserve 1 for the moved value
+            let base = unsafe { self.buf.segment_ptr(seg_idx) };
+
+            for i in 0..to_fill {
+                unsafe {
+                    std::ptr::write(base.add(offset + i), value.clone());
+                }
+            }
+
+            remaining -= to_fill;
+            offset += to_fill;
+            if offset >= seg_cap {
+                seg_idx += 1;
+                offset = 0;
+            }
+        }
+
+        // Write the last element by moving the value (saves one clone)
+        if remaining == 1 {
+            let seg_cap = RawSegmentedVec::<T>::segment_capacity(seg_idx);
+            if offset >= seg_cap {
+                seg_idx += 1;
+                offset = 0;
+            }
+            let base = unsafe { self.buf.segment_ptr(seg_idx) };
+            unsafe {
+                std::ptr::write(base.add(offset), value);
+            }
+        }
+
+        self.len = new_len;
+        self.update_write_ptr_for_len();
     }
 
     /// Resizes the vector using a closure to generate new elements.
