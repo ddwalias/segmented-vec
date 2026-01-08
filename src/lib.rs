@@ -1616,22 +1616,110 @@ impl<T> SegmentedVec<T> {
     }
 
     /// Moves all elements from `other` into `self`.
+    ///
+    /// Uses chunk-based moving with `ptr::copy_nonoverlapping` for better
+    /// performance by copying contiguous memory regions.
     pub fn append(&mut self, other: &mut Self) {
         if other.is_empty() {
             return;
         }
 
-        self.reserve(other.len);
-        for i in 0..other.len {
+        let other_len = other.len;
+        self.reserve(other_len);
+
+        // Handle ZST - no actual copying needed
+        if std::mem::size_of::<T>() == 0 {
+            self.len += other_len;
+            other.len = 0;
+            return;
+        }
+
+        let old_len = self.len;
+
+        // Initialize write cursor for self (where to start writing)
+        let (mut write_seg_idx, mut write_offset) = if old_len == 0 {
+            (0, 0)
+        } else {
+            let (seg, off) = RawSegmentedVec::<T>::location(old_len - 1);
+            let seg_cap = RawSegmentedVec::<T>::segment_capacity(seg);
+            if off + 1 >= seg_cap {
+                (seg + 1, 0)
+            } else {
+                (seg, off + 1)
+            }
+        };
+
+        // Initialize read cursor for other (where to start reading)
+        let mut read_seg_idx: usize = 0;
+        let mut read_offset: usize = 0;
+
+        let mut remaining = other_len;
+
+        while remaining > 0 {
+            // Get segment info for both cursors
+            let write_seg_cap = RawSegmentedVec::<T>::segment_capacity(write_seg_idx);
+            let write_available = write_seg_cap - write_offset;
+            let write_ptr = unsafe { self.buf.segment_ptr(write_seg_idx) };
+
+            let read_seg_cap = RawSegmentedVec::<T>::segment_capacity(read_seg_idx);
+            let read_seg_len = if read_seg_idx == other.active_segment_index {
+                // Last segment of other may be partially filled
+                unsafe {
+                    other
+                        .write_ptr
+                        .offset_from(other.buf.segment_ptr(read_seg_idx))
+                        as usize
+                }
+            } else {
+                read_seg_cap
+            };
+            let read_available = read_seg_len - read_offset;
+            let read_ptr = unsafe { other.buf.segment_ptr(read_seg_idx) };
+
+            // Copy the minimum of what's available in both segments
+            let to_copy = remaining.min(write_available).min(read_available);
+
             unsafe {
-                let value = other.unchecked_read(i);
-                self.push(value);
+                std::ptr::copy_nonoverlapping(
+                    read_ptr.add(read_offset),
+                    write_ptr.add(write_offset),
+                    to_copy,
+                );
+            }
+
+            remaining -= to_copy;
+            read_offset += to_copy;
+            write_offset += to_copy;
+
+            // Advance read cursor if segment exhausted
+            if read_offset >= read_seg_len {
+                read_seg_idx += 1;
+                read_offset = 0;
+            }
+
+            // Advance write cursor if segment exhausted
+            if write_offset >= write_seg_cap {
+                write_seg_idx += 1;
+                write_offset = 0;
             }
         }
+
+        // Update self's length and write pointer
+        self.len = old_len + other_len;
+        self.update_write_ptr_for_len();
+
+        // Reset other without dropping elements (they've been moved)
         other.len = 0;
-        other.write_ptr = std::ptr::null_mut();
-        other.segment_end = std::ptr::null_mut();
-        other.active_segment_index = usize::MAX;
+        if other.buf.segment_count() > 0 {
+            let base = unsafe { other.buf.segment_ptr(0) };
+            other.write_ptr = base;
+            other.segment_end = unsafe { base.add(RawSegmentedVec::<T>::segment_capacity(0)) };
+            other.active_segment_index = 0;
+        } else {
+            other.write_ptr = std::ptr::null_mut();
+            other.segment_end = std::ptr::null_mut();
+            other.active_segment_index = 0;
+        }
     }
 
     /// Splits the vector into two at the given index.
