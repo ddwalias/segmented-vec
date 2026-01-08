@@ -474,6 +474,9 @@ impl<T> SegmentedVec<T> {
     }
 
     /// Shortens the vector, keeping the first `len` elements and dropping the rest.
+    ///
+    /// Uses chunk-based dropping for better performance by dropping entire
+    /// segments at once rather than element by element.
     pub fn truncate(&mut self, len: usize) {
         if len >= self.len {
             return;
@@ -492,11 +495,80 @@ impl<T> SegmentedVec<T> {
             self.update_write_ptr_for_len();
         }
 
-        // Drop elements beyond new length
+        // Drop elements beyond new length using chunk-based dropping
         if std::mem::needs_drop::<T>() {
-            for i in len..old_len {
-                unsafe {
-                    std::ptr::drop_in_place(self.unchecked_at_mut(i));
+            // Handle ZST - nothing to drop in terms of memory
+            if std::mem::size_of::<T>() == 0 {
+                for _ in len..old_len {
+                    unsafe {
+                        std::ptr::drop_in_place(NonNull::<T>::dangling().as_ptr());
+                    }
+                }
+                return;
+            }
+
+            // Find segment and offset for new length
+            let (start_seg, start_offset) = if len == 0 {
+                (0, 0)
+            } else {
+                let (seg, off) = RawSegmentedVec::<T>::location(len - 1);
+                // Start dropping from the next element
+                let seg_cap = RawSegmentedVec::<T>::segment_capacity(seg);
+                if off + 1 >= seg_cap {
+                    (seg + 1, 0)
+                } else {
+                    (seg, off + 1)
+                }
+            };
+
+            // Find segment and offset for old length
+            let (end_seg, end_offset) = RawSegmentedVec::<T>::location(old_len - 1);
+            let end_offset = end_offset + 1; // Convert to exclusive end
+
+            if start_seg == end_seg {
+                // All elements to drop are in the same segment
+                if start_offset < end_offset {
+                    let base = unsafe { self.buf.segment_ptr(start_seg) };
+                    unsafe {
+                        let ptr = base.add(start_offset);
+                        std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
+                            ptr,
+                            end_offset - start_offset,
+                        ));
+                    }
+                }
+            } else {
+                // Drop partial first segment (from start_offset to end of segment)
+                let first_seg_cap = RawSegmentedVec::<T>::segment_capacity(start_seg);
+                if start_offset < first_seg_cap {
+                    let base = unsafe { self.buf.segment_ptr(start_seg) };
+                    unsafe {
+                        let ptr = base.add(start_offset);
+                        std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
+                            ptr,
+                            first_seg_cap - start_offset,
+                        ));
+                    }
+                }
+
+                // Drop full middle segments
+                for seg_idx in (start_seg + 1)..end_seg {
+                    let seg_cap = RawSegmentedVec::<T>::segment_capacity(seg_idx);
+                    let base = unsafe { self.buf.segment_ptr(seg_idx) };
+                    unsafe {
+                        std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(base, seg_cap));
+                    }
+                }
+
+                // Drop partial last segment (from 0 to end_offset)
+                if end_offset > 0 {
+                    let base = unsafe { self.buf.segment_ptr(end_seg) };
+                    unsafe {
+                        std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
+                            base,
+                            end_offset,
+                        ));
+                    }
                 }
             }
         }
