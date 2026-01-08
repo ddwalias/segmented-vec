@@ -2415,12 +2415,46 @@ impl<T: PartialEq> PartialEq for SegmentedVec<T> {
         if self.len != other.len {
             return false;
         }
-        for i in 0..self.len {
-            if unsafe { self.unchecked_at(i) != other.unchecked_at(i) } {
+
+        let len = self.len;
+        if len == 0 {
+            return true;
+        }
+
+        // ZST: lengths are equal, so they're equal
+        if size_of::<T>() == 0 {
+            return true;
+        }
+
+        // Both vecs have same length, so same segment layout
+        let active_idx = self.active_segment_index;
+
+        // Compare full segments (0..active_idx)
+        for seg_idx in 0..active_idx {
+            let seg_cap = RawSegmentedVec::<T>::segment_capacity(seg_idx);
+            let self_slice = unsafe {
+                let ptr = self.buf.segment_ptr(seg_idx) as *const T;
+                std::slice::from_raw_parts(ptr, seg_cap)
+            };
+            let other_slice = unsafe {
+                let ptr = other.buf.segment_ptr(seg_idx) as *const T;
+                std::slice::from_raw_parts(ptr, seg_cap)
+            };
+            if self_slice != other_slice {
                 return false;
             }
         }
-        true
+
+        // Compare partial active segment
+        let active_cap = RawSegmentedVec::<T>::segment_capacity(active_idx);
+        let self_base = unsafe { self.segment_end.sub(active_cap) };
+        let other_base = unsafe { other.segment_end.sub(active_cap) };
+        let active_len = unsafe { self.write_ptr.offset_from(self_base) as usize };
+
+        let self_active = unsafe { std::slice::from_raw_parts(self_base, active_len) };
+        let other_active = unsafe { std::slice::from_raw_parts(other_base, active_len) };
+
+        self_active == other_active
     }
 }
 
