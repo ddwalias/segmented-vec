@@ -2327,11 +2327,85 @@ impl<T, A: Allocator> Drop for SegmentedVec<T, A> {
 }
 
 impl<T: Clone> Clone for SegmentedVec<T> {
+    /// Clones the vector segment-by-segment for better performance.
+    ///
+    /// - For Copy types: uses slice operations that can be vectorized (SIMD)
+    /// - For Clone types: clones within contiguous segments, avoiding per-element segment lookups
     fn clone(&self) -> Self {
-        let mut new_vec = Self::with_capacity(self.len);
-        for i in 0..self.len {
-            new_vec.push(unsafe { self.unchecked_at(i).clone() });
+        if self.len == 0 {
+            return Self::new();
         }
+
+        let mut new_vec = Self::with_capacity(self.len);
+
+        // Handle ZST
+        if std::mem::size_of::<T>() == 0 {
+            for _ in 0..self.len {
+                unsafe {
+                    let val = (*NonNull::<T>::dangling().as_ptr()).clone();
+                    std::ptr::write(NonNull::<T>::dangling().as_ptr(), val);
+                }
+            }
+            new_vec.len = self.len;
+            return new_vec;
+        }
+
+        let total_len = self.len;
+        let active_idx = self.active_segment_index;
+
+        // Clone full segments (0..active_idx)
+        for seg_idx in 0..active_idx {
+            let seg_cap = RawSegmentedVec::<T>::segment_capacity(seg_idx);
+            let src_base = unsafe { self.buf.segment_ptr(seg_idx) };
+            let dst_base = unsafe { new_vec.buf.segment_ptr(seg_idx) };
+
+            // For Copy types, this can be vectorized
+            if !std::mem::needs_drop::<T>() {
+                unsafe {
+                    let src_slice = std::slice::from_raw_parts(src_base, seg_cap);
+                    let dst_slice = std::slice::from_raw_parts_mut(dst_base, seg_cap);
+                    dst_slice.clone_from_slice(src_slice);
+                }
+            } else {
+                // For non-Copy types, clone element by element within segment
+                for i in 0..seg_cap {
+                    unsafe {
+                        let val = (*src_base.add(i)).clone();
+                        std::ptr::write(dst_base.add(i), val);
+                    }
+                }
+            }
+        }
+
+        // Clone partial active segment
+        let active_cap = RawSegmentedVec::<T>::segment_capacity(active_idx);
+        let active_base = unsafe { self.segment_end.sub(active_cap) };
+        let active_len = unsafe { self.write_ptr.offset_from(active_base) as usize };
+
+        if active_len > 0 {
+            let src_base = active_base;
+            let dst_base = unsafe { new_vec.buf.segment_ptr(active_idx) };
+
+            if !std::mem::needs_drop::<T>() {
+                unsafe {
+                    let src_slice = std::slice::from_raw_parts(src_base, active_len);
+                    let dst_slice = std::slice::from_raw_parts_mut(dst_base, active_len);
+                    dst_slice.clone_from_slice(src_slice);
+                }
+            } else {
+                for i in 0..active_len {
+                    unsafe {
+                        let val = (*src_base.add(i)).clone();
+                        std::ptr::write(dst_base.add(i), val);
+                    }
+                }
+            }
+        }
+
+        // Update new_vec state
+        new_vec.len = total_len;
+        new_vec.update_write_ptr_for_len();
+
         new_vec
     }
 }
