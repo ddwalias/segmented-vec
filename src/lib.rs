@@ -1235,7 +1235,86 @@ impl<T> SegmentedVec<T> {
     }
 
     /// Binary search using a comparison function.
+    ///
+    /// Uses reverse linear scan of segments followed by native binary search
+    /// on the target segment's slice for better cache performance.
     pub fn binary_search_by<F>(&self, mut f: F) -> Result<usize, usize>
+    where
+        F: FnMut(&T) -> Ordering,
+    {
+        if self.len == 0 {
+            return Err(0);
+        }
+
+        // Handle ZST - fall back to simple binary search
+        if std::mem::size_of::<T>() == 0 {
+            return self.binary_search_by_simple(&mut f);
+        }
+
+        // Reverse linear scan of segments to find target segment
+        let mut segment_idx = self.active_segment_index;
+        let mut segment_start_idx = 0;
+
+        // Calculate starting index of the active segment
+        if segment_idx > 0 {
+            segment_start_idx = RawSegmentedVec::<T>::segment_capacity(0);
+            for i in 1..segment_idx {
+                segment_start_idx += RawSegmentedVec::<T>::segment_capacity(i);
+            }
+        }
+
+        loop {
+            let segment_base = unsafe { self.buf.segment_ptr(segment_idx) };
+            let segment_cap = RawSegmentedVec::<T>::segment_capacity(segment_idx);
+
+            // Calculate how many elements are in this segment
+            let segment_len = if segment_idx == self.active_segment_index {
+                unsafe { self.write_ptr.offset_from(segment_base) as usize }
+            } else {
+                segment_cap
+            };
+
+            if segment_len == 0 {
+                // Empty segment (shouldn't happen in normal use, but handle it)
+                if segment_idx == 0 {
+                    return Err(0);
+                }
+                segment_idx -= 1;
+                segment_start_idx -= RawSegmentedVec::<T>::segment_capacity(segment_idx);
+                continue;
+            }
+
+            // Check first element of this segment
+            let first_cmp = f(unsafe { &*segment_base });
+
+            match first_cmp {
+                Ordering::Greater => {
+                    // Target is less than first element of this segment
+                    // Move to previous segment
+                    if segment_idx == 0 {
+                        return Err(0);
+                    }
+                    segment_idx -= 1;
+                    segment_start_idx -= RawSegmentedVec::<T>::segment_capacity(segment_idx);
+                }
+                Ordering::Equal => {
+                    // Found at first element
+                    return Ok(segment_start_idx);
+                }
+                Ordering::Less => {
+                    // Target >= first element, search in this segment
+                    let slice = unsafe { std::slice::from_raw_parts(segment_base, segment_len) };
+                    match slice.binary_search_by(&mut f) {
+                        Ok(pos) => return Ok(segment_start_idx + pos),
+                        Err(pos) => return Err(segment_start_idx + pos),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Simple element-by-element binary search (fallback for ZST)
+    fn binary_search_by_simple<F>(&self, f: &mut F) -> Result<usize, usize>
     where
         F: FnMut(&T) -> Ordering,
     {
