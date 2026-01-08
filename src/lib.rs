@@ -2462,25 +2462,113 @@ impl<T: Eq> Eq for SegmentedVec<T> {}
 
 impl<T: PartialOrd> PartialOrd for SegmentedVec<T> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        for i in 0..self.len.min(other.len) {
-            match unsafe { self.unchecked_at(i).partial_cmp(other.unchecked_at(i)) } {
+        let min_len = self.len.min(other.len);
+
+        if min_len == 0 {
+            return Some(self.len.cmp(&other.len));
+        }
+
+        // ZST: compare element by element (no memory layout)
+        if size_of::<T>() == 0 {
+            for i in 0..min_len {
+                match unsafe { self.unchecked_at(i).partial_cmp(other.unchecked_at(i)) } {
+                    Some(Ordering::Equal) => continue,
+                    non_eq => return non_eq,
+                }
+            }
+            return Some(self.len.cmp(&other.len));
+        }
+
+        // Find segment containing last common element
+        let (common_seg, common_offset) = RawSegmentedVec::<T>::location(min_len - 1);
+
+        // Compare full segments (0..common_seg)
+        for seg_idx in 0..common_seg {
+            let seg_cap = RawSegmentedVec::<T>::segment_capacity(seg_idx);
+            let self_slice = unsafe {
+                let ptr = self.buf.segment_ptr(seg_idx) as *const T;
+                std::slice::from_raw_parts(ptr, seg_cap)
+            };
+            let other_slice = unsafe {
+                let ptr = other.buf.segment_ptr(seg_idx) as *const T;
+                std::slice::from_raw_parts(ptr, seg_cap)
+            };
+            match self_slice.partial_cmp(other_slice) {
                 Some(Ordering::Equal) => continue,
                 non_eq => return non_eq,
             }
         }
-        Some(self.len.cmp(&other.len))
+
+        // Compare partial segment containing the last common element
+        let common_len = common_offset + 1;
+        let self_slice = unsafe {
+            let ptr = self.buf.segment_ptr(common_seg) as *const T;
+            std::slice::from_raw_parts(ptr, common_len)
+        };
+        let other_slice = unsafe {
+            let ptr = other.buf.segment_ptr(common_seg) as *const T;
+            std::slice::from_raw_parts(ptr, common_len)
+        };
+        match self_slice.partial_cmp(other_slice) {
+            Some(Ordering::Equal) => Some(self.len.cmp(&other.len)),
+            non_eq => non_eq,
+        }
     }
 }
 
 impl<T: Ord> Ord for SegmentedVec<T> {
     fn cmp(&self, other: &Self) -> Ordering {
-        for i in 0..self.len.min(other.len) {
-            match unsafe { self.unchecked_at(i).cmp(other.unchecked_at(i)) } {
+        let min_len = self.len.min(other.len);
+
+        if min_len == 0 {
+            return self.len.cmp(&other.len);
+        }
+
+        // ZST: compare element by element (no memory layout)
+        if size_of::<T>() == 0 {
+            for i in 0..min_len {
+                match unsafe { self.unchecked_at(i).cmp(other.unchecked_at(i)) } {
+                    Ordering::Equal => continue,
+                    non_eq => return non_eq,
+                }
+            }
+            return self.len.cmp(&other.len);
+        }
+
+        // Find segment containing last common element
+        let (common_seg, common_offset) = RawSegmentedVec::<T>::location(min_len - 1);
+
+        // Compare full segments (0..common_seg)
+        for seg_idx in 0..common_seg {
+            let seg_cap = RawSegmentedVec::<T>::segment_capacity(seg_idx);
+            let self_slice = unsafe {
+                let ptr = self.buf.segment_ptr(seg_idx) as *const T;
+                std::slice::from_raw_parts(ptr, seg_cap)
+            };
+            let other_slice = unsafe {
+                let ptr = other.buf.segment_ptr(seg_idx) as *const T;
+                std::slice::from_raw_parts(ptr, seg_cap)
+            };
+            match self_slice.cmp(other_slice) {
                 Ordering::Equal => continue,
                 non_eq => return non_eq,
             }
         }
-        self.len.cmp(&other.len)
+
+        // Compare partial segment containing the last common element
+        let common_len = common_offset + 1;
+        let self_slice = unsafe {
+            let ptr = self.buf.segment_ptr(common_seg) as *const T;
+            std::slice::from_raw_parts(ptr, common_len)
+        };
+        let other_slice = unsafe {
+            let ptr = other.buf.segment_ptr(common_seg) as *const T;
+            std::slice::from_raw_parts(ptr, common_len)
+        };
+        match self_slice.cmp(other_slice) {
+            Ordering::Equal => self.len.cmp(&other.len),
+            non_eq => non_eq,
+        }
     }
 }
 
