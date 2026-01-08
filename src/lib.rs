@@ -565,8 +565,7 @@ impl<T> SegmentedVec<T> {
                     let base = unsafe { self.buf.segment_ptr(end_seg) };
                     unsafe {
                         std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
-                            base,
-                            end_offset,
+                            base, end_offset,
                         ));
                     }
                 }
@@ -1132,6 +1131,10 @@ impl<T> SegmentedVec<T> {
     }
 
     /// Fills the vector with elements returned by calling a closure.
+    ///
+    /// Uses chunk-based processing for better performance:
+    /// - For Copy/POD types: writes directly without dropping
+    /// - For complex types: drops chunk first, then writes new values
     pub fn fill_with<F>(&mut self, mut f: F)
     where
         F: FnMut() -> T,
@@ -1140,17 +1143,55 @@ impl<T> SegmentedVec<T> {
             return;
         }
 
+        // Handle ZST
+        if std::mem::size_of::<T>() == 0 {
+            for _ in 0..self.len {
+                unsafe {
+                    std::ptr::drop_in_place(NonNull::<T>::dangling().as_ptr());
+                    std::ptr::write(NonNull::<T>::dangling().as_ptr(), f());
+                }
+            }
+            return;
+        }
+
         let mut remaining = self.len;
         let mut segment_idx = 0;
 
+        // For types without Drop, we can skip the drop step entirely
+        if !std::mem::needs_drop::<T>() {
+            while remaining > 0 {
+                let segment_cap = RawSegmentedVec::<T>::segment_capacity(segment_idx);
+                let segment_len = segment_cap.min(remaining);
+                let base = unsafe { self.buf.segment_ptr(segment_idx) };
+
+                for i in 0..segment_len {
+                    unsafe {
+                        std::ptr::write(base.add(i), f());
+                    }
+                }
+
+                segment_idx += 1;
+                remaining -= segment_len;
+            }
+            return;
+        }
+
+        // For types with Drop: drop the chunk first, then write new values
+        // This improves cache locality by processing each segment twice
+        // rather than interleaving drop/write for each element
         while remaining > 0 {
             let segment_cap = RawSegmentedVec::<T>::segment_capacity(segment_idx);
             let segment_len = segment_cap.min(remaining);
             let base = unsafe { self.buf.segment_ptr(segment_idx) };
 
+            // Drop all elements in this segment chunk
+            unsafe {
+                std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(base, segment_len));
+            }
+
+            // Write new values to this segment chunk
             for i in 0..segment_len {
                 unsafe {
-                    std::ptr::drop_in_place(base.add(i));
                     std::ptr::write(base.add(i), f());
                 }
             }
@@ -1282,18 +1323,68 @@ impl<T> SegmentedVec<T> {
     }
 
     /// Resizes the vector using a closure to generate new elements.
+    ///
+    /// Uses chunk-based filling for better performance by writing
+    /// directly to segments rather than using push in a loop.
     pub fn resize_with<F>(&mut self, new_len: usize, mut f: F)
     where
         F: FnMut() -> T,
     {
-        if new_len > self.len {
-            self.reserve(new_len - self.len);
-            while self.len < new_len {
-                self.push(f());
-            }
-        } else {
+        if new_len <= self.len {
             self.truncate(new_len);
+            return;
         }
+
+        let old_len = self.len;
+        let additional = new_len - old_len;
+        self.reserve(additional);
+
+        // Handle ZST
+        if std::mem::size_of::<T>() == 0 {
+            for _ in 0..additional {
+                unsafe {
+                    std::ptr::write(NonNull::<T>::dangling().as_ptr(), f());
+                }
+            }
+            self.len = new_len;
+            return;
+        }
+
+        // Find starting segment and offset
+        let (mut seg_idx, mut offset) = if old_len == 0 {
+            (0, 0)
+        } else {
+            let (seg, off) = RawSegmentedVec::<T>::location(old_len - 1);
+            let seg_cap = RawSegmentedVec::<T>::segment_capacity(seg);
+            if off + 1 >= seg_cap {
+                (seg + 1, 0)
+            } else {
+                (seg, off + 1)
+            }
+        };
+
+        let mut remaining = additional;
+
+        // Write new elements directly to segments
+        while remaining > 0 {
+            let seg_cap = RawSegmentedVec::<T>::segment_capacity(seg_idx);
+            let available = seg_cap - offset;
+            let to_fill = remaining.min(available);
+            let base = unsafe { self.buf.segment_ptr(seg_idx) };
+
+            for i in 0..to_fill {
+                unsafe {
+                    std::ptr::write(base.add(offset + i), f());
+                }
+            }
+
+            remaining -= to_fill;
+            seg_idx += 1;
+            offset = 0;
+        }
+
+        self.len = new_len;
+        self.update_write_ptr_for_len();
     }
 
     /// Retains only the elements specified by the predicate.
