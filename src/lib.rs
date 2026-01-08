@@ -1723,6 +1723,9 @@ impl<T> SegmentedVec<T> {
     }
 
     /// Splits the vector into two at the given index.
+    ///
+    /// Uses chunk-based moving with `ptr::copy_nonoverlapping` for better
+    /// performance by copying contiguous memory regions.
     pub fn split_off(&mut self, at: usize) -> Self {
         assert!(at <= self.len);
 
@@ -1731,13 +1734,82 @@ impl<T> SegmentedVec<T> {
             return other;
         }
 
-        other.reserve(self.len - at);
-        for i in at..self.len {
+        let move_count = self.len - at;
+        other.reserve(move_count);
+
+        // Handle ZST - no actual copying needed
+        if std::mem::size_of::<T>() == 0 {
+            other.len = move_count;
+            self.len = at;
+            return other;
+        }
+
+        // Initialize read cursor for self (starting at index `at`)
+        let (mut read_seg_idx, mut read_offset) = RawSegmentedVec::<T>::location(at);
+        let mut read_seg_cap = RawSegmentedVec::<T>::segment_capacity(read_seg_idx);
+
+        // Initialize write cursor for other (starting at 0)
+        let mut write_seg_idx: usize = 0;
+        let mut write_offset: usize = 0;
+
+        let mut remaining = move_count;
+
+        while remaining > 0 {
+            // Get segment info for read cursor
+            let read_seg_len = if read_seg_idx == self.active_segment_index {
+                // Last segment of self may be partially filled
+                unsafe {
+                    self.write_ptr
+                        .offset_from(self.buf.segment_ptr(read_seg_idx))
+                        as usize
+                }
+            } else {
+                read_seg_cap
+            };
+            let read_available = read_seg_len - read_offset;
+            let read_ptr = unsafe { self.buf.segment_ptr(read_seg_idx) };
+
+            // Get segment info for write cursor
+            let write_seg_cap = RawSegmentedVec::<T>::segment_capacity(write_seg_idx);
+            let write_available = write_seg_cap - write_offset;
+            let write_ptr = unsafe { other.buf.segment_ptr(write_seg_idx) };
+
+            // Copy the minimum of what's available in both segments
+            let to_copy = remaining.min(read_available).min(write_available);
+
             unsafe {
-                let value = self.unchecked_read(i);
-                other.push(value);
+                std::ptr::copy_nonoverlapping(
+                    read_ptr.add(read_offset),
+                    write_ptr.add(write_offset),
+                    to_copy,
+                );
+            }
+
+            remaining -= to_copy;
+            read_offset += to_copy;
+            write_offset += to_copy;
+
+            // Advance read cursor if segment exhausted
+            if read_offset >= read_seg_len {
+                read_seg_idx += 1;
+                read_offset = 0;
+                if read_seg_idx < self.buf.segment_count() {
+                    read_seg_cap = RawSegmentedVec::<T>::segment_capacity(read_seg_idx);
+                }
+            }
+
+            // Advance write cursor if segment exhausted
+            if write_offset >= write_seg_cap {
+                write_seg_idx += 1;
+                write_offset = 0;
             }
         }
+
+        // Update other's length and write pointer
+        other.len = move_count;
+        other.update_write_ptr_for_len();
+
+        // Update self's length and write pointer
         self.len = at;
         if at == 0 && self.buf.segment_count() > 0 {
             let base = unsafe { self.buf.segment_ptr(0) };
@@ -1747,6 +1819,7 @@ impl<T> SegmentedVec<T> {
         } else if at > 0 {
             self.update_write_ptr_for_len();
         }
+
         other
     }
 }
