@@ -1504,6 +1504,9 @@ impl<T> SegmentedVec<T> {
     }
 
     /// Removes consecutive elements that satisfy the predicate.
+    ///
+    /// Uses two independent segment cursors (read and write) that traverse
+    /// linearly, avoiding per-element segment/offset calculations.
     pub fn dedup_by<F>(&mut self, mut same_bucket: F)
     where
         F: FnMut(&mut T, &mut T) -> bool,
@@ -1512,21 +1515,95 @@ impl<T> SegmentedVec<T> {
             return;
         }
 
-        let mut write_idx = 1;
-        for read_idx in 1..self.len {
-            let should_keep = unsafe {
-                let prev_ptr = self.buf.ptr_at(write_idx - 1);
-                let curr_ptr = self.buf.ptr_at(read_idx);
-                !same_bucket(&mut *prev_ptr, &mut *curr_ptr)
-            };
-            if should_keep {
-                if write_idx != read_idx {
-                    self.swap(write_idx, read_idx);
+        // Handle ZST
+        if std::mem::size_of::<T>() == 0 {
+            let mut write_count = 1;
+            let mut prev_ptr = NonNull::<T>::dangling().as_ptr();
+            for _ in 1..self.len {
+                let curr_ptr = NonNull::<T>::dangling().as_ptr();
+                let is_dup = unsafe { same_bucket(&mut *prev_ptr, &mut *curr_ptr) };
+                if !is_dup {
+                    write_count += 1;
+                    prev_ptr = curr_ptr;
                 }
-                write_idx += 1;
+            }
+            self.len = write_count;
+            return;
+        }
+
+        let total_len = self.len;
+
+        // Initialize read cursor - starts at index 1
+        let mut read_seg_idx: usize = 0;
+        let mut read_offset: usize = 1;
+        let mut read_seg_cap = RawSegmentedVec::<T>::segment_capacity(0);
+        let mut read_ptr = unsafe { self.buf.segment_ptr(0) };
+
+        // Handle case where first segment has only 1 element
+        if read_offset >= read_seg_cap {
+            read_seg_idx = 1;
+            read_offset = 0;
+            read_seg_cap = RawSegmentedVec::<T>::segment_capacity(1);
+            read_ptr = unsafe { self.buf.segment_ptr(1) };
+        }
+
+        // Initialize write cursor - points to last written element (index 0)
+        let mut write_seg_idx: usize = 0;
+        let mut write_offset: usize = 0;
+        let mut write_seg_cap = RawSegmentedVec::<T>::segment_capacity(0);
+        let mut write_ptr = unsafe { self.buf.segment_ptr(0) };
+
+        let mut write_count: usize = 1; // First element is always kept
+        let mut deleted_count: usize = 0;
+
+        for _ in 1..total_len {
+            // Get pointers to previous (last written) and current (read) elements
+            let prev_elem_ptr = unsafe { write_ptr.add(write_offset) };
+            let curr_elem_ptr = unsafe { read_ptr.add(read_offset) };
+
+            let is_dup = unsafe { same_bucket(&mut *prev_elem_ptr, &mut *curr_elem_ptr) };
+
+            if !is_dup {
+                // Advance write cursor to next position
+                write_offset += 1;
+                if write_offset >= write_seg_cap {
+                    write_seg_idx += 1;
+                    write_offset = 0;
+                    write_seg_cap = RawSegmentedVec::<T>::segment_capacity(write_seg_idx);
+                    write_ptr = unsafe { self.buf.segment_ptr(write_seg_idx) };
+                }
+
+                // Move element from read to write position if they differ
+                if deleted_count > 0 {
+                    unsafe {
+                        let write_elem_ptr = write_ptr.add(write_offset);
+                        std::ptr::copy_nonoverlapping(curr_elem_ptr, write_elem_ptr, 1);
+                    }
+                }
+                write_count += 1;
+            } else {
+                // Drop the duplicate element
+                unsafe {
+                    std::ptr::drop_in_place(curr_elem_ptr);
+                }
+                deleted_count += 1;
+            }
+
+            // Advance read cursor
+            read_offset += 1;
+            if read_offset >= read_seg_cap {
+                read_seg_idx += 1;
+                read_offset = 0;
+                if read_seg_idx < self.buf.segment_count() {
+                    read_seg_cap = RawSegmentedVec::<T>::segment_capacity(read_seg_idx);
+                    read_ptr = unsafe { self.buf.segment_ptr(read_seg_idx) };
+                }
             }
         }
-        self.truncate(write_idx);
+
+        // Update length and write pointer
+        self.len = write_count;
+        self.update_write_ptr_for_len();
     }
 
     /// Removes consecutive elements with duplicate keys.
