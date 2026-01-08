@@ -31,6 +31,7 @@ mod raw_vec;
 mod slice;
 mod sort;
 
+use allocator_api2::alloc::{Allocator, Global};
 pub use drain::Drain;
 pub use into_iter::IntoIter;
 pub use iter::{Iter, IterMut};
@@ -105,9 +106,9 @@ impl TryReserveError {
 ///
 /// With 64 segments, this can hold more than 2^64 elements.
 #[repr(C)]
-pub struct SegmentedVec<T> {
+pub struct SegmentedVec<T, A: Allocator = Global> {
     /// Low-level segment allocation management
-    pub(crate) buf: RawSegmentedVec<T>,
+    pub(crate) buf: RawSegmentedVec<T, A>,
     /// Number of initialized elements
     len: usize,
     /// Cached pointer to the next write position (for fast push)
@@ -1439,10 +1440,53 @@ impl<T> SegmentedVec<T> {
     }
 }
 
+// Generic implementation for all allocators (needed for Drop)
+impl<T, A: Allocator> SegmentedVec<T, A> {
+    /// Clears the vector, removing all elements.
+    ///
+    /// This drops all elements but keeps the allocated memory.
+    fn clear_internal(&mut self) {
+        let old_len = self.len;
+        if old_len == 0 {
+            return;
+        }
+
+        // Reset len BEFORE dropping to prevent double-free if drop panics
+        self.len = 0;
+
+        // Reset write_ptr to segment 0 (keep capacity usable)
+        if self.buf.segment_count() > 0 {
+            let base = unsafe { self.buf.segment_ptr(0) };
+            self.write_ptr = base;
+            self.segment_end = unsafe { base.add(RawSegmentedVec::<T, A>::segment_capacity(0)) };
+            self.active_segment_index = 0;
+        }
+
+        // Drop all elements
+        if std::mem::needs_drop::<T>() {
+            let mut remaining = old_len;
+            let mut segment_idx = 0;
+
+            while remaining > 0 {
+                let segment_cap = RawSegmentedVec::<T, A>::segment_capacity(segment_idx);
+                let segment_len = segment_cap.min(remaining);
+                let base = unsafe { self.buf.segment_ptr(segment_idx) };
+
+                unsafe {
+                    std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(base, segment_len));
+                }
+
+                segment_idx += 1;
+                remaining -= segment_len;
+            }
+        }
+    }
+}
+
 // Trait implementations
-impl<T> Drop for SegmentedVec<T> {
+impl<T, A: Allocator> Drop for SegmentedVec<T, A> {
     fn drop(&mut self) {
-        self.clear();
+        self.clear_internal();
         // RawSegmentedVec will be dropped automatically and free the memory
     }
 }
