@@ -1827,35 +1827,129 @@ impl<T> SegmentedVec<T> {
 // Search operations
 impl<T> SegmentedVec<T> {
     /// Returns `true` if `needle` is a prefix of the vector.
+    ///
+    /// Uses chunk-based comparison for better performance by comparing
+    /// contiguous slices rather than element by element.
     pub fn starts_with(&self, needle: &[T]) -> bool
     where
         T: PartialEq,
     {
-        if needle.len() > self.len {
+        let needle_len = needle.len();
+        if needle_len > self.len {
             return false;
         }
-        for (i, item) in needle.iter().enumerate() {
-            if unsafe { self.unchecked_at(i) } != item {
+        if needle_len == 0 {
+            return true;
+        }
+
+        // Handle ZST
+        if std::mem::size_of::<T>() == 0 {
+            // For ZST, all instances are equal
+            return true;
+        }
+
+        let mut seg_idx: usize = 0;
+        let mut seg_offset: usize = 0;
+        let mut needle_offset: usize = 0;
+
+        while needle_offset < needle_len {
+            let seg_cap = RawSegmentedVec::<T>::segment_capacity(seg_idx);
+            let seg_ptr = unsafe { self.buf.segment_ptr(seg_idx) };
+
+            // How many elements available in this segment
+            let seg_available = seg_cap - seg_offset;
+            // How many elements left to compare in needle
+            let needle_remaining = needle_len - needle_offset;
+            // Compare the minimum of both
+            let to_compare = seg_available.min(needle_remaining);
+
+            // Create slices and compare
+            let seg_slice =
+                unsafe { std::slice::from_raw_parts(seg_ptr.add(seg_offset), to_compare) };
+            let needle_slice = &needle[needle_offset..needle_offset + to_compare];
+
+            if seg_slice != needle_slice {
                 return false;
             }
+
+            needle_offset += to_compare;
+            seg_offset += to_compare;
+
+            // Move to next segment if current is exhausted
+            if seg_offset >= seg_cap {
+                seg_idx += 1;
+                seg_offset = 0;
+            }
         }
+
         true
     }
 
     /// Returns `true` if `needle` is a suffix of the vector.
+    ///
+    /// Uses chunk-based comparison for better performance by comparing
+    /// contiguous slices rather than element by element.
     pub fn ends_with(&self, needle: &[T]) -> bool
     where
         T: PartialEq,
     {
-        if needle.len() > self.len {
+        let needle_len = needle.len();
+        if needle_len > self.len {
             return false;
         }
-        let start = self.len - needle.len();
-        for (i, item) in needle.iter().enumerate() {
-            if unsafe { self.unchecked_at(start + i) } != item {
+        if needle_len == 0 {
+            return true;
+        }
+
+        // Handle ZST
+        if std::mem::size_of::<T>() == 0 {
+            // For ZST, all instances are equal
+            return true;
+        }
+
+        let start_idx = self.len - needle_len;
+
+        // Initialize cursor at start_idx
+        let (mut seg_idx, mut seg_offset) = RawSegmentedVec::<T>::location(start_idx);
+        let mut needle_offset: usize = 0;
+
+        while needle_offset < needle_len {
+            let seg_cap = RawSegmentedVec::<T>::segment_capacity(seg_idx);
+            let seg_ptr = unsafe { self.buf.segment_ptr(seg_idx) };
+
+            // How many elements available in this segment from current offset
+            // For the last segment, limit to actual elements
+            let seg_len = if seg_idx == self.active_segment_index {
+                unsafe { self.write_ptr.offset_from(seg_ptr) as usize }
+            } else {
+                seg_cap
+            };
+            let seg_available = seg_len - seg_offset;
+
+            // How many elements left to compare in needle
+            let needle_remaining = needle_len - needle_offset;
+            // Compare the minimum of both
+            let to_compare = seg_available.min(needle_remaining);
+
+            // Create slices and compare
+            let seg_slice =
+                unsafe { std::slice::from_raw_parts(seg_ptr.add(seg_offset), to_compare) };
+            let needle_slice = &needle[needle_offset..needle_offset + to_compare];
+
+            if seg_slice != needle_slice {
                 return false;
             }
+
+            needle_offset += to_compare;
+            seg_offset += to_compare;
+
+            // Move to next segment if current is exhausted
+            if seg_offset >= seg_len {
+                seg_idx += 1;
+                seg_offset = 0;
+            }
         }
+
         true
     }
 
