@@ -174,7 +174,7 @@ impl<A: Allocator> RawSegmentedVecInner<A> {
         self.segment_count += 1;
     }
 
-    /// Ensures capacity for at least `needed_capacity` elements.
+    /// Ensures capacity for at least `len + additional` elements.
     ///
     /// # Safety
     ///
@@ -183,7 +183,22 @@ impl<A: Allocator> RawSegmentedVecInner<A> {
     /// # Panics
     ///
     /// Panics if allocation fails or capacity exceeds limits.
-    unsafe fn reserve(&mut self, needed_capacity: usize, elem_layout: Layout) {
+    unsafe fn reserve(&mut self, len: usize, additional: usize, elem_layout: Layout) {
+        if additional <= self.capacity(elem_layout.size()).wrapping_sub(len) {
+            return;
+        }
+        self.do_reserve(len, additional, elem_layout);
+    }
+
+    /// Internal reserve implementation.
+    ///
+    /// # Safety
+    ///
+    /// `elem_layout` must match the element type this vec is used for.
+    #[cold]
+    unsafe fn do_reserve(&mut self, len: usize, additional: usize, elem_layout: Layout) {
+        let needed_capacity = len.checked_add(additional).expect("capacity overflow");
+
         if needed_capacity == 0 {
             return;
         }
@@ -222,7 +237,7 @@ impl<A: Allocator> RawSegmentedVecInner<A> {
         }
     }
 
-    /// Tries to ensure capacity for at least `needed_capacity` elements.
+    /// Tries to ensure capacity for at least `len + additional` elements.
     ///
     /// # Safety
     ///
@@ -232,9 +247,32 @@ impl<A: Allocator> RawSegmentedVecInner<A> {
     /// On error, any segments allocated during this call are freed.
     unsafe fn try_reserve(
         &mut self,
-        needed_capacity: usize,
+        len: usize,
+        additional: usize,
         elem_layout: Layout,
     ) -> Result<(), TryReserveError> {
+        if additional <= self.capacity(elem_layout.size()).wrapping_sub(len) {
+            return Ok(());
+        }
+        self.do_try_reserve(len, additional, elem_layout)
+    }
+
+    /// Internal try_reserve implementation.
+    ///
+    /// # Safety
+    ///
+    /// `elem_layout` must match the element type this vec is used for.
+    #[cold]
+    unsafe fn do_try_reserve(
+        &mut self,
+        len: usize,
+        additional: usize,
+        elem_layout: Layout,
+    ) -> Result<(), TryReserveError> {
+        let needed_capacity = len
+            .checked_add(additional)
+            .ok_or_else(TryReserveError::capacity_overflow)?;
+
         if needed_capacity == 0 {
             return Ok(());
         }
@@ -279,14 +317,15 @@ impl<A: Allocator> RawSegmentedVecInner<A> {
         Ok(())
     }
 
-    /// Shrinks to hold at most `new_capacity` elements.
+    /// Shrinks the buffer down to the specified capacity.
     ///
     /// # Safety
     ///
     /// `elem_layout` must match the element type.
-    /// Caller must ensure elements beyond new capacity have already been dropped.
-    unsafe fn shrink_to(&mut self, new_capacity: usize, elem_layout: Layout) {
-        let new_segment_count = segments_for_capacity_inner(new_capacity, elem_layout.size());
+    /// Caller must ensure elements beyond `cap` have already been dropped.
+    /// `cap` must be less than or equal to current capacity.
+    unsafe fn shrink_to_fit(&mut self, cap: usize, elem_layout: Layout) {
+        let new_segment_count = segments_for_capacity_inner(cap, elem_layout.size());
 
         if new_segment_count < self.segment_count {
             self.free_segments(self.segment_count, new_segment_count, elem_layout);
@@ -418,32 +457,40 @@ impl<T, A: Allocator> RawSegmentedVec<T, A> {
         unsafe { self.inner.grow_one(Self::elem_layout()) }
     }
 
-    /// Ensures capacity for at least `needed_capacity` elements.
+    /// Ensures capacity for at least `len + additional` elements.
     ///
     /// # Panics
     ///
     /// Panics if allocation fails or capacity exceeds limits.
-    pub(crate) fn reserve(&mut self, needed_capacity: usize) {
+    pub(crate) fn reserve(&mut self, len: usize, additional: usize) {
         // SAFETY: elem_layout matches type T
-        unsafe { self.inner.reserve(needed_capacity, Self::elem_layout()) }
+        unsafe { self.inner.reserve(len, additional, Self::elem_layout()) }
     }
 
-    /// Tries to ensure capacity for at least `needed_capacity` elements.
+    /// Tries to ensure capacity for at least `len + additional` elements.
     ///
     /// Returns `Err` if allocation fails or capacity would overflow.
     /// On error, any segments allocated during this call are freed.
-    pub(crate) fn try_reserve(&mut self, needed_capacity: usize) -> Result<(), TryReserveError> {
+    pub(crate) fn try_reserve(
+        &mut self,
+        len: usize,
+        additional: usize,
+    ) -> Result<(), TryReserveError> {
         // SAFETY: elem_layout matches type T
-        unsafe { self.inner.try_reserve(needed_capacity, Self::elem_layout()) }
+        unsafe { self.inner.try_reserve(len, additional, Self::elem_layout()) }
     }
 
-    /// Shrinks to hold at most `new_capacity` elements.
+    /// Shrinks the buffer down to the specified capacity.
     ///
-    /// Does not drop elements - caller must ensure elements beyond new capacity
+    /// Does not drop elements - caller must ensure elements beyond `cap`
     /// have already been dropped.
-    pub(crate) fn shrink_to(&mut self, new_capacity: usize) {
+    ///
+    /// # Panics
+    ///
+    /// Panics if `cap` is larger than current capacity.
+    pub(crate) fn shrink_to_fit(&mut self, cap: usize) {
         // SAFETY: elem_layout matches type T
-        unsafe { self.inner.shrink_to(new_capacity, Self::elem_layout()) }
+        unsafe { self.inner.shrink_to_fit(cap, Self::elem_layout()) }
     }
 
     /// Returns a raw pointer to an element at the given index.
@@ -461,8 +508,16 @@ impl<T> RawSegmentedVec<T> {
     /// Creates a new `RawSegmentedVec` without allocating.
     #[inline]
     pub(crate) const fn new() -> Self {
+        Self::new_in(Global)
+    }
+}
+
+impl<T, A: Allocator> RawSegmentedVec<T, A> {
+    /// Creates a new `RawSegmentedVec` without allocating, using the given allocator.
+    #[inline]
+    pub(crate) const fn new_in(alloc: A) -> Self {
         Self {
-            inner: RawSegmentedVecInner::new_in(Global),
+            inner: RawSegmentedVecInner::new_in(alloc),
             _marker: PhantomData,
         }
     }
@@ -505,7 +560,7 @@ mod tests {
     #[test]
     fn test_reserve() {
         let mut raw: RawSegmentedVec<i32> = RawSegmentedVec::new();
-        raw.reserve(100);
+        raw.reserve(0, 100);
         assert!(raw.capacity() >= 100);
     }
 
@@ -525,9 +580,9 @@ mod tests {
     #[test]
     fn test_shrink() {
         let mut raw: RawSegmentedVec<i32> = RawSegmentedVec::new();
-        raw.reserve(100);
+        raw.reserve(0, 100);
         let old_count = raw.segment_count();
-        raw.shrink_to(10);
+        raw.shrink_to_fit(10);
         assert!(raw.segment_count() < old_count);
         assert!(raw.capacity() >= 10);
     }

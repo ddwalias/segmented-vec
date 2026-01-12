@@ -575,7 +575,7 @@ impl<T> SegmentedVec<T> {
 
     /// Reserves capacity for at least `additional` more elements.
     pub fn reserve(&mut self, additional: usize) {
-        self.buf.reserve(self.len + additional);
+        self.buf.reserve(self.len, additional);
         self.init_write_ptr_if_needed();
     }
 
@@ -583,23 +583,19 @@ impl<T> SegmentedVec<T> {
     ///
     /// Returns `Ok(())` on success, or `Err(TryReserveError)` if allocation fails.
     pub fn try_reserve(&mut self, additional: usize) -> Result<(), TryReserveError> {
-        let new_capacity = self
-            .len
-            .checked_add(additional)
-            .ok_or_else(TryReserveError::capacity_overflow)?;
-        self.buf.try_reserve(new_capacity)?;
+        self.buf.try_reserve(self.len, additional)?;
         self.init_write_ptr_if_needed();
         Ok(())
     }
 
     /// Shrinks the capacity to match the current length.
     pub fn shrink_to_fit(&mut self) {
-        self.buf.shrink_to(self.len);
+        self.buf.shrink_to_fit(self.len);
     }
 
     /// Shrinks the capacity with a lower bound.
     pub fn shrink_to(&mut self, min_capacity: usize) {
-        self.buf.shrink_to(min_capacity.max(self.len));
+        self.buf.shrink_to_fit(min_capacity.max(self.len));
     }
 
     /// Initialize write pointer if we didn't have capacity before,
