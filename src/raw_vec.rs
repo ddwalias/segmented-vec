@@ -11,23 +11,6 @@ use allocator_api2::alloc::{Allocator, Global};
 
 use crate::TryReserveError;
 
-/// Maximum number of segments supported.
-/// With exponentially growing segments, 64 segments can hold more than 2^64 elements.
-pub(crate) const MAX_SEGMENTS: usize = 64;
-
-/// Raw segmented vector that handles segment allocation without element management.
-///
-/// This is the low-level allocation primitive used by `SegmentedVec`.
-/// It manages segment pointers and capacity but does not track element count
-/// or handle element initialization/destruction.
-#[repr(C)]
-pub(crate) struct RawSegmentedVec<T, A: Allocator = Global> {
-    /// Type-erased inner implementation
-    inner: RawSegmentedVecInner<A>,
-    /// Marker for type ownership
-    _marker: PhantomData<T>,
-}
-
 /// Computes the minimum segment capacity exponent for a given element size.
 /// Returns log2(min_segment_cap).
 #[inline]
@@ -67,11 +50,7 @@ const fn segment_capacity_for_size(index: usize, elem_size: usize) -> usize {
 #[inline]
 const fn compute_capacity_for_size(segment_count: usize, elem_size: usize) -> usize {
     if elem_size == 0 {
-        if segment_count == 0 {
-            0
-        } else {
-            usize::MAX
-        }
+        usize::MAX
     } else {
         let min_cap = min_segment_cap_for_size(elem_size);
         (min_cap << segment_count).wrapping_sub(min_cap)
@@ -85,7 +64,7 @@ fn segments_for_capacity_inner(element_count: usize, elem_size: usize) -> usize 
         return 0;
     }
     if elem_size == 0 {
-        return 1;
+        return 0; // ZSTs don't need segments
     }
     let min_cap = min_segment_cap_for_size(elem_size);
     let min_cap_exp = min_cap_exp_for_size(elem_size);
@@ -94,426 +73,59 @@ fn segments_for_capacity_inner(element_count: usize, elem_size: usize) -> usize 
     (msb - min_cap_exp + 1) as usize
 }
 
-/// Type-erased inner implementation for RawSegmentedVec.
-/// Stores segment pointers as `*mut u8` and takes element layout as parameter.
-struct RawSegmentedVecInner<A> {
-    /// Array of segment pointers (type-erased)
-    segments: [*mut u8; MAX_SEGMENTS],
-    /// Number of allocated segments
+/// Raw segmented vector that handles segment allocation without element management.
+///
+/// This is the low-level allocation primitive used by `SegmentedVec`.
+/// It manages segment pointers and capacity but does not track element count
+/// or handle element initialization/destruction.
+#[repr(C)]
+pub(crate) struct RawSegmentedVec<T, A: Allocator = Global> {
+    inner: RawSegmentedVecInner<A>,
+    _marker: PhantomData<T>,
+}
+
+#[repr(C)]
+struct RawSegmentedVecInner<A: Allocator> {
+    /// Pointer to the array of segment pointers.
+    /// This is allocated using `A`, just like the segments themselves.
+    segments: *mut *mut u8,
+    /// Number of *allocated* segments (aka length of the backbone array).
     segment_count: usize,
+    /// Capacity of the backbone array (how many segment pointers we can store before reallocating).
+    segments_cap: usize,
     /// Allocator
     alloc: A,
 }
 
-impl<A: Allocator> RawSegmentedVecInner<A> {
-    /// Creates a new empty `RawSegmentedVecInner`.
+impl<T> RawSegmentedVec<T, Global> {}
+
+impl<T, A: Allocator> RawSegmentedVec<T, A> {
     #[inline]
-    const fn new_in(alloc: A) -> Self {
+    pub(crate) fn with_capacity_in(capacity: usize, alloc: A) -> Self {
+        // Optimization for ZSTs: capacity is infinite/irrelevant
+        if std::mem::size_of::<T>() == 0 {
+            return Self::new_in(alloc);
+        }
+
         Self {
-            segments: [std::ptr::null_mut(); MAX_SEGMENTS],
-            segment_count: 0,
-            alloc,
+            inner: RawSegmentedVecInner::with_capacity_in(
+                capacity,
+                alloc,
+                std::alloc::Layout::new::<T>(),
+            ),
+            _marker: PhantomData,
         }
     }
 
-    /// Returns the number of allocated segments.
-    #[inline]
-    const fn segment_count(&self) -> usize {
-        self.segment_count
+    /// Grows by one segment, returning (segment_ptr, segment_capacity).
+    #[inline(never)]
+    pub(crate) fn grow_one(&mut self) -> (*mut T, usize) {
+        let (ptr, cap) = unsafe { self.inner.grow_one(std::alloc::Layout::new::<T>()) };
+        (ptr as *mut T, cap)
     }
 
-    /// Returns a pointer to the segment at the given index.
-    ///
-    /// # Safety
-    ///
-    /// `index` must be less than `segment_count`.
-    #[inline]
-    unsafe fn segment_ptr(&self, index: usize) -> *mut u8 {
-        debug_assert!(index < self.segment_count);
-        *self.segments.get_unchecked(index)
-    }
-
-    /// Returns the total capacity across all allocated segments.
-    #[inline]
-    fn capacity(&self, elem_size: usize) -> usize {
-        compute_capacity_for_size(self.segment_count, elem_size)
-    }
-
-    /// Allocates a single new segment.
-    ///
-    /// # Safety
-    ///
-    /// `elem_layout` must match the element type this vec is used for.
-    ///
-    /// # Panics
-    ///
-    /// Panics if allocation fails or MAX_SEGMENTS is exceeded.
-    unsafe fn grow_one(&mut self, elem_layout: Layout) {
-        assert!(
-            self.segment_count < MAX_SEGMENTS,
-            "Maximum segment count exceeded"
-        );
-
-        // ZST: no actual allocation needed
-        if elem_layout.size() == 0 {
-            self.segments[self.segment_count] = NonNull::dangling().as_ptr();
-            self.segment_count += 1;
-            return;
-        }
-
-        let size = segment_capacity_for_size(self.segment_count, elem_layout.size());
-        let layout = Layout::from_size_align(size * elem_layout.size(), elem_layout.align())
-            .expect("Layout overflow");
-
-        let ptr = match self.alloc.allocate(layout) {
-            Ok(ptr) => ptr.as_ptr() as *mut u8,
-            Err(_) => panic!("Allocation failed"),
-        };
-
-        self.segments[self.segment_count] = ptr;
-        self.segment_count += 1;
-    }
-
-    /// Ensures capacity for at least `len + additional` elements.
-    ///
-    /// # Safety
-    ///
-    /// `elem_layout` must match the element type this vec is used for.
-    ///
-    /// # Panics
-    ///
-    /// Panics if allocation fails or capacity exceeds limits.
-    unsafe fn reserve(&mut self, len: usize, additional: usize, elem_layout: Layout) {
-        if additional <= self.capacity(elem_layout.size()).wrapping_sub(len) {
-            return;
-        }
-        self.do_reserve(len, additional, elem_layout);
-    }
-
-    /// Internal reserve implementation.
-    ///
-    /// # Safety
-    ///
-    /// `elem_layout` must match the element type this vec is used for.
-    #[cold]
-    unsafe fn do_reserve(&mut self, len: usize, additional: usize, elem_layout: Layout) {
-        let needed_capacity = len.checked_add(additional).expect("capacity overflow");
-
-        if needed_capacity == 0 {
-            return;
-        }
-
-        // ZST: only need one segment ever
-        if elem_layout.size() == 0 {
-            if self.segment_count == 0 {
-                self.segments[0] = NonNull::dangling().as_ptr();
-                self.segment_count = 1;
-            }
-            return;
-        }
-
-        let needed_segments = segments_for_capacity_inner(needed_capacity, elem_layout.size());
-
-        if needed_segments > self.segment_count {
-            assert!(
-                needed_segments <= MAX_SEGMENTS,
-                "Maximum segment count exceeded"
-            );
-
-            for i in self.segment_count..needed_segments {
-                let size = segment_capacity_for_size(i, elem_layout.size());
-                let layout =
-                    Layout::from_size_align(size * elem_layout.size(), elem_layout.align())
-                        .expect("Layout overflow");
-
-                let ptr = match self.alloc.allocate(layout) {
-                    Ok(ptr) => ptr.as_ptr() as *mut u8,
-                    Err(_) => panic!("Allocation failed"),
-                };
-
-                self.segments[i] = ptr;
-            }
-            self.segment_count = needed_segments;
-        }
-    }
-
-    /// Tries to ensure capacity for at least `len + additional` elements.
-    ///
-    /// # Safety
-    ///
-    /// `elem_layout` must match the element type this vec is used for.
-    ///
-    /// Returns `Err` if allocation fails or capacity would overflow.
-    /// On error, any segments allocated during this call are freed.
-    unsafe fn try_reserve(
-        &mut self,
-        len: usize,
-        additional: usize,
-        elem_layout: Layout,
-    ) -> Result<(), TryReserveError> {
-        if additional <= self.capacity(elem_layout.size()).wrapping_sub(len) {
-            return Ok(());
-        }
-        self.do_try_reserve(len, additional, elem_layout)
-    }
-
-    /// Internal try_reserve implementation.
-    ///
-    /// # Safety
-    ///
-    /// `elem_layout` must match the element type this vec is used for.
-    #[cold]
-    unsafe fn do_try_reserve(
-        &mut self,
-        len: usize,
-        additional: usize,
-        elem_layout: Layout,
-    ) -> Result<(), TryReserveError> {
-        let needed_capacity = len
-            .checked_add(additional)
-            .ok_or_else(TryReserveError::capacity_overflow)?;
-
-        if needed_capacity == 0 {
-            return Ok(());
-        }
-
-        // ZST
-        if elem_layout.size() == 0 {
-            if self.segment_count == 0 {
-                self.segments[0] = NonNull::dangling().as_ptr();
-                self.segment_count = 1;
-            }
-            return Ok(());
-        }
-
-        let needed_segments = segments_for_capacity_inner(needed_capacity, elem_layout.size());
-        let old_segment_count = self.segment_count;
-
-        if needed_segments > old_segment_count {
-            if needed_segments > MAX_SEGMENTS {
-                return Err(TryReserveError::capacity_overflow());
-            }
-
-            for i in old_segment_count..needed_segments {
-                let size = segment_capacity_for_size(i, elem_layout.size());
-                let layout =
-                    Layout::from_size_align(size * elem_layout.size(), elem_layout.align())
-                        .map_err(|_| TryReserveError::capacity_overflow())?;
-
-                let ptr = match self.alloc.allocate(layout) {
-                    Ok(ptr) => ptr.as_ptr() as *mut u8,
-                    Err(_) => {
-                        // Free any segments we allocated in this call
-                        self.free_segments(i, old_segment_count, elem_layout);
-                        return Err(TryReserveError::alloc_error(layout));
-                    }
-                };
-
-                self.segments[i] = ptr;
-                self.segment_count = i + 1;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Shrinks the buffer down to the specified capacity.
-    ///
-    /// # Safety
-    ///
-    /// `elem_layout` must match the element type.
-    /// Caller must ensure elements beyond `cap` have already been dropped.
-    /// `cap` must be less than or equal to current capacity.
-    unsafe fn shrink_to_fit(&mut self, cap: usize, elem_layout: Layout) {
-        let new_segment_count = segments_for_capacity_inner(cap, elem_layout.size());
-
-        if new_segment_count < self.segment_count {
-            self.free_segments(self.segment_count, new_segment_count, elem_layout);
-            self.segment_count = new_segment_count;
-        }
-    }
-
-    /// Frees segments from `from_count` down to `to_count` (exclusive).
-    ///
-    /// # Safety
-    ///
-    /// `elem_layout` must match the element type.
-    unsafe fn free_segments(&mut self, from_count: usize, to_count: usize, elem_layout: Layout) {
-        if elem_layout.size() == 0 {
-            return;
-        }
-
-        for i in (to_count..from_count).rev() {
-            let size = segment_capacity_for_size(i, elem_layout.size());
-            let layout =
-                Layout::from_size_align_unchecked(size * elem_layout.size(), elem_layout.align());
-
-            if let Some(ptr) = NonNull::new(self.segments[i]) {
-                self.alloc.deallocate(ptr, layout);
-            }
-            self.segments[i] = std::ptr::null_mut();
-        }
-    }
-
-    /// Deallocates all segments without dropping elements.
-    ///
-    /// # Safety
-    ///
-    /// All elements must have been dropped before calling this.
-    /// `elem_layout` must match the element type.
-    unsafe fn deallocate(&mut self, elem_layout: Layout) {
-        self.free_segments(self.segment_count, 0, elem_layout);
-        self.segment_count = 0;
-    }
-
-    /// Returns a raw pointer to an element at the given index.
-    ///
-    /// # Safety
-    ///
-    /// The index must be within allocated capacity.
-    /// `elem_layout` must match the element type.
-    #[inline]
-    unsafe fn ptr_at(&self, index: usize, elem_layout: Layout) -> *mut u8 {
-        let (segment, offset) = Self::location(index, elem_layout.size());
-        (*self.segments.get_unchecked(segment)).add(offset * elem_layout.size())
-    }
-
-    /// Calculates which segment and offset a list index falls into.
-    /// Returns (segment_index, offset_within_segment).
-    #[inline]
-    fn location(list_index: usize, elem_size: usize) -> (usize, usize) {
-        if elem_size == 0 {
-            return (0, 0);
-        }
-        let min_cap = min_segment_cap_for_size(elem_size);
-        let min_cap_exp = min_cap_exp_for_size(elem_size);
-        let biased = list_index + min_cap;
-        let msb = biased.ilog2();
-        let segment = msb - min_cap_exp;
-        let offset = biased ^ (1usize << msb);
-        (segment as usize, offset)
-    }
-}
-
-impl<T, A: Allocator> RawSegmentedVec<T, A> {
-    /// Minimum capacity for the first segment.
-    /// Avoids tiny allocations that heap allocators round up anyway.
-    /// - 8 for 1-byte elements (allocators round up small requests)
-    /// - 4 for moderate elements (<= 1 KiB)
-    /// - 1 for large elements (avoid wasting space)
-    pub(crate) const MIN_SEGMENT_CAP: usize = min_segment_cap_for_size(std::mem::size_of::<T>());
-
-    /// Returns the layout for type T
-    #[inline]
-    const fn elem_layout() -> Layout {
-        // SAFETY: Layout::new::<T>() is always valid
-        unsafe {
-            Layout::from_size_align_unchecked(std::mem::size_of::<T>(), std::mem::align_of::<T>())
-        }
-    }
-
-    /// Returns the number of allocated segments.
-    #[inline]
-    pub(crate) const fn segment_count(&self) -> usize {
-        self.inner.segment_count()
-    }
-
-    /// Returns a pointer to the segment at the given index.
-    ///
-    /// # Safety
-    ///
-    /// `index` must be less than `segment_count`.
-    #[inline]
-    pub(crate) unsafe fn segment_ptr(&self, index: usize) -> *mut T {
-        self.inner.segment_ptr(index) as *mut T
-    }
-
-    /// Returns the capacity of a segment at the given index.
-    #[inline]
-    pub(crate) const fn segment_capacity(index: usize) -> usize {
-        segment_capacity_for_size(index, std::mem::size_of::<T>())
-    }
-
-    /// Returns the total capacity across all allocated segments.
-    #[inline]
-    pub(crate) fn capacity(&self) -> usize {
-        self.inner.capacity(std::mem::size_of::<T>())
-    }
-
-    /// Calculates which segment and offset a list index falls into.
-    /// Returns (segment_index, offset_within_segment).
-    #[inline]
-    pub(crate) fn location(list_index: usize) -> (usize, usize) {
-        RawSegmentedVecInner::<Global>::location(list_index, std::mem::size_of::<T>())
-    }
-
-    /// Allocates a single new segment.
-    ///
-    /// # Panics
-    ///
-    /// Panics if allocation fails or MAX_SEGMENTS is exceeded.
-    pub(crate) fn grow_one(&mut self) {
-        // SAFETY: elem_layout matches type T
-        unsafe { self.inner.grow_one(Self::elem_layout()) }
-    }
-
-    /// Ensures capacity for at least `len + additional` elements.
-    ///
-    /// # Panics
-    ///
-    /// Panics if allocation fails or capacity exceeds limits.
-    pub(crate) fn reserve(&mut self, len: usize, additional: usize) {
-        // SAFETY: elem_layout matches type T
-        unsafe { self.inner.reserve(len, additional, Self::elem_layout()) }
-    }
-
-    /// Tries to ensure capacity for at least `len + additional` elements.
-    ///
-    /// Returns `Err` if allocation fails or capacity would overflow.
-    /// On error, any segments allocated during this call are freed.
-    pub(crate) fn try_reserve(
-        &mut self,
-        len: usize,
-        additional: usize,
-    ) -> Result<(), TryReserveError> {
-        // SAFETY: elem_layout matches type T
-        unsafe { self.inner.try_reserve(len, additional, Self::elem_layout()) }
-    }
-
-    /// Shrinks the buffer down to the specified capacity.
-    ///
-    /// Does not drop elements - caller must ensure elements beyond `cap`
-    /// have already been dropped.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `cap` is larger than current capacity.
-    pub(crate) fn shrink_to_fit(&mut self, cap: usize) {
-        // SAFETY: elem_layout matches type T
-        unsafe { self.inner.shrink_to_fit(cap, Self::elem_layout()) }
-    }
-
-    /// Returns a raw pointer to an element at the given index.
-    ///
-    /// # Safety
-    ///
-    /// The index must be within allocated capacity.
-    #[inline]
-    pub(crate) unsafe fn ptr_at(&self, index: usize) -> *mut T {
-        self.inner.ptr_at(index, Self::elem_layout()) as *mut T
-    }
-}
-
-impl<T> RawSegmentedVec<T> {
-    /// Creates a new `RawSegmentedVec` without allocating.
-    #[inline]
-    pub(crate) const fn new() -> Self {
-        Self::new_in(Global)
-    }
-}
-
-impl<T, A: Allocator> RawSegmentedVec<T, A> {
-    /// Creates a new `RawSegmentedVec` without allocating, using the given allocator.
+    /// Like `new`, but parameterized over the choice of allocator for
+    /// the returned `RawVec`.
     #[inline]
     pub(crate) const fn new_in(alloc: A) -> Self {
         Self {
@@ -521,77 +133,528 @@ impl<T, A: Allocator> RawSegmentedVec<T, A> {
             _marker: PhantomData,
         }
     }
+
+    /// Like `try_with_capacity`, but parameterized over the choice of
+    /// allocator for the returned `RawVec`.
+    #[inline]
+    pub(crate) fn try_with_capacity_in(capacity: usize, alloc: A) -> Result<Self, TryReserveError> {
+        if std::mem::size_of::<T>() == 0 {
+            return Ok(Self::new_in(alloc));
+        }
+
+        match RawSegmentedVecInner::try_with_capacity_in(
+            capacity,
+            alloc,
+            std::alloc::Layout::new::<T>(),
+        ) {
+            Ok(inner) => Ok(Self {
+                inner,
+                _marker: PhantomData,
+            }),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Gets the capacity of the allocation.
+    ///
+    /// This will always be `usize::MAX` if `T` is zero-sized.
+    #[inline]
+    pub(crate) const fn capacity(&self) -> usize {
+        self.inner.capacity(std::mem::size_of::<T>())
+    }
+
+    /// Returns a shared reference to the allocator backing this `RawSegmentedVec`.
+    #[inline]
+    pub(crate) fn allocator(&self) -> &A {
+        self.inner.allocator()
+    }
+
+    /// Ensures that the buffer contains at least enough space to hold `len +
+    /// additional` elements. If it doesn't already have enough capacity, will
+    /// allocate new segments as needed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the new capacity exceeds `isize::MAX` _bytes_.
+    ///
+    /// # Aborts
+    ///
+    /// Aborts on OOM.
+    #[inline]
+    pub(crate) fn reserve(&mut self, len: usize, additional: usize) -> Option<(*mut T, usize)> {
+        unsafe {
+            self.inner
+                .reserve(len, additional, std::alloc::Layout::new::<T>())
+                .map(|(ptr, cap)| (ptr.as_ptr() as *mut T, cap))
+        }
+    }
+
+    /// The same as `reserve`, but returns on errors instead of panicking or aborting.
+    /// The same as `reserve`, but returns on errors instead of panicking or aborting.
+    pub(crate) fn try_reserve(
+        &mut self,
+        len: usize,
+        additional: usize,
+    ) -> Result<Option<(*mut T, usize)>, TryReserveError> {
+        let ret = unsafe {
+            self.inner
+                .try_reserve(len, additional, std::alloc::Layout::new::<T>())?
+        };
+        Ok(ret.map(|(ptr, cap)| (ptr.as_ptr() as *mut T, cap)))
+    }
+
+    /// Shrinks the buffer down to the specified capacity. If the given amount
+    /// is 0, actually completely deallocates.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the given amount is *larger* than the current capacity.
+    ///
+    /// # Aborts
+    ///
+    /// Aborts on OOM.
+    #[inline]
+    pub(crate) fn shrink_to_fit(&mut self, cap: usize) {
+        unsafe {
+            self.inner
+                .shrink_to_fit(cap, std::alloc::Layout::new::<T>())
+        }
+    }
+
+    /// Shrink to exactly `target_segments` count.
+    ///
+    /// # Safety
+    /// `target_segments` must be <= current segment count.
+    #[inline]
+    pub(crate) unsafe fn shrink_to_fit_segments(&mut self, target_segments: usize) {
+        self.inner
+            .shrink_to_fit_segments(target_segments, std::alloc::Layout::new::<T>())
+    }
+
+    /// Returns the number of allocated segments.
+    #[inline]
+    pub(crate) fn segment_count(&self) -> usize {
+        self.inner.segment_count
+    }
+
+    /// Returns a pointer to the start of segment at the given index.
+    ///
+    /// # Safety
+    ///
+    /// The segment at `index` must have been allocated.
+    #[inline]
+    pub(crate) unsafe fn segment_ptr(&self, index: usize) -> *mut T {
+        if std::mem::size_of::<T>() == 0 {
+            return std::ptr::NonNull::<T>::dangling().as_ptr();
+        }
+        debug_assert!(index < self.inner.segment_count);
+        self.inner.segments.add(index).read() as *mut T
+    }
+
+    /// Returns the capacity of a segment at the given index.
+    #[inline]
+    pub(crate) fn segment_capacity(index: usize) -> usize {
+        segment_capacity_for_size(index, std::mem::size_of::<T>())
+    }
+
+    /// Computes the segment index and offset within segment for a given logical index.
+    /// Returns `(segment_index, offset_within_segment)`.
+    #[inline]
+    pub(crate) fn location(index: usize) -> (usize, usize) {
+        let elem_size = std::mem::size_of::<T>();
+        if elem_size == 0 {
+            // For ZSTs, everything is in segment 0
+            return (0, index);
+        }
+
+        let min_cap = min_segment_cap_for_size(elem_size);
+        let min_cap_exp = min_cap_exp_for_size(elem_size);
+
+        // biased = index + min_cap gives us the position in a virtual array
+        // where segment 0 starts at index min_cap
+        let biased = index + min_cap;
+        let segment_index = (biased.ilog2() - min_cap_exp) as usize;
+
+        // The start of this segment in logical index space
+        let segment_start = compute_capacity_for_size(segment_index, elem_size);
+        let offset = index - segment_start;
+
+        (segment_index, offset)
+    }
+
+    /// Returns a pointer to the element at the given logical index.
+    ///
+    /// # Safety
+    ///
+    /// The index must be within the allocated capacity.
+    #[inline]
+    pub(crate) unsafe fn ptr_at(&self, index: usize) -> *mut T {
+        if std::mem::size_of::<T>() == 0 {
+            return std::ptr::NonNull::<T>::dangling().as_ptr();
+        }
+        let (segment_idx, offset) = Self::location(index);
+        debug_assert!(segment_idx < self.inner.segment_count);
+        let segment_ptr = self.inner.segments.add(segment_idx).read() as *mut T;
+        segment_ptr.add(offset)
+    }
 }
 
 impl<T, A: Allocator> Drop for RawSegmentedVec<T, A> {
+    /// Frees the memory owned by the `RawSegmentedVec` *without* trying to drop its contents.
     fn drop(&mut self) {
-        // Note: This only frees memory, it doesn't drop elements.
-        // SegmentedVec must drop elements before RawSegmentedVec is dropped.
-        // SAFETY: We're dropping, so no more accesses will happen
-        unsafe {
-            self.inner.deallocate(Self::elem_layout());
+        unsafe { self.inner.deallocate(std::alloc::Layout::new::<T>()) }
+    }
+}
+
+impl<A: Allocator> RawSegmentedVecInner<A> {
+    #[inline]
+    fn with_capacity_in(capacity: usize, alloc: A, elem_layout: Layout) -> Self {
+        match Self::try_with_capacity_in(capacity, alloc, elem_layout) {
+            Ok(this) => this,
+            Err(_) => handle_alloc_error(elem_layout),
+        }
+    }
+
+    /// Allocates segments for the given capacity, with optional zeroing.
+    ///
+    /// For segmented storage, zeroed allocation allocates segments using
+    /// `allocate_zeroed` instead of `allocate`.
+    fn try_allocate_in(
+        capacity: usize,
+        alloc: A,
+        elem_layout: Layout,
+    ) -> Result<Self, TryReserveError> {
+        let mut this = Self::new_in(alloc);
+        let segments_needed = segments_for_capacity_inner(capacity, elem_layout.size());
+
+        for _ in 0..segments_needed {
+            if let Err(e) = unsafe { this.grow_one_inner_impl(elem_layout) } {
+                // Free any already allocated segments/backbone to avoid leak
+                unsafe {
+                    this.deallocate(elem_layout);
+                }
+                return Err(e);
+            }
+        }
+
+        Ok(this)
+    }
+
+    #[inline]
+    const fn new_in(alloc: A) -> Self {
+        Self {
+            segments: std::ptr::null_mut(),
+            segment_count: 0,
+            segments_cap: 0,
+            alloc,
+        }
+    }
+
+    #[inline]
+    fn try_with_capacity_in(
+        capacity: usize,
+        alloc: A,
+        elem_layout: Layout,
+    ) -> Result<Self, TryReserveError> {
+        Self::try_allocate_in(capacity, alloc, elem_layout)
+    }
+
+    /// # Safety
+    /// - `elem_layout` must be valid for `self`, i.e. it must be the same `elem_layout` used to
+    ///   initially construct `self`
+    /// - `elem_layout`'s size must be a multiple of its alignment
+    ///   Returns (segment_ptr, segment_capacity)
+    #[inline]
+    unsafe fn grow_one(&mut self, elem_layout: Layout) -> (*mut u8, usize) {
+        match unsafe { self.grow_one_inner(elem_layout) } {
+            Ok(result) => result,
+            Err(_) => handle_alloc_error(elem_layout),
+        }
+    }
+
+    /// # Safety
+    /// - `elem_layout` must be valid for `self`, i.e. it must be the same `elem_layout` used to
+    ///   initially construct `self`
+    /// - `elem_layout`'s size must be a multiple of its alignment
+    /// - The sum of `len` and `additional` must be greater than the current capacity
+    ///   Returns the (ptr, cap) of the *first* newly allocated segment, if any.
+    unsafe fn grow_amortized(
+        &mut self,
+        len: usize,
+        additional: usize,
+        elem_layout: Layout,
+    ) -> Result<Option<(NonNull<u8>, usize)>, TryReserveError> {
+        // This is ensured by the calling contexts.
+        debug_assert!(additional > 0);
+
+        if elem_layout.size() == 0 {
+            // Since we return a capacity of `usize::MAX` when `elem_size` is
+            // 0, getting to here necessarily means the `RawSegmentedVec` is overfull,
+            // UNLESS we haven't allocated any segments yet.
+            if self.segment_count > 0 {
+                return Err(TryReserveError::capacity_overflow());
+            }
+        }
+
+        // Nothing we can really do about these checks, sadly.
+        let required_cap = len
+            .checked_add(additional)
+            .ok_or_else(TryReserveError::capacity_overflow)?;
+
+        // For segmented storage, we just need to ensure we have enough segments
+        let segments_needed = segments_for_capacity_inner(required_cap, elem_layout.size());
+
+        let mut first_alloc = None;
+        while self.segment_count < segments_needed {
+            unsafe {
+                let (ptr, cap) = self.grow_one_inner(elem_layout)?;
+                if first_alloc.is_none() {
+                    first_alloc = Some((NonNull::new_unchecked(ptr), cap));
+                }
+            }
+        }
+
+        Ok(first_alloc)
+    }
+
+    /// Allocates one more segment, returning an error on failure.
+    ///
+    /// # Safety
+    /// - `elem_layout` must be valid for `self`
+    ///   Returns (segment_ptr, segment_capacity)
+    unsafe fn grow_one_inner(
+        &mut self,
+        elem_layout: Layout,
+    ) -> Result<(*mut u8, usize), TryReserveError> {
+        unsafe { self.grow_one_inner_impl(elem_layout) }
+    }
+
+    /// Allocates one more segment with the specified initialization.
+    /// # Safety
+    /// - `elem_layout` must be valid for `self`
+    unsafe fn grow_one_inner_impl(
+        &mut self,
+        elem_layout: Layout,
+    ) -> Result<(*mut u8, usize), TryReserveError> {
+        // Limit max segments to avoid overflow in capacity calculation
+        if self.segment_count >= usize::BITS as usize {
+            return Err(TryReserveError::capacity_overflow());
+        }
+
+        // Ensure we have space in the segments array
+        if self.segment_count == self.segments_cap {
+            let new_cap = if self.segments_cap == 0 {
+                4 // Start with 4 segments to avoid small copies
+            } else {
+                self.segments_cap
+                    .checked_mul(2)
+                    .ok_or_else(TryReserveError::capacity_overflow)?
+            };
+
+            let backbone_layout = Layout::array::<*mut u8>(new_cap)
+                .map_err(|_| TryReserveError::capacity_overflow())?;
+
+            let new_segments = if self.segments_cap == 0 {
+                self.alloc.allocate(backbone_layout)
+            } else {
+                let old_layout = Layout::array::<*mut u8>(self.segments_cap).unwrap();
+                unsafe {
+                    self.alloc.grow(
+                        NonNull::new_unchecked(self.segments).cast(),
+                        old_layout,
+                        backbone_layout,
+                    )
+                }
+            };
+
+            let new_ptr = new_segments
+                .map_err(|_| TryReserveError::alloc_error(backbone_layout))?
+                .cast::<*mut u8>();
+            self.segments = new_ptr.as_ptr();
+            self.segments_cap = new_cap;
+        }
+
+        // For ZSTs, we use a dangling pointer and don't actually allocate
+        if elem_layout.size() == 0 {
+            let ptr = NonNull::<u8>::dangling().as_ptr();
+            self.segments.add(self.segment_count).write(ptr);
+            self.segment_count += 1;
+            return Ok((ptr, usize::MAX));
+        }
+
+        let segment_cap = segment_capacity_for_size(self.segment_count, elem_layout.size());
+        let layout = Layout::from_size_align(
+            elem_layout
+                .size()
+                .checked_mul(segment_cap)
+                .ok_or_else(TryReserveError::capacity_overflow)?,
+            elem_layout.align(),
+        )
+        .map_err(|_| TryReserveError::capacity_overflow())?;
+
+        let ptr = self
+            .alloc
+            .allocate(layout)
+            .map_err(|_| TryReserveError::alloc_error(layout))?;
+
+        let segment_ptr = ptr.as_ptr() as *mut u8;
+        self.segments.add(self.segment_count).write(segment_ptr);
+        self.segment_count += 1;
+        Ok((segment_ptr, segment_cap))
+    }
+
+    #[inline]
+    const fn capacity(&self, elem_size: usize) -> usize {
+        compute_capacity_for_size(self.segment_count, elem_size)
+    }
+
+    #[inline]
+    fn allocator(&self) -> &A {
+        &self.alloc
+    }
+
+    /// # Safety
+    /// - `elem_layout` must be valid for `self`, i.e. it must be the same `elem_layout` used to
+    ///   initially construct `self`
+    /// - `elem_layout`'s size must be a multiple of its alignment
+    #[inline]
+    ///   Returns the (ptr, cap) of the *first* newly allocated segment, if any.
+    pub(crate) unsafe fn reserve(
+        &mut self,
+        len: usize,
+        additional: usize,
+        elem_layout: Layout,
+    ) -> Option<(NonNull<u8>, usize)> {
+        if self.needs_to_grow(len, additional, elem_layout) {
+            match self.grow_amortized(len, additional, elem_layout) {
+                Ok(res) => res, // Option<(NonNull<u8>, usize)>
+                Err(_) => handle_alloc_error(elem_layout),
+            }
+        } else {
+            None
+        }
+    }
+
+    /// The same as `reserve`, but returns on errors instead of panicking or aborting.
+    /// Returns the (ptr, cap) of the *first* newly allocated segment, if any.
+    pub(crate) unsafe fn try_reserve(
+        &mut self,
+        len: usize,
+        additional: usize,
+        elem_layout: Layout,
+    ) -> Result<Option<(NonNull<u8>, usize)>, TryReserveError> {
+        if self.needs_to_grow(len, additional, elem_layout) {
+            self.grow_amortized(len, additional, elem_layout)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// # Safety
+    /// - `elem_layout` must be valid for `self`
+    #[inline]
+    unsafe fn shrink_to_fit(&mut self, cap: usize, elem_layout: Layout) {
+        if unsafe { self.shrink(cap, elem_layout) }.is_err() {
+            handle_alloc_error(elem_layout);
+        }
+    }
+
+    /// Shrink to exactly `target_segments` count.
+    ///
+    /// # Safety
+    /// `target_segments` must be <= current segment count.
+    #[inline]
+    pub(crate) unsafe fn shrink_to_fit_segments(
+        &mut self,
+        target_segments: usize,
+        elem_layout: Layout,
+    ) {
+        if unsafe { self.shrink_segments(target_segments, elem_layout) }.is_err() {
+            handle_alloc_error(elem_layout);
+        }
+    }
+
+    #[inline]
+    const fn needs_to_grow(&self, len: usize, additional: usize, elem_layout: Layout) -> bool {
+        additional > self.capacity(elem_layout.size()).wrapping_sub(len)
+    }
+
+    /// # Safety
+    /// - `elem_layout` must be valid for `self`, i.e. it must be the same `elem_layout` used to
+    ///   initially construct `self`
+    /// - `elem_layout`'s size must be a multiple of its alignment
+    /// - `cap` must be less than or equal to `self.capacity(elem_layout.size())`
+    #[inline]
+    unsafe fn shrink(&mut self, cap: usize, elem_layout: Layout) -> Result<(), TryReserveError> {
+        let segments_needed = if cap == 0 {
+            0
+        } else {
+            segments_for_capacity_inner(cap, elem_layout.size())
+        };
+        unsafe { self.shrink_segments(segments_needed, elem_layout) }
+    }
+
+    /// Internal logic for shrinking segments directly by count.
+    unsafe fn shrink_segments(
+        &mut self,
+        segments_needed: usize,
+        elem_layout: Layout,
+    ) -> Result<(), TryReserveError> {
+        // For ZSTs, don't deallocate segments (they're dangling pointers anyway)
+        if elem_layout.size() == 0 {
+            return Ok(());
+        }
+
+        // Deallocate excess segments
+        while self.segment_count > segments_needed {
+            self.segment_count -= 1;
+            let segment_idx = self.segment_count;
+            let segment_cap = segment_capacity_for_size(segment_idx, elem_layout.size());
+
+            let layout = Layout::from_size_align_unchecked(
+                elem_layout.size() * segment_cap,
+                elem_layout.align(),
+            );
+
+            let ptr = self.segments.add(segment_idx).read();
+            if let Some(ptr) = NonNull::new(ptr) {
+                self.alloc.deallocate(ptr, layout);
+            }
+            self.segments.add(segment_idx).write(std::ptr::null_mut());
+        }
+
+        Ok(())
+    }
+
+    unsafe fn deallocate(&mut self, elem_layout: Layout) {
+        // Free all allocated segments
+        if elem_layout.size() != 0 {
+            for i in 0..self.segment_count {
+                let segment_cap = segment_capacity_for_size(i, elem_layout.size());
+                let layout = Layout::from_size_align_unchecked(
+                    elem_layout.size() * segment_cap,
+                    elem_layout.align(),
+                );
+                let ptr = self.segments.add(i).read();
+                if let Some(ptr) = NonNull::new(ptr) {
+                    self.alloc.deallocate(ptr, layout);
+                }
+            }
+        }
+
+        if self.segments_cap > 0 {
+            let backbone_layout = Layout::array::<*mut u8>(self.segments_cap).unwrap();
+            self.alloc.deallocate(
+                NonNull::new_unchecked(self.segments).cast(),
+                backbone_layout,
+            );
         }
     }
 }
 
-// Safety: RawSegmentedVec owns its allocations and T determines thread safety
-unsafe impl<T: Send, A: Allocator + Send> Send for RawSegmentedVec<T, A> {}
-unsafe impl<T: Sync, A: Allocator + Sync> Sync for RawSegmentedVec<T, A> {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_new() {
-        let raw: RawSegmentedVec<i32> = RawSegmentedVec::new();
-        assert_eq!(raw.segment_count(), 0);
-        assert_eq!(raw.capacity(), 0);
-    }
-
-    #[test]
-    fn test_grow_one() {
-        let mut raw: RawSegmentedVec<i32> = RawSegmentedVec::new();
-        raw.grow_one();
-        assert_eq!(raw.segment_count(), 1);
-        assert!(raw.capacity() >= 4);
-    }
-
-    #[test]
-    fn test_reserve() {
-        let mut raw: RawSegmentedVec<i32> = RawSegmentedVec::new();
-        raw.reserve(0, 100);
-        assert!(raw.capacity() >= 100);
-    }
-
-    #[test]
-    fn test_location() {
-        // For i32, MIN_SEGMENT_CAP = 4
-        // Segment 0: indices 0..4 (capacity 4)
-        // Segment 1: indices 4..12 (capacity 8)
-        // Segment 2: indices 12..28 (capacity 16)
-        assert_eq!(RawSegmentedVec::<i32>::location(0), (0, 0));
-        assert_eq!(RawSegmentedVec::<i32>::location(3), (0, 3));
-        assert_eq!(RawSegmentedVec::<i32>::location(4), (1, 0));
-        assert_eq!(RawSegmentedVec::<i32>::location(11), (1, 7));
-        assert_eq!(RawSegmentedVec::<i32>::location(12), (2, 0));
-    }
-
-    #[test]
-    fn test_shrink() {
-        let mut raw: RawSegmentedVec<i32> = RawSegmentedVec::new();
-        raw.reserve(0, 100);
-        let old_count = raw.segment_count();
-        raw.shrink_to_fit(10);
-        assert!(raw.segment_count() < old_count);
-        assert!(raw.capacity() >= 10);
-    }
-
-    #[test]
-    fn test_zst() {
-        let mut raw: RawSegmentedVec<()> = RawSegmentedVec::new();
-        assert_eq!(raw.capacity(), 0);
-        raw.grow_one();
-        assert_eq!(raw.capacity(), usize::MAX);
-    }
+/// Handle allocation errors by panicking.
+#[cold]
+#[inline(never)]
+fn handle_alloc_error(layout: Layout) -> ! {
+    panic!("memory allocation of {} bytes failed", layout.size());
 }

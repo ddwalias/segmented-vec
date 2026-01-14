@@ -1484,7 +1484,7 @@ mod stress_tests {
 }
 
 // ============================================================================
-// ZERO-SIZED TYPE (ZST) TESTS
+// ZERO-SIZED TYPE (Zst) TESTS
 // ============================================================================
 
 #[cfg(test)]
@@ -1492,16 +1492,16 @@ mod zst_tests {
     use super::*;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-    struct ZST;
+    struct Zst;
 
     #[test]
     fn test_zst_push_pop() {
-        let mut seg_vec: SegmentedVec<ZST> = SegmentedVec::new();
-        let mut std_vec: Vec<ZST> = Vec::new();
+        let mut seg_vec: SegmentedVec<Zst> = SegmentedVec::new();
+        let mut std_vec: Vec<Zst> = Vec::new();
 
         for _ in 0..1000 {
-            seg_vec.push(ZST);
-            std_vec.push(ZST);
+            seg_vec.push(Zst);
+            std_vec.push(Zst);
         }
 
         assert_eq!(seg_vec.len(), std_vec.len());
@@ -1516,50 +1516,50 @@ mod zst_tests {
 
     #[test]
     fn test_zst_get() {
-        let mut seg_vec: SegmentedVec<ZST> = SegmentedVec::new();
+        let mut seg_vec: SegmentedVec<Zst> = SegmentedVec::new();
 
         for _ in 0..100 {
-            seg_vec.push(ZST);
+            seg_vec.push(Zst);
         }
 
         for i in 0..100 {
-            assert_eq!(seg_vec.get(i), Some(&ZST));
+            assert_eq!(seg_vec.get(i), Some(&Zst));
         }
         assert_eq!(seg_vec.get(100), None);
     }
 
     #[test]
     fn test_zst_iter() {
-        let mut seg_vec: SegmentedVec<ZST> = SegmentedVec::new();
-        let mut std_vec: Vec<ZST> = Vec::new();
+        let mut seg_vec: SegmentedVec<Zst> = SegmentedVec::new();
+        let mut std_vec: Vec<Zst> = Vec::new();
 
         for _ in 0..100 {
-            seg_vec.push(ZST);
-            std_vec.push(ZST);
+            seg_vec.push(Zst);
+            std_vec.push(Zst);
         }
 
-        assert_eq!(seg_vec.iter().count(), std_vec.iter().count());
-        assert!(seg_vec.iter().all(|x| *x == ZST));
+        assert_eq!(seg_vec.iter().count(), std_vec.len());
+        assert!(seg_vec.iter().all(|x| *x == Zst));
     }
 
     #[test]
     fn test_zst_into_iter() {
-        let mut seg_vec: SegmentedVec<ZST> = SegmentedVec::new();
+        let mut seg_vec: SegmentedVec<Zst> = SegmentedVec::new();
 
         for _ in 0..100 {
-            seg_vec.push(ZST);
+            seg_vec.push(Zst);
         }
 
-        let collected: Vec<ZST> = seg_vec.into_iter().collect();
+        let collected: Vec<Zst> = seg_vec.into_iter().collect();
         assert_eq!(collected.len(), 100);
     }
 
     #[test]
     fn test_zst_clear() {
-        let mut seg_vec: SegmentedVec<ZST> = SegmentedVec::new();
+        let mut seg_vec: SegmentedVec<Zst> = SegmentedVec::new();
 
         for _ in 0..100 {
-            seg_vec.push(ZST);
+            seg_vec.push(Zst);
         }
 
         seg_vec.clear();
@@ -1569,12 +1569,12 @@ mod zst_tests {
 
     #[test]
     fn test_zst_truncate() {
-        let mut seg_vec: SegmentedVec<ZST> = SegmentedVec::new();
-        let mut std_vec: Vec<ZST> = Vec::new();
+        let mut seg_vec: SegmentedVec<Zst> = SegmentedVec::new();
+        let mut std_vec: Vec<Zst> = Vec::new();
 
         for _ in 0..100 {
-            seg_vec.push(ZST);
-            std_vec.push(ZST);
+            seg_vec.push(Zst);
+            std_vec.push(Zst);
         }
 
         seg_vec.truncate(50);
@@ -1585,16 +1585,16 @@ mod zst_tests {
 
     #[test]
     fn test_zst_insert_remove() {
-        let mut seg_vec: SegmentedVec<ZST> = SegmentedVec::new();
-        let mut std_vec: Vec<ZST> = Vec::new();
+        let mut seg_vec: SegmentedVec<Zst> = SegmentedVec::new();
+        let mut std_vec: Vec<Zst> = Vec::new();
 
         for _ in 0..10 {
-            seg_vec.push(ZST);
-            std_vec.push(ZST);
+            seg_vec.push(Zst);
+            std_vec.push(Zst);
         }
 
-        seg_vec.insert(5, ZST);
-        std_vec.insert(5, ZST);
+        seg_vec.insert(5, Zst);
+        std_vec.insert(5, Zst);
         assert_eq!(seg_vec.len(), std_vec.len());
 
         seg_vec.remove(5);
@@ -1604,12 +1604,12 @@ mod zst_tests {
 
     #[test]
     fn test_zst_swap_remove() {
-        let mut seg_vec: SegmentedVec<ZST> = SegmentedVec::new();
-        let mut std_vec: Vec<ZST> = Vec::new();
+        let mut seg_vec: SegmentedVec<Zst> = SegmentedVec::new();
+        let mut std_vec: Vec<Zst> = Vec::new();
 
         for _ in 0..10 {
-            seg_vec.push(ZST);
-            std_vec.push(ZST);
+            seg_vec.push(Zst);
+            std_vec.push(Zst);
         }
 
         seg_vec.swap_remove(5);
@@ -1619,12 +1619,12 @@ mod zst_tests {
 
     #[test]
     fn test_zst_drain() {
-        let mut seg_vec: SegmentedVec<ZST> = SegmentedVec::new();
-        let mut std_vec: Vec<ZST> = Vec::new();
+        let mut seg_vec: SegmentedVec<Zst> = SegmentedVec::new();
+        let mut std_vec: Vec<Zst> = Vec::new();
 
         for _ in 0..10 {
-            seg_vec.push(ZST);
-            std_vec.push(ZST);
+            seg_vec.push(Zst);
+            std_vec.push(Zst);
         }
 
         let seg_drained: Vec<_> = seg_vec.drain(3..7).collect();
@@ -1636,21 +1636,21 @@ mod zst_tests {
 
     #[test]
     fn test_zst_extend() {
-        let mut seg_vec: SegmentedVec<ZST> = SegmentedVec::new();
-        let mut std_vec: Vec<ZST> = Vec::new();
+        let mut seg_vec: SegmentedVec<Zst> = SegmentedVec::new();
+        let mut std_vec: Vec<Zst> = Vec::new();
 
-        seg_vec.extend(std::iter::repeat(ZST).take(100));
-        std_vec.extend(std::iter::repeat(ZST).take(100));
+        seg_vec.extend(std::iter::repeat_n(Zst, 100));
+        std_vec.extend(std::iter::repeat_n(Zst, 100));
 
         assert_eq!(seg_vec.len(), std_vec.len());
     }
 
     #[test]
     fn test_zst_clone() {
-        let mut seg_vec: SegmentedVec<ZST> = SegmentedVec::new();
+        let mut seg_vec: SegmentedVec<Zst> = SegmentedVec::new();
 
         for _ in 0..100 {
-            seg_vec.push(ZST);
+            seg_vec.push(Zst);
         }
 
         let cloned = seg_vec.clone();
@@ -1659,10 +1659,10 @@ mod zst_tests {
 
     #[test]
     fn test_zst_reverse() {
-        let mut seg_vec: SegmentedVec<ZST> = SegmentedVec::new();
+        let mut seg_vec: SegmentedVec<Zst> = SegmentedVec::new();
 
         for _ in 0..100 {
-            seg_vec.push(ZST);
+            seg_vec.push(Zst);
         }
 
         seg_vec.reverse();
@@ -1671,10 +1671,10 @@ mod zst_tests {
 
     #[test]
     fn test_zst_sort() {
-        let mut seg_vec: SegmentedVec<ZST> = SegmentedVec::new();
+        let mut seg_vec: SegmentedVec<Zst> = SegmentedVec::new();
 
         for _ in 0..100 {
-            seg_vec.push(ZST);
+            seg_vec.push(Zst);
         }
 
         seg_vec.sort();
@@ -1685,11 +1685,11 @@ mod zst_tests {
     #[test]
     fn test_zst_large_count() {
         // Test with a large number of ZSTs
-        let mut seg_vec: SegmentedVec<ZST> = SegmentedVec::new();
+        let mut seg_vec: SegmentedVec<Zst> = SegmentedVec::new();
         let count = 100_000;
 
         for _ in 0..count {
-            seg_vec.push(ZST);
+            seg_vec.push(Zst);
         }
 
         assert_eq!(seg_vec.len(), count);
@@ -1699,7 +1699,7 @@ mod zst_tests {
 
         // Pop all
         for _ in 0..count {
-            assert_eq!(seg_vec.pop(), Some(ZST));
+            assert_eq!(seg_vec.pop(), Some(Zst));
         }
 
         assert!(seg_vec.is_empty());
@@ -1707,7 +1707,7 @@ mod zst_tests {
 
     #[test]
     fn test_zst_unit_type() {
-        // Test with () which is the canonical ZST
+        // Test with () which is the canonical Zst
         let mut seg_vec: SegmentedVec<()> = SegmentedVec::new();
         let mut std_vec: Vec<()> = Vec::new();
 
@@ -1755,12 +1755,12 @@ mod zst_tests {
 
     #[test]
     fn test_zst_split_off() {
-        let mut seg_vec: SegmentedVec<ZST> = SegmentedVec::new();
-        let mut std_vec: Vec<ZST> = Vec::new();
+        let mut seg_vec: SegmentedVec<Zst> = SegmentedVec::new();
+        let mut std_vec: Vec<Zst> = Vec::new();
 
         for _ in 0..100 {
-            seg_vec.push(ZST);
-            std_vec.push(ZST);
+            seg_vec.push(Zst);
+            std_vec.push(Zst);
         }
 
         let seg_split = seg_vec.split_off(50);
@@ -1772,12 +1772,12 @@ mod zst_tests {
 
     #[test]
     fn test_zst_retain() {
-        let mut seg_vec: SegmentedVec<ZST> = SegmentedVec::new();
-        let mut std_vec: Vec<ZST> = Vec::new();
+        let mut seg_vec: SegmentedVec<Zst> = SegmentedVec::new();
+        let mut std_vec: Vec<Zst> = Vec::new();
 
         for _ in 0..100 {
-            seg_vec.push(ZST);
-            std_vec.push(ZST);
+            seg_vec.push(Zst);
+            std_vec.push(Zst);
         }
 
         let mut i = 0;
@@ -1797,21 +1797,21 @@ mod zst_tests {
 
     #[test]
     fn test_zst_first_last() {
-        let mut seg_vec: SegmentedVec<ZST> = SegmentedVec::new();
+        let mut seg_vec: SegmentedVec<Zst> = SegmentedVec::new();
 
         assert_eq!(seg_vec.first(), None);
         assert_eq!(seg_vec.last(), None);
 
-        seg_vec.push(ZST);
+        seg_vec.push(Zst);
 
-        assert_eq!(seg_vec.first(), Some(&ZST));
-        assert_eq!(seg_vec.last(), Some(&ZST));
+        assert_eq!(seg_vec.first(), Some(&Zst));
+        assert_eq!(seg_vec.last(), Some(&Zst));
 
         for _ in 0..99 {
-            seg_vec.push(ZST);
+            seg_vec.push(Zst);
         }
 
-        assert_eq!(seg_vec.first(), Some(&ZST));
-        assert_eq!(seg_vec.last(), Some(&ZST));
+        assert_eq!(seg_vec.first(), Some(&Zst));
+        assert_eq!(seg_vec.last(), Some(&Zst));
     }
 }

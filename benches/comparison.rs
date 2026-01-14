@@ -150,6 +150,36 @@ impl<T> VecLike<T> for SegmentedVec<T> {
 }
 
 // ============================================================================
+// Construction Benchmarks
+// ============================================================================
+
+#[divan::bench(consts = [100, 1000, 10000, 100000, 1000000, 10000000, 100000000])]
+fn z_from_fn<const N: usize>(bencher: divan::Bencher) {
+    bencher.bench_local(|| {
+        let v: Vec<usize> = (0..N).collect();
+        v
+    });
+}
+
+#[divan::bench(consts = [100, 1000, 10000, 100000, 1000000, 10000000, 100000000])]
+fn y_from_fn<const N: usize>(bencher: divan::Bencher) {
+    bencher.bench_local(|| SegmentedVec::from_fn(N, |i| i));
+}
+
+#[divan::bench(consts = [100, 1000, 10000, 100000, 1000000, 10000000, 100000000])]
+fn x_from_fn<const N: usize>(bencher: divan::Bencher) {
+    bencher.bench_local(|| SegmentedVec::from_fn(N, |i| i));
+}
+
+#[divan::bench(consts = [100, 1000, 10000, 100000, 1000000])]
+fn segmented_vec_collect<const N: usize>(bencher: divan::Bencher) {
+    bencher.bench_local(|| {
+        let v: SegmentedVec<usize> = (0..N).collect();
+        v
+    });
+}
+
+// ============================================================================
 // Push Benchmarks
 // ============================================================================
 

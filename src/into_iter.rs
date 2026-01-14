@@ -12,14 +12,25 @@ pub struct IntoIter<T> {
 }
 
 impl<T> IntoIter<T> {
+    /// Creates a new owning iterator from a `SegmentedVec`.
+    #[inline]
+    pub fn new(vec: SegmentedVec<T>) -> Self {
+        Self { vec, index: 0 }
+    }
+
     /// Returns the remaining items as a slice.
+    ///
+    /// Note: For segmented storage, this returns an empty slice since
+    /// elements are not stored contiguously. Use iteration instead.
     pub fn as_slice(&self) -> &[T] {
         // We can't return a contiguous slice for segmented storage
-        // This is intentionally not implemented to avoid confusion
         &[]
     }
 
     /// Returns the remaining items as a mutable slice.
+    ///
+    /// Note: For segmented storage, this returns an empty slice since
+    /// elements are not stored contiguously. Use iteration instead.
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         // We can't return a contiguous slice for segmented storage
         &mut []
@@ -34,6 +45,7 @@ impl<T> Iterator for IntoIter<T> {
         if self.index >= self.vec.len() {
             return None;
         }
+        // Safety: index < len, so the element exists and is initialized
         let value = unsafe { self.vec.unchecked_read(self.index) };
         self.index += 1;
         Some(value)
@@ -60,8 +72,9 @@ impl<T> DoubleEndedIterator for IntoIter<T> {
         let new_len = self.vec.len() - 1;
         // Safety: new_len < old len, so this index is valid
         let value = unsafe { self.vec.unchecked_read(new_len) };
-        // Manually decrease the length to avoid dropping the element again
-        self.vec.set_len_internal(new_len);
+        // Safety: new_len is less than capacity and we just read (not dropped)
+        // the element at new_len, so it's safe to shrink
+        unsafe { self.vec.set_len_internal(new_len) };
         Some(value)
     }
 }
@@ -80,8 +93,9 @@ impl<T> Drop for IntoIter<T> {
                 }
             }
         }
-        // Prevent the Vec from dropping elements again
-        self.vec.set_len_internal(0);
+        // Safety: All remaining elements have been dropped, set len to 0
+        // to prevent the Vec from dropping them again
+        unsafe { self.vec.set_len_internal(0) };
     }
 }
 

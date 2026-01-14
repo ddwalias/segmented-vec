@@ -1,6 +1,7 @@
 //! Draining iterator for `SegmentedVec`.
 
 use crate::SegmentedVec;
+use allocator_api2::alloc::{Allocator, Global};
 use std::ptr::NonNull;
 
 /// A draining iterator for `SegmentedVec`.
@@ -8,9 +9,9 @@ use std::ptr::NonNull;
 /// This struct is created by the [`drain`] method on [`SegmentedVec`].
 ///
 /// [`drain`]: SegmentedVec::drain
-pub struct Drain<'a, T: 'a> {
+pub struct Drain<'a, T: 'a, A: Allocator = Global> {
     /// Pointer to the SegmentedVec we're draining
-    pub(crate) vec: NonNull<SegmentedVec<T>>,
+    pub(crate) vec: NonNull<SegmentedVec<T, A>>,
     /// Start of the drained range
     pub(crate) range_start: usize,
     /// Original end of the drained range
@@ -20,10 +21,10 @@ pub struct Drain<'a, T: 'a> {
     /// Original length of the vector
     pub(crate) original_len: usize,
     /// Marker for the lifetime
-    pub(crate) _marker: std::marker::PhantomData<&'a mut SegmentedVec<T>>,
+    pub(crate) _marker: std::marker::PhantomData<&'a mut SegmentedVec<T, A>>,
 }
 
-impl<T> Drain<'_, T> {
+impl<T, A: Allocator> Drain<'_, T, A> {
     /// Returns the remaining items as a slice.
     ///
     /// Note: Due to the segmented nature of the storage, this returns an empty slice.
@@ -44,7 +45,7 @@ impl<T> Drain<'_, T> {
     }
 }
 
-impl<'a, T> Iterator for Drain<'a, T> {
+impl<'a, T, A: Allocator> Iterator for Drain<'a, T, A> {
     type Item = T;
 
     #[inline]
@@ -52,6 +53,10 @@ impl<'a, T> Iterator for Drain<'a, T> {
         if self.index >= self.range_end {
             None
         } else {
+            if std::mem::size_of::<T>() == 0 {
+                self.index += 1;
+                return Some(unsafe { std::mem::zeroed() });
+            }
             let vec = unsafe { self.vec.as_ref() };
             let value = unsafe { std::ptr::read(vec.unchecked_at(self.index)) };
             self.index += 1;
@@ -66,25 +71,48 @@ impl<'a, T> Iterator for Drain<'a, T> {
     }
 }
 
-impl<T> DoubleEndedIterator for Drain<'_, T> {
+impl<T, A: Allocator> DoubleEndedIterator for Drain<'_, T, A> {
     #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.index >= self.range_end {
             None
         } else {
             self.range_end -= 1;
+            if std::mem::size_of::<T>() == 0 {
+                return Some(unsafe { std::mem::zeroed() });
+            }
             let vec = unsafe { self.vec.as_ref() };
             Some(unsafe { std::ptr::read(vec.unchecked_at(self.range_end)) })
         }
     }
 }
 
-impl<T> ExactSizeIterator for Drain<'_, T> {}
+impl<T, A: Allocator> ExactSizeIterator for Drain<'_, T, A> {}
 
-impl<T> std::iter::FusedIterator for Drain<'_, T> {}
+impl<T, A: Allocator> std::iter::FusedIterator for Drain<'_, T, A> {}
 
-impl<T> Drop for Drain<'_, T> {
+impl<T, A: Allocator> Drop for Drain<'_, T, A> {
     fn drop(&mut self) {
+        // Special case for ZST: no memory management needed, just updates
+        if std::mem::size_of::<T>() == 0 {
+            let vec = unsafe { self.vec.as_mut() };
+            let drain_count = self.range_end - self.range_start;
+
+            // If implicit drop needed for remaining ZSTs
+            if std::mem::needs_drop::<T>() {
+                for _ in self.index..self.range_end {
+                    unsafe {
+                        // ZST drop is likely no-op but if T implements Drop we must call it
+                        std::ptr::drop_in_place(std::ptr::NonNull::<T>::dangling().as_ptr());
+                    }
+                }
+            }
+
+            // Update length
+            unsafe { vec.set_len_internal(self.original_len - drain_count) };
+            return;
+        }
+
         // Drop any remaining elements in the range that weren't consumed
         if std::mem::needs_drop::<T>() {
             let vec = unsafe { self.vec.as_ref() };
@@ -112,17 +140,16 @@ impl<T> Drop for Drain<'_, T> {
             }
         }
 
-        // Update the vector's length
-        vec.set_len_internal(self.original_len - drain_count);
-        vec.update_write_ptr_for_len();
+        // Update the vector's length (set_len_internal also updates the write pointer)
+        unsafe { vec.set_len_internal(self.original_len - drain_count) };
     }
 }
 
 // Safety: Drain has exclusive access to the drained portion
-unsafe impl<T: Sync> Sync for Drain<'_, T> {}
-unsafe impl<T: Send> Send for Drain<'_, T> {}
+unsafe impl<T: Sync, A: Allocator + Sync> Sync for Drain<'_, T, A> {}
+unsafe impl<T: Send, A: Allocator + Send> Send for Drain<'_, T, A> {}
 
-impl<T: std::fmt::Debug> std::fmt::Debug for Drain<'_, T> {
+impl<T: std::fmt::Debug, A: Allocator> std::fmt::Debug for Drain<'_, T, A> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Drain")
             .field("range_start", &self.range_start)
