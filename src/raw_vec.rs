@@ -257,6 +257,12 @@ impl<T, A: Allocator> RawSegmentedVec<T, A> {
         segment_capacity_for_size(index, std::mem::size_of::<T>())
     }
 
+    /// Returns the logical start index of the segment at the given index.
+    #[inline]
+    pub(crate) fn segment_start_index(&self, index: usize) -> usize {
+        compute_capacity_for_size(index, std::mem::size_of::<T>())
+    }
+
     /// Computes the segment index and offset within segment for a given logical index.
     /// Returns `(segment_index, offset_within_segment)`.
     #[inline]

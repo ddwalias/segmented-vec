@@ -124,8 +124,29 @@ impl<'a, T, A: Allocator> SliceIter<'a, T, A> {
     #[must_use]
     #[inline]
     pub fn as_slice(&self) -> SegmentedSlice<'a, T, A> {
-        // self.make_slice()
-        todo!()
+        if self.remaining == 0 {
+            return SegmentedSlice::new(self.buf, 0, 0);
+        }
+
+        let buf = self.buf();
+        // SAFETY: self.remaining > 0 implies ptr is valid within the current segment
+        let segment_base_ptr = unsafe { buf.segment_ptr(self.seg) };
+        let offset = unsafe { self.ptr.offset_from(segment_base_ptr) as usize };
+        let segment_start = buf.segment_start_index(self.seg);
+        let start = segment_start + offset;
+
+        // Construct SegmentedSlice directly to avoid re-calculating end location
+        // end_ptr is exclusive, so it is back_ptr + 1
+        let end_ptr = unsafe { self.back_ptr.add(1) as *mut T };
+
+        SegmentedSlice {
+            buf: self.buf,
+            start,
+            len: self.remaining,
+            end_ptr,
+            end_seg: self.back_seg,
+            _marker: PhantomData,
+        }
     }
 
     #[inline]
@@ -147,7 +168,7 @@ impl<T, A: Allocator> Clone for SliceIter<'_, T, A> {
             back_seg_start: self.back_seg_start,
             back_seg: self.back_seg,
             remaining: self.remaining,
-            _marker: PhantomData,
+            _marker: self._marker,
         }
     }
 }
