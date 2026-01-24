@@ -64,8 +64,8 @@ pub struct SliceIter<'a, T, A: Allocator + 'a = Global> {
 }
 
 impl<T: std::fmt::Debug> std::fmt::Debug for SliceIter<'_, T> {
-    fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!()
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.clone()).finish()
     }
 }
 
