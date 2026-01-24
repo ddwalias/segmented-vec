@@ -69,6 +69,9 @@ impl<T: std::fmt::Debug> std::fmt::Debug for SliceIter<'_, T> {
     }
 }
 
+unsafe impl<T: Sync, A: Allocator + Sync> Sync for SliceIter<'_, T, A> {}
+unsafe impl<T: Sync, A: Allocator + Sync> Send for SliceIter<'_, T, A> {}
+
 impl<'a, T, A: Allocator> SliceIter<'a, T, A> {
     /// Creates a new `SliceIter` from a buffer and index range.
     #[inline]
@@ -1540,9 +1543,6 @@ impl<'a, T, A: Allocator + 'a> Iterator for Windows<'a, T, A> {
 
 impl<T, A: Allocator> ExactSizeIterator for Windows<'_, T, A> {}
 impl<T, A: Allocator> std::iter::FusedIterator for Windows<'_, T, A> {}
-
-unsafe impl<T: Sync, A: Allocator + Sync> Sync for SliceIter<'_, T, A> {}
-unsafe impl<T: Sync, A: Allocator + Sync> Send for SliceIter<'_, T, A> {}
 
 unsafe impl<T: Send, A: Allocator + Send> Send for SliceIterMut<'_, T, A> {}
 unsafe impl<T: Sync, A: Allocator + Sync> Sync for SliceIterMut<'_, T, A> {}
