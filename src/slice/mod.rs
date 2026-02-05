@@ -32,7 +32,9 @@ pub mod iter;
 use allocator_api2::alloc::{Allocator, Global};
 use std::cmp::Ordering;
 use std::marker::PhantomData;
+use std::num::NonZero;
 use std::ops::{Index, IndexMut, RangeBounds};
+use std::ptr::NonNull;
 
 use self::index::SliceIndex;
 use crate::raw_vec::RawSegmentedVec;
@@ -52,13 +54,14 @@ pub use iter::{
 ///
 /// # Mutability
 ///
-/// - `&SegmentedSlice` provides read-only access (like `&[T]`)
-/// - `&mut SegmentedSlice` provides read-write access (like `&mut [T]`)
-pub struct SegmentedSlice<'a, T, A: Allocator + 'a = Global> {
+/// - `SegmentedSlice` provides read-only access
+/// - `SegmentedSliceMut` provides read-write access
+/// Immutable segmented slice.
+///
+/// This is analogous to `&[T]` but for segmented (non-contiguous) storage.
+pub(crate) struct SegmentedSlice<'a, T, A: Allocator + 'a = Global> {
     /// Raw pointer to the underlying SegmentedVec's buffer.
-    /// Using a raw pointer allows mutability to be determined by the borrow checker
-    /// based on whether the `SegmentedSlice` itself is borrowed mutably.
-    pub(crate) buf: *const RawSegmentedVec<T, A>,
+    pub(crate) buf: NonNull<RawSegmentedVec<T, A>>,
     /// Starting logical index (inclusive)
     pub(crate) start: usize,
     /// Length of the slice
@@ -67,79 +70,41 @@ pub struct SegmentedSlice<'a, T, A: Allocator + 'a = Global> {
     pub(crate) end_ptr: *mut T,
     /// Cached segment index for end
     pub(crate) end_seg: usize,
-    /// Marker for lifetime and mutability
-    pub(crate) _marker: PhantomData<&'a mut T>,
+    _marker: PhantomData<&'a T>,
 }
 
-impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
-    /// Returns a reference to the underlying buffer.
-    #[inline]
-    pub(crate) fn buf(&self) -> &'a RawSegmentedVec<T, A> {
-        // SAFETY: The pointer is valid for the lifetime 'a
-        unsafe { &*self.buf }
-    }
-
-    /// Returns a mutable reference to the underlying buffer.
-    #[inline]
-    pub(crate) fn buf_mut(&mut self) -> &'a mut RawSegmentedVec<T, A> {
-        // SAFETY: The pointer is valid for the lifetime 'a, and we have exclusive access
-        unsafe { &mut *(self.buf as *mut RawSegmentedVec<T, A>) }
-    }
+/// Mutable segmented slice.
+///
+/// This is analogous to `&mut [T]` but for segmented (non-contiguous) storage.
+pub(crate) struct SegmentedSliceMut<'a, T, A: Allocator + 'a = Global> {
+    /// Raw pointer to the underlying SegmentedVec's buffer.
+    pub(crate) buf: NonNull<RawSegmentedVec<T, A>>,
+    /// Starting logical index (inclusive)
+    pub(crate) start: usize,
+    /// Length of the slice
+    pub(crate) len: usize,
+    /// Cached pointer to end (exclusive)
+    pub(crate) end_ptr: *mut T,
+    /// Cached segment index for end
+    pub(crate) end_seg: usize,
+    _marker: PhantomData<&'a mut T>,
 }
 
-impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
-    /// Returns the number of elements in the slice.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let vec: SegmentedVec<i32> = (0..10).collect();
-    /// let slice = vec.as_slice();
-    /// assert_eq!(slice.len(), 10);
-    /// ```
-    /// Creates a new `SegmentedSlice` from a `SegmentedVec` buffer.
-    #[inline]
-    pub(crate) fn new(buf: *const RawSegmentedVec<T, A>, start: usize, end: usize) -> Self {
-        debug_assert!(start <= end);
-        let len = end - start;
-
-        if len == 0 {
-            return Self {
-                buf,
-                start,
-                len: 0,
-                end_ptr: std::ptr::null_mut(),
-                end_seg: 0,
-                _marker: PhantomData,
-            };
-        }
-
-        // SAFETY: The pointer is valid for the lifetime 'a
-        let buf_ref = unsafe { &*buf };
-
-        // Compute cached pointers for end (exclusive)
-        let (mut end_seg, end_offset) = RawSegmentedVec::<T, A>::location(end);
-        let end_ptr = if end_seg >= buf_ref.segment_count() {
-            let last_idx = end - 1;
-            let (last_seg, last_offset) = RawSegmentedVec::<T, A>::location(last_idx);
-            end_seg = last_seg;
-            unsafe { buf_ref.segment_ptr(last_seg).add(last_offset + 1) }
-        } else {
-            unsafe { buf_ref.segment_ptr(end_seg).add(end_offset) }
-        };
-
-        Self {
-            buf,
-            start,
-            len,
-            end_ptr,
-            end_seg,
+impl<'a, T, A: Allocator> From<SegmentedSliceMut<'a, T, A>> for SegmentedSlice<'a, T, A> {
+    #[inline(always)]
+    fn from(src: SegmentedSliceMut<'a, T, A>) -> Self {
+        SegmentedSlice {
+            buf: src.buf,
+            start: src.start,
+            len: src.len,
+            end_ptr: src.end_ptr,
+            end_seg: src.end_seg,
             _marker: PhantomData,
         }
     }
+}
 
+impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
     /// Returns the number of elements in the slice.
     #[inline]
     #[must_use]
@@ -152,62 +117,6 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// Returns a sub-slice of the slice.
-    #[inline]
-    #[must_use]
-    pub fn slice<R: RangeBounds<usize>>(&self, range: R) -> Self {
-        let len = self.len();
-        let start = match range.start_bound() {
-            core::ops::Bound::Included(&s) => s,
-            core::ops::Bound::Excluded(&s) => s + 1,
-            core::ops::Bound::Unbounded => 0,
-        };
-        let end = match range.end_bound() {
-            core::ops::Bound::Included(&e) => e + 1,
-            core::ops::Bound::Excluded(&e) => e,
-            core::ops::Bound::Unbounded => len,
-        };
-        assert!(start <= end && end <= len);
-        Self::new(self.buf, self.start + start, self.start + end)
-    }
-
-    /// Returns a mutable sub-slice of the slice.
-    #[inline]
-    #[must_use]
-    pub fn slice_mut<R: RangeBounds<usize>>(&mut self, range: R) -> Self {
-        let len = self.len();
-        let start = match range.start_bound() {
-            core::ops::Bound::Included(&s) => s,
-            core::ops::Bound::Excluded(&s) => s + 1,
-            core::ops::Bound::Unbounded => 0,
-        };
-        let end = match range.end_bound() {
-            core::ops::Bound::Included(&e) => e + 1,
-            core::ops::Bound::Excluded(&e) => e,
-            core::ops::Bound::Unbounded => len,
-        };
-        assert!(start <= end && end <= len);
-        Self::new(self.buf, self.start + start, self.start + end)
-    }
-
-    /// Returns a reference to the element at the given index, or panics if the index is out of bounds.
-    #[inline]
-    pub fn index<I>(&self, index: I) -> I::Output<'_>
-    where
-        I: SliceIndex<Self>,
-    {
-        index.index(self)
-    }
-
-    /// Returns a mutable reference to the element at the given index, or panics if the index is out of bounds.
-    #[inline]
-    pub fn index_mut<I>(&mut self, index: I) -> I::OutputMut<'_>
-    where
-        I: SliceIndex<Self>,
-    {
-        index.index_mut(self)
     }
 
     /// Returns a reference to the first element of the slice, or `None` if it is empty.
@@ -230,80 +139,24 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
             return None;
         }
 
-        Some(unsafe { &*self.buf().ptr_at(self.start) })
+        Some(unsafe { &*self.buf.ptr_at(self.start) })
     }
 
-    /// Returns a mutable reference to the first element of the slice, or `None` if it is empty.
-    #[inline]
-    #[must_use]
-    pub fn first_mut(&mut self) -> Option<&mut T> {
-        if self.is_empty() {
-            return None;
-        }
-
-        let start = self.start;
-        Some(unsafe { &mut *self.buf_mut().ptr_at(start) })
-    }
-
-    /// Returns a reference to the first and all the rest of the elements of the slice,
-    /// or `None` if it is empty.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let vec: SegmentedVec<i32> = (0..5).collect();
-    /// let slice = vec.as_slice();
-    ///
-    /// if let Some((first, rest)) = slice.split_first() {
-    ///     assert_eq!(*first, 0);
-    ///     assert_eq!(rest.len(), 4);
-    /// }
-    /// ```
-    #[inline]
-    #[must_use]
     pub fn split_first(&self) -> Option<(&T, SegmentedSlice<'a, T, A>)> {
-        if self.is_empty() {
-            return None;
+        if let Some(first) = self.first() {
+            let tail = SegmentedSlice {
+                buf: self.buf,
+                start: self.start + 1,
+                len: self.len() - 1,
+                end_ptr: self.end_ptr,
+                end_seg: self.end_seg,
+                _marker: self._marker,
+            };
+
+            return Some((first, tail));
         }
 
-        let first = unsafe { &*self.buf().ptr_at(self.start) };
-
-        let tail = Self {
-            buf: self.buf,
-            start: self.start + 1,
-            len: self.len() - 1,
-            end_ptr: self.end_ptr,
-            end_seg: self.end_seg,
-            _marker: PhantomData,
-        };
-
-        Some((first, tail))
-    }
-
-    /// Returns a mutable reference to the first and all the rest of the elements of the slice,
-    /// or `None` if it is empty.
-    #[inline]
-    #[must_use]
-    pub fn split_first_mut(&mut self) -> Option<(&mut T, SegmentedSlice<'a, T, A>)> {
-        if self.is_empty() {
-            return None;
-        }
-
-        let start = self.start;
-        let first = unsafe { &mut *self.buf_mut().ptr_at(start) };
-
-        let tail = SegmentedSlice {
-            buf: self.buf,
-            start: self.start + 1,
-            len: self.len() - 1,
-            end_ptr: self.end_ptr,
-            end_seg: self.end_seg,
-            _marker: PhantomData,
-        };
-
-        Some((first, tail))
+        None
     }
 
     /// Returns a reference to the last and all the rest of the elements of the slice,
@@ -325,12 +178,308 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
     #[inline]
     #[must_use]
     pub fn split_last(&self) -> Option<(&T, SegmentedSlice<'a, T, A>)> {
+        if let Some(last) = self.last() {
+            let head = SegmentedSlice {
+                buf: self.buf,
+                start: self.start,
+                len: self.len() - 1,
+                end_ptr: self.end_ptr,
+                end_seg: self.end_seg,
+                _marker: self._marker,
+            };
+
+            return Some((last, head));
+        }
+
+        None
+    }
+
+    /// Returns a reference to the last element of the slice, or `None` if it is empty.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use segmented_vec::SegmentedVec;
+    ///
+    /// let vec: SegmentedVec<i32> = (0..10).collect();
+    /// assert_eq!(vec.as_slice().last(), Some(&9));
+    ///
+    /// let empty: SegmentedVec<i32> = SegmentedVec::new();
+    /// assert_eq!(empty.as_slice().last(), None);
+    /// ```
+    #[inline]
+    #[must_use]
+    pub fn last(&self) -> Option<&T> {
+        if self.is_empty() {
+            return None;
+        }
+
+        let segment_base = unsafe { self.buf.segment_ptr(self.end_seg) };
+
+        if self.end_ptr > segment_base {
+            Some(unsafe { &*self.end_ptr.sub(1) })
+        } else {
+            // Cold path: write_ptr is at the start of the active segment,
+            // so the last element is in the previous (fully populated) segment.
+            let prev_segment_index = self.end_seg - 1;
+            let prev_cap = RawSegmentedVec::<T, A>::segment_capacity(prev_segment_index);
+
+            unsafe {
+                let prev_segment_base = self.buf.segment_ptr(prev_segment_index);
+                Some(&*prev_segment_base.add(prev_cap - 1))
+            }
+        }
+    }
+
+    /// Returns an array reference to the first `N` items in the slice.
+    #[inline]
+    pub fn first_chunk<const N: usize>(&self) -> Option<&[T; N]> {
+        if self.len() < N {
+            return None;
+        }
+
+        let (seg_idx, offset) = RawSegmentedVec::<T, A>::location(self.start);
+        let seg_cap = RawSegmentedVec::<T, A>::segment_capacity(seg_idx);
+        let available = seg_cap - offset;
+
+        if available < N {
+            return None;
+        }
+
+        unsafe {
+            let ptr = self.buf.segment_ptr(seg_idx).add(offset);
+            Some(&*(ptr as *const [T; N]))
+        }
+    }
+
+    /// Returns an array reference to the first `N` items in the slice and the remaining slice.
+    #[inline]
+    pub fn split_first_chunk<const N: usize>(&self) -> Option<(&[T; N], SegmentedSlice<'a, T, A>)> {
+        let chunk = self.first_chunk::<N>()?;
+        let (_, tail) = self.split_at(N);
+        Some((chunk, tail))
+    }
+
+    /// Returns an array reference to the last `N` items in the slice and the remaining slice.
+    #[inline]
+    pub fn split_last_chunk<const N: usize>(&self) -> Option<(SegmentedSlice<'a, T, A>, &[T; N])> {
+        let chunk = self.last_chunk::<N>()?;
+        let (init, _) = self.split_at(self.len() - N);
+        Some((init, chunk))
+    }
+
+    /// Returns an array reference to the last `N` items in the slice.
+    #[inline]
+    pub fn last_chunk<const N: usize>(&self) -> Option<&[T; N]> {
+        if self.len() < N {
+            return None;
+        }
+
+        if N == 0 {
+            return Some(unsafe { &*(std::ptr::NonNull::<[T; N]>::dangling().as_ptr()) });
+        }
+
+        let segment_base = unsafe { self.buf.segment_ptr(self.end_seg) };
+        let current_len = unsafe { self.end_ptr.offset_from(segment_base) as usize };
+
+        if current_len >= N {
+            return Some(unsafe { &*(self.end_ptr.sub(N) as *const [T; N]) });
+        }
+
+        if current_len == 0 && self.end_seg > 0 {
+            let prev_seg = self.end_seg - 1;
+            let prev_cap = RawSegmentedVec::<T, A>::segment_capacity(prev_seg);
+
+            if prev_cap >= N {
+                let prev_base = unsafe { self.buf.segment_ptr(prev_seg) };
+                return Some(unsafe { &*(prev_base.add(prev_cap - N) as *const [T; N]) });
+            }
+        }
+
+        None
+    }
+    /// Returns a reference to an element or subslice depending on the type of index.
+    #[inline]
+    pub fn get<I>(&self, index: I) -> Option<I::Output<'_>>
+    where
+        I: SliceIndex<Self>,
+    {
+        index.get(self)
+    }
+
+    /// Returns a reference to an element or subslice without doing bounds checking.
+    ///
+    /// # Safety
+    ///
+    /// Calling this method with an out-of-bounds index is *[undefined behavior]*.
+    #[inline]
+    pub unsafe fn get_unchecked<I>(&self, index: I) -> I::Output<'_>
+    where
+        I: SliceIndex<Self>,
+    {
+        index.get_unchecked(self)
+    }
+
+    /// Returns an iterator over the slice.
+    #[inline]
+    pub fn iter(&self) -> SliceIter<'a, T, A> {
+        SliceIter::new(self)
+    }
+
+    /// Returns an iterator over overlapping windows of length `size`.
+    #[inline]
+    #[track_caller]
+    pub fn windows(&self, size: usize) -> Windows<'a, T, A> {
+        Windows {
+            slice: *self,
+            size: NonZero::new(size).expect("window size must be non-zero"),
+        }
+    }
+
+    /// Returns an iterator over `chunk_size` elements of the slice at a time.
+    #[inline]
+    #[track_caller]
+    pub fn chunks(&self, chunk_size: usize) -> Chunks<'a, T, A> {
+        assert!(chunk_size != 0, "chunk size must be non-zero");
+        Chunks {
+            buf: self.buf,
+            start: self.start,
+            end: self.start + self.len,
+            chunk_size,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Returns an iterator over `chunk_size` elements of the slice at a time.
+    #[inline]
+    #[track_caller]
+    pub fn chunks_exact(&self, chunk_size: usize) -> ChunksExact<'a, T, A> {
+        assert!(chunk_size != 0, "chunk size must be non-zero");
+        let end = self.start + self.len;
+        let rem = self.len % chunk_size;
+        let chunks_end = end - rem;
+        ChunksExact {
+            buf: self.buf,
+            start: self.start,
+            end: chunks_end,
+            remainder_start: chunks_end,
+            remainder_end: end,
+            chunk_size,
+            _marker: PhantomData,
+        }
+    }
+
+    // /// Returns a sub-slice of the slice.
+    // #[inline]
+    // #[must_use]
+    // pub fn slice<R: RangeBounds<usize>>(&self, range: R) -> SegmentedSlice<'a, T, A> {
+    //     let len = self.len();
+    //     let start = match range.start_bound() {
+    //         core::ops::Bound::Included(&s) => s,
+    //         core::ops::Bound::Excluded(&s) => s + 1,
+    //         core::ops::Bound::Unbounded => 0,
+    //     };
+    //     let end = match range.end_bound() {
+    //         core::ops::Bound::Included(&e) => e + 1,
+    //         core::ops::Bound::Excluded(&e) => e,
+    //         core::ops::Bound::Unbounded => len,
+    //     };
+    //     assert!(start <= end && end <= len);
+    //     SegmentedSlice::new(self.buf, self.start + start, self.start + end)
+    // }
+}
+
+impl<'a, T, A: Allocator> SegmentedSliceMut<'a, T, A> {
+    /// Returns the number of elements in the slice.
+    #[inline]
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns `true` if the slice has a length of 0.
+    #[inline]
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns a reference to the first element of the slice, or `None` if it is empty.
+    #[inline]
+    #[must_use]
+    pub fn first(&self) -> Option<&T> {
+        if self.is_empty() {
+            return None;
+        }
+
+        Some(unsafe { &*self.buf.ptr_at(self.start) })
+    }
+
+    /// Returns a mutable reference to the first element of the slice, or `None` if it is empty.
+    #[inline]
+    #[must_use]
+    pub fn first_mut(&mut self) -> Option<&mut T> {
+        if self.is_empty() {
+            return None;
+        }
+
+        let start = self.start;
+        Some(unsafe { &mut *self.buf.ptr_at(start) })
+    }
+
+    pub fn split_first(&'a self) -> Option<(&T, SegmentedSlice<'a, T, A>)> {
+        if let Some(first) = self.first() {
+            let tail = SegmentedSlice {
+                buf: self.buf,
+                start: self.start + 1,
+                len: self.len() - 1,
+                end_ptr: self.end_ptr,
+                end_seg: self.end_seg,
+                _marker: PhantomData,
+            };
+
+            return Some((first, tail));
+        }
+
+        None
+    }
+
+    /// Returns a mutable reference to the first and all the rest of the elements of the slice,
+    /// or `None` if it is empty.
+    #[inline]
+    #[must_use]
+    pub fn split_first_mut(&'a mut self) -> Option<(&mut T, SegmentedSliceMut<'a, T, A>)> {
+        let first_ptr = if let Some(first) = self.first_mut() {
+            first as *mut T
+        } else {
+            return None;
+        };
+
+        unsafe {
+            let tail = SegmentedSliceMut {
+                buf: std::ptr::read(&self.buf),
+                start: self.start + 1,
+                len: self.len() - 1,
+                end_ptr: self.end_ptr,
+                end_seg: self.end_seg,
+                _marker: self._marker,
+            };
+
+            Some((&mut *first_ptr, tail))
+        }
+    }
+
+    /// Returns a reference to the last and all the rest of the elements of the slice,
+    /// or `None` if it is empty.
+    #[inline]
+    #[must_use]
+    pub fn split_last(&'a self) -> Option<(&T, SegmentedSlice<'a, T, A>)> {
         if self.is_empty() {
             return None;
         }
 
         // Use end_ptr to get last element efficiently
-        let segment_base = unsafe { self.buf().segment_ptr(self.end_seg) };
+        let segment_base = unsafe { self.buf.segment_ptr(self.end_seg) };
 
         // Determine the pointer to the last element.
         // This acts as the pointer to the returned element AND the exclusive end_ptr for the rest slice.
@@ -342,7 +491,7 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
             let prev_seg = self.end_seg - 1;
             let prev_cap = RawSegmentedVec::<T, A>::segment_capacity(prev_seg);
             (
-                unsafe { self.buf().segment_ptr(prev_seg).add(prev_cap - 1) },
+                unsafe { self.buf.segment_ptr(prev_seg).add(prev_cap - 1) },
                 prev_seg,
             )
         };
@@ -365,13 +514,13 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
     /// or `None` if it is empty.
     #[inline]
     #[must_use]
-    pub fn split_last_mut(&mut self) -> Option<(&mut T, SegmentedSlice<'a, T, A>)> {
+    pub fn split_last_mut(&'a mut self) -> Option<(&mut T, SegmentedSliceMut<'a, T, A>)> {
         if self.is_empty() {
             return None;
         }
 
         // Use end_ptr to get last element efficiently
-        let segment_base = unsafe { self.buf().segment_ptr(self.end_seg) };
+        let segment_base = unsafe { self.buf.segment_ptr(self.end_seg) };
 
         // Determine the pointer to the last element.
         // This acts as the pointer to the returned element AND the exclusive end_ptr for the rest slice.
@@ -383,20 +532,20 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
             let prev_seg = self.end_seg - 1;
             let prev_cap = RawSegmentedVec::<T, A>::segment_capacity(prev_seg);
             (
-                unsafe { self.buf().segment_ptr(prev_seg).add(prev_cap - 1) },
+                unsafe { self.buf.segment_ptr(prev_seg).add(prev_cap - 1) },
                 prev_seg,
             )
         };
 
         let last = unsafe { &mut *last_ptr };
 
-        let rest = SegmentedSlice {
+        let rest = SegmentedSliceMut {
             buf: self.buf,
             start: self.start,
-            len: self.len() - 1,
+            len: self.len - 1,
             end_ptr: last_ptr,
             end_seg: last_seg,
-            _marker: PhantomData,
+            _marker: self._marker,
         };
 
         Some((last, rest))
@@ -422,7 +571,7 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
             return None;
         }
 
-        let segment_base = unsafe { self.buf().segment_ptr(self.end_seg) };
+        let segment_base = unsafe { self.buf.segment_ptr(self.end_seg) };
 
         if self.end_ptr > segment_base {
             Some(unsafe { &*self.end_ptr.sub(1) })
@@ -433,7 +582,7 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
             let prev_cap = RawSegmentedVec::<T, A>::segment_capacity(prev_segment_index);
 
             unsafe {
-                let prev_segment_base = self.buf().segment_ptr(prev_segment_index);
+                let prev_segment_base = self.buf.segment_ptr(prev_segment_index);
                 Some(&*prev_segment_base.add(prev_cap - 1))
             }
         }
@@ -447,7 +596,7 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
             return None;
         }
 
-        let segment_base = unsafe { self.buf().segment_ptr(self.end_seg) };
+        let segment_base = unsafe { self.buf.segment_ptr(self.end_seg) };
 
         if self.end_ptr > segment_base {
             Some(unsafe { &mut *self.end_ptr.sub(1) })
@@ -458,35 +607,19 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
             let prev_cap = RawSegmentedVec::<T, A>::segment_capacity(prev_segment_index);
 
             unsafe {
-                let prev_segment_base = self.buf_mut().segment_ptr(prev_segment_index);
+                let prev_segment_base = self.buf.segment_ptr(prev_segment_index);
                 Some(&mut *prev_segment_base.add(prev_cap - 1))
             }
         }
     }
 
     /// Returns an array reference to the first `N` items in the slice.
-    ///
-    /// If the slice is not at least `N` in length, this will return `None`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// let u = [10, 40, 30];
-    /// assert_eq!(Some(&[10, 40]), u.first_chunk::<2>());
-    ///
-    /// let v: &[i32] = &[10];
-    /// assert_eq!(None, v.first_chunk::<2>());
-    ///
-    /// let w: &[i32] = &[];
-    /// assert_eq!(Some(&[]), w.first_chunk::<0>());
-    /// ```
     #[inline]
     pub fn first_chunk<const N: usize>(&self) -> Option<&[T; N]> {
         if self.len() < N {
             return None;
         }
 
-        // Check if the chunk is contiguous in the first segment
         let (seg_idx, offset) = RawSegmentedVec::<T, A>::location(self.start);
         let seg_cap = RawSegmentedVec::<T, A>::segment_capacity(seg_idx);
         let available = seg_cap - offset;
@@ -496,84 +629,83 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
         }
 
         unsafe {
-            // Optimized: We already know the segment and offset, avoid re-computing it via ptr_at
-            let ptr = self.buf().segment_ptr(seg_idx).add(offset);
+            let ptr = self.buf.segment_ptr(seg_idx).add(offset);
             Some(&*(ptr as *const [T; N]))
         }
     }
 
+    /// Returns an array reference to the first `N` items in the slice.
+    #[inline]
+    pub fn first_chunk_mut<const N: usize>(&mut self) -> Option<&mut [T; N]> {
+        if self.len() < N {
+            return None;
+        }
+
+        let (seg_idx, offset) = RawSegmentedVec::<T, A>::location(self.start);
+        let seg_cap = RawSegmentedVec::<T, A>::segment_capacity(seg_idx);
+        let available = seg_cap - offset;
+
+        if available < N {
+            return None;
+        }
+
+        unsafe {
+            let ptr = self.buf.segment_ptr(seg_idx).add(offset);
+            Some(&mut *(ptr as *mut [T; N]))
+        }
+    }
+
     /// Returns an array reference to the first `N` items in the slice and the remaining slice.
-    ///
-    /// If the slice is not at least `N` in length, this will return `None`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let vec: SegmentedVec<i32> = (0..3).collect();
-    /// let slice = vec.as_slice();
-    ///
-    /// if let Some((first, elements)) = slice.split_first_chunk::<2>() {
-    ///     assert_eq!(first, &[0, 1]);
-    ///     assert_eq!(elements.len(), 1);
-    ///     assert_eq!(elements[0], 2);
-    /// }
-    ///
-    /// assert!(slice.split_first_chunk::<4>().is_none());
-    /// ```
     #[inline]
     pub fn split_first_chunk<const N: usize>(&self) -> Option<(&[T; N], SegmentedSlice<'a, T, A>)> {
         let chunk = self.first_chunk::<N>()?;
-        // We know the split is valid because first_chunk succeeded.
         let (_, tail) = self.split_at(N);
         Some((chunk, tail))
     }
 
+    /// Returns an array reference to the first `N` items in the slice and the remaining slice.
+    #[inline]
+    pub fn split_first_chunk_mut<const N: usize>(
+        &'a mut self,
+    ) -> Option<(&mut [T; N], SegmentedSliceMut<'a, T, A>)> {
+        let chunk_ptr = {
+            let chunk_ref = self.first_chunk_mut::<N>()?;
+            chunk_ref as *mut [T; N]
+        };
+
+        let tail = SegmentedSliceMut {
+            buf: unsafe { std::ptr::read(&self.buf) },
+            start: self.start + N,
+            len: self.len() - N,
+            end_ptr: self.end_ptr,
+            end_seg: self.end_seg,
+            _marker: self._marker,
+        };
+
+        Some((unsafe { &mut *chunk_ptr }, tail))
+    }
+
     /// Returns an array reference to the last `N` items in the slice and the remaining slice.
-    ///
-    /// If the slice is not at least `N` in length, this will return `None`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let vec: SegmentedVec<i32> = (0..3).collect();
-    /// let slice = vec.as_slice();
-    ///
-    /// if let Some((elements, last)) = slice.split_last_chunk::<2>() {
-    ///     assert_eq!(elements.len(), 1);
-    ///     assert_eq!(elements[0], 0);
-    ///     assert_eq!(last, &[1, 2]);
-    /// }
-    ///
-    /// assert!(slice.split_last_chunk::<4>().is_none());
-    /// ```
     #[inline]
     pub fn split_last_chunk<const N: usize>(&self) -> Option<(SegmentedSlice<'a, T, A>, &[T; N])> {
         let chunk = self.last_chunk::<N>()?;
-        // We know the split is valid because last_chunk succeeded.
         let (init, _) = self.split_at(self.len() - N);
         Some((init, chunk))
     }
 
+    /// Returns an array reference to the last `N` items in the slice and the remaining slice.
+    #[inline]
+    pub fn split_last_chunk_mut<const N: usize>(
+        &self,
+    ) -> Option<(SegmentedSliceMut<'a, T, A>, &mut [T; N])> {
+        let chunk = self.last_chunk_mut::<N>()?;
+        let Some((init, _)) = self.split_at_mut_checked(self.len() - N) else {
+            return None;
+        };
+        Some((init, chunk))
+    }
+
     /// Returns an array reference to the last `N` items in the slice.
-    ///
-    /// If the slice is not at least `N` in length, this will return `None`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// let u = [10, 40, 30];
-    /// assert_eq!(Some(&[40, 30]), u.last_chunk::<2>());
-    ///
-    /// let v: &[i32] = &[10];
-    /// assert_eq!(None, v.last_chunk::<2>());
-    ///
-    /// let w: &[i32] = &[];
-    /// assert_eq!(Some(&[]), w.last_chunk::<0>());
-    /// ```
     #[inline]
     pub fn last_chunk<const N: usize>(&self) -> Option<&[T; N]> {
         if self.len() < N {
@@ -587,22 +719,16 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
         let segment_base = unsafe { self.buf().segment_ptr(self.end_seg) };
         let current_len = unsafe { self.end_ptr.offset_from(segment_base) as usize };
 
-        // Case 1: The current segment has enough elements.
         if current_len >= N {
             return Some(unsafe { &*(self.end_ptr.sub(N) as *const [T; N]) });
         }
 
-        // Case 2: The current segment is completely empty (just started),
-        // so we check if the *previous* segment has enough elements.
-        // Note: If current_len > 0 but < N, we return None (split chunk).
         if current_len == 0 && self.end_seg > 0 {
             let prev_seg = self.end_seg - 1;
             let prev_cap = RawSegmentedVec::<T, A>::segment_capacity(prev_seg);
 
             if prev_cap >= N {
                 let prev_base = unsafe { self.buf().segment_ptr(prev_seg) };
-                // The chunk is at the very end of the previous segment.
-                // Address = base + capacity - N
                 return Some(unsafe { &*(prev_base.add(prev_cap - N) as *const [T; N]) });
             }
         }
@@ -610,10 +736,38 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
         None
     }
 
+    /// Returns an array reference to the last `N` items in the slice.
+    #[inline]
+    pub fn last_chunk_mut<const N: usize>(&self) -> Option<&mut [T; N]> {
+        if self.len() < N {
+            return None;
+        }
+
+        if N == 0 {
+            return Some(unsafe { &mut *(std::ptr::NonNull::<[T; N]>::dangling().as_ptr()) });
+        }
+
+        let segment_base = unsafe { self.buf().segment_ptr(self.end_seg) };
+        let current_len = unsafe { self.end_ptr.offset_from(segment_base) as usize };
+
+        if current_len >= N {
+            return Some(unsafe { &mut *(self.end_ptr.sub(N) as *const [T; N]) });
+        }
+
+        if current_len == 0 && self.end_seg > 0 {
+            let prev_seg = self.end_seg - 1;
+            let prev_cap = RawSegmentedVec::<T, A>::segment_capacity(prev_seg);
+
+            if prev_cap >= N {
+                let prev_base = unsafe { self.buf().segment_ptr(prev_seg) };
+                return Some(unsafe { &mut *(prev_base.add(prev_cap - N) as *const [T; N]) });
+            }
+        }
+
+        None
+    }
+
     /// Returns a reference to an element or subslice depending on the type of index.
-    ///
-    /// - If given a position, returns a reference to the element at that position or `None` if out of bounds.
-    /// - If given a range, returns `None` (range slicing by reference is not supported for SegmentedSlice).
     #[inline]
     pub fn get<I>(&self, index: I) -> Option<I::Output<'_>>
     where
@@ -622,10 +776,6 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
         index.get(self)
     }
 
-    /// Returns a mutable reference to an element or subslice depending on the type of index.
-    ///
-    /// - If given a position, returns a mutable reference to the element at that position or `None` if out of bounds.
-    #[inline]
     pub fn get_mut<I>(&mut self, index: I) -> Option<I::OutputMut<'_>>
     where
         I: SliceIndex<Self>,
@@ -634,52 +784,24 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
     }
 
     /// Returns a reference to an element or subslice without doing bounds checking.
-    ///
-    /// # Safety
-    ///
-    /// Calling this method with an out-of-bounds index is *[undefined behavior]*.
-    ///
-    /// [undefined behavior]: https://doc.rust-lang.org/reference/behavior-considered-undefined.html
     #[inline]
     pub unsafe fn get_unchecked<I>(&self, index: I) -> I::Output<'_>
     where
         I: SliceIndex<Self>,
     {
-        index.get_unchecked(self)
+        unsafe { index.get_unchecked(self) }
     }
 
-    /// Returns a mutable reference to an element or subslice without doing bounds checking.
-    ///
-    /// # Safety
-    ///
-    /// Calling this method with an out-of-bounds index is *[undefined behavior]*.
-    ///
-    /// [undefined behavior]: https://doc.rust-lang.org/reference/behavior-considered-undefined.html
+    /// Returns a reference to an element or subslice without doing bounds checking.
     #[inline]
     pub unsafe fn get_unchecked_mut<I>(&mut self, index: I) -> I::OutputMut<'_>
     where
         I: SliceIndex<Self>,
     {
-        index.get_unchecked_mut(self)
+        unsafe { index.get_unchecked_mut(self) }
     }
 
     /// Swaps two elements in the slice.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `a` or `b` are out of bounds.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let mut vec: SegmentedVec<i32> = (0..5).collect();
-    /// vec.as_mut_slice().swap(0, 4);
-    ///
-    /// assert_eq!(vec[0], 4);
-    /// assert_eq!(vec[4], 0);
-    /// ```
     #[inline]
     #[track_caller]
     pub fn swap(&mut self, a: usize, b: usize) {
@@ -696,12 +818,6 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
     }
 
     /// Swaps two elements in the slice without doing bounds checking.
-    ///
-    /// # Safety
-    ///
-    /// Calling this method with an out-of-bounds index is *[undefined behavior]*.
-    ///
-    /// [undefined behavior]: https://doc.rust-lang.org/reference/behavior-considered-undefined.html
     #[inline]
     pub unsafe fn swap_unchecked(&mut self, a: usize, b: usize) {
         let start = self.start;
@@ -711,18 +827,6 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
     }
 
     /// Reverses the order of elements in the slice, in place.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let mut vec: SegmentedVec<i32> = (0..5).collect();
-    /// vec.as_mut_slice().reverse();
-    ///
-    /// assert_eq!(vec[0], 4);
-    /// assert_eq!(vec[4], 0);
-    /// ```
     #[inline]
     pub fn reverse(&mut self) {
         if core::mem::size_of::<T>() == 0 {
@@ -844,69 +948,477 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
     }
 
     /// Returns an iterator over the slice.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let vec: SegmentedVec<i32> = (0..5).collect();
-    /// let slice = vec.as_slice();
-    ///
-    /// for (i, &val) in slice.iter().enumerate() {
-    ///     assert_eq!(val, i as i32);
-    /// }
-    /// ```
     #[inline]
     pub fn iter(&self) -> SliceIter<'a, T, A> {
-        SliceIter::new(self.buf, self.start, self.start + self.len)
+        SliceIter::new(self.into())
+    }
+
+    /// Returns a mutable iterator over the slice.
+    #[inline]
+    pub fn iter_mut(&mut self) -> SliceIterMut<'_, T, A> {
+        SliceIterMut::new(self)
+    }
+
+    /// Returns an iterator over overlapping windows of length `size`.
+    #[inline]
+    #[track_caller]
+    pub fn windows(&self, size: usize) -> Windows<'a, T, A> {
+        assert!(size != 0, "window size must be non-zero");
+        Windows {
+            buf: self.buf,
+            start: self.start,
+            end: self.start + self.len,
+            size,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Returns an iterator over `chunk_size` elements of the slice at a time.
+    #[inline]
+    #[track_caller]
+    pub fn chunks(&self, chunk_size: usize) -> Chunks<'a, T, A> {
+        assert!(chunk_size != 0, "chunk size must be non-zero");
+        Chunks {
+            buf: self.buf,
+            start: self.start,
+            end: self.start + self.len,
+            chunk_size,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Returns an iterator over `chunk_size` elements of the slice at a time.
+    #[inline]
+    #[track_caller]
+    pub fn chunks_mut(&mut self, chunk_size: usize) -> iter::ChunksMut<'a, T, A> {
+        iter::ChunksMut::new(self, chunk_size)
+    }
+
+    /// Returns an iterator over `chunk_size` elements of the slice at a time.
+    #[inline]
+    #[track_caller]
+    pub fn chunks_exact(&self, chunk_size: usize) -> ChunksExact<'a, T, A> {
+        assert!(chunk_size != 0, "chunk size must be non-zero");
+        let end = self.start + self.len;
+        let rem = self.len % chunk_size;
+        let chunks_end = end - rem;
+        ChunksExact {
+            buf: self.buf,
+            start: self.start,
+            end: chunks_end,
+            remainder_start: chunks_end,
+            remainder_end: end,
+            chunk_size,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Returns an iterator over `chunk_size` elements of the slice at a time.
+    #[inline]
+    #[track_caller]
+    pub fn chunks_exact_mut(&mut self, chunk_size: usize) -> iter::ChunksExactMut<'a, T, A> {
+        iter::ChunksExactMut::new(self, chunk_size)
+    }
+
+    pub const fn array_windows<const N: usize>(&self) -> ArrayWindows<'_, T, N> {
+        todo!()
+    }
+
+    /// Returns an iterator over `chunk_size` elements at a time, starting at the end.
+    #[inline]
+    #[track_caller]
+    pub fn rchunks(&self, chunk_size: usize) -> RChunks<'a, T, A> {
+        assert!(chunk_size != 0, "chunk size must be non-zero");
+        RChunks {
+            buf: self.buf,
+            start: self.start,
+            end: self.start + self.len,
+            chunk_size,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Returns an iterator over `chunk_size` elements at a time, starting at the end.
+    #[inline]
+    #[track_caller]
+    pub fn rchunks_mut(&mut self, chunk_size: usize) -> iter::RChunksMut<'a, T, A> {
+        iter::RChunksMut::new(self, chunk_size)
+    }
+
+    /// Returns an iterator over `chunk_size` elements of the slice at a time, starting at the end.
+    #[inline]
+    #[track_caller]
+    pub fn rchunks_exact(&self, chunk_size: usize) -> iter::RChunksExact<'a, T, A> {
+        iter::RChunksExact::new(self, chunk_size)
+    }
+
+    /// Returns an iterator over `chunk_size` elements at a time, starting at the end.
+    #[inline]
+    #[track_caller]
+    pub fn rchunks_exact_mut(&mut self, chunk_size: usize) -> iter::RChunksExactMut<'a, T, A> {
+        iter::RChunksExactMut::new(self, chunk_size)
+    }
+
+    #[inline]
+    pub const fn chunk_by<F>(&self, pred: F) -> ChunkBy<'_, T, F>
+    where
+        F: FnMut(&T, &T) -> bool,
+    {
+        todo!()
+    }
+
+    #[inline]
+    pub const fn chunk_by_mut<F>(&mut self, pred: F) -> ChunkByMut<'_, T, F>
+    where
+        F: FnMut(&T, &T) -> bool,
+    {
+        todo!()
     }
 
     /// Divides one slice into two at an index.
-    ///
-    /// The first will contain all indices from `[0, mid)` and the second will
-    /// contain all indices from `[mid, len)`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `mid > len`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let vec: SegmentedVec<i32> = (0..10).collect();
-    /// let slice = vec.as_slice();
-    ///
-    /// let (left, right) = slice.split_at(5);
-    /// assert_eq!(left.len(), 5);
-    /// assert_eq!(right.len(), 5);
-    /// ```
     #[inline]
     #[track_caller]
     pub fn split_at(&self, mid: usize) -> (SegmentedSlice<'a, T, A>, SegmentedSlice<'a, T, A>) {
         assert!(mid <= self.len(), "mid > len");
 
-        let left = Self::new(self.buf, self.start, self.start + mid);
-        let right = Self::new(self.buf, self.start + mid, self.start + self.len);
+        let left = SegmentedSlice::new(self.buf, self.start, self.start + mid);
+        let right = SegmentedSlice::new(self.buf, self.start + mid, self.start + self.len);
+
+        (left, right)
+    }
+
+    /// Divides one slice into two at an index.
+    #[inline]
+    #[track_caller]
+    pub fn split_at_mut(
+        &mut self,
+        mid: usize,
+    ) -> (SegmentedSliceMut<'a, T, A>, SegmentedSliceMut<'a, T, A>) {
+        assert!(mid <= self.len(), "mid > len");
+
+        let left = SegmentedSliceMut::new(self.buf, self.start, self.start + mid);
+        let right = SegmentedSliceMut::new(self.buf, self.start + mid, self.start + self.len);
+
+        (left, right)
+    }
+
+    #[inline]
+    #[must_use]
+    #[track_caller]
+    pub const unsafe fn split_at_unchecked(
+        &self,
+        mid: usize,
+    ) -> (SegmentedSlice<'a, T, A>, SegmentedSlice<'a, T, A>) {
+        todo!()
+    }
+
+    /// Divides one slice into two at an index.
+    #[inline]
+    #[track_caller]
+    pub fn split_at_mut_unchecked(
+        &mut self,
+        mid: usize,
+    ) -> (SegmentedSliceMut<'a, T, A>, SegmentedSliceMut<'a, T, A>) {
+        todo!()
+    }
+
+    /// Divides one slice into two at an index, returning `None` if the slice is too short.
+    #[inline]
+    pub fn split_at_checked(
+        &self,
+        mid: usize,
+    ) -> Option<(SegmentedSlice<'a, T, A>, SegmentedSlice<'a, T, A>)> {
+        if mid <= self.len() {
+            Some(self.split_at(mid))
+        } else {
+            None
+        }
+    }
+
+    /// Divides one slice into two at an index, returning `None` if the slice is too short.
+    #[inline]
+    pub fn split_at_mut_checked(
+        &mut self,
+        mid: usize,
+    ) -> Option<(SegmentedSliceMut<'a, T, A>, SegmentedSliceMut<'a, T, A>)> {
+        if mid <= self.len() {
+            Some(self.split_at_mut(mid))
+        } else {
+            None
+        }
+    }
+
+    /// Returns an iterator over subslices separated by elements that match `pred`.
+    #[inline]
+    pub fn split<P>(&self, pred: P) -> iter::Split<'a, T, A, P>
+    where
+        P: FnMut(&T) -> bool,
+    {
+        iter::Split::new(
+            SegmentedSlice::new(self.buf, self.start, self.start + self.len),
+            pred,
+        )
+    }
+
+    /// Returns an iterator over subslices separated by elements that match `pred`.
+    #[inline]
+    pub fn split_mut<P>(&mut self, pred: P) -> iter::SplitMut<'a, T, A, P>
+    where
+        P: FnMut(&T) -> bool,
+    {
+        iter::SplitMut::new(
+            SegmentedSliceMut::new(self.buf, self.start, self.start + self.len),
+            pred,
+        )
+    }
+
+    /// Returns an iterator over subslices separated by elements that match `pred`.
+    #[inline]
+    pub fn split_inclusive<P>(&self, pred: P) -> iter::SplitInclusive<'a, T, A, P>
+    where
+        P: FnMut(&T) -> bool,
+    {
+        iter::SplitInclusive::new(
+            SegmentedSlice::new(self.buf, self.start, self.start + self.len),
+            pred,
+        )
+    }
+
+    /// Returns an iterator over subslices separated by elements that match `pred`.
+    #[inline]
+    pub fn split_inclusive_mut<P>(&mut self, pred: P) -> iter::SplitInclusiveMut<'a, T, A, P>
+    where
+        P: FnMut(&T) -> bool,
+    {
+        iter::SplitInclusiveMut::new(
+            SegmentedSliceMut::new(self.buf, self.start, self.start + self.len),
+            pred,
+        )
+    }
+
+    /// Returns an iterator over subslices separated by elements that match `pred`, starting from the end.
+    #[inline]
+    pub fn rsplit<P>(&self, pred: P) -> iter::RSplit<'a, T, A, P>
+    where
+        P: FnMut(&T) -> bool,
+    {
+        iter::RSplit::new(
+            SegmentedSlice::new(self.buf, self.start, self.start + self.len),
+            pred,
+        )
+    }
+
+    /// Returns an iterator over subslices separated by elements that match `pred`, starting from the end.
+    #[inline]
+    pub fn rsplit_mut<P>(&mut self, pred: P) -> iter::RSplitMut<'a, T, A, P>
+    where
+        P: FnMut(&T) -> bool,
+    {
+        iter::RSplitMut::new(
+            SegmentedSliceMut::new(self.buf, self.start, self.start + self.len),
+            pred,
+        )
+    }
+
+    /// Returns an iterator over subslices separated by elements that match `pred`, limited to at most `n` splits.
+    #[inline]
+    pub fn splitn<P>(&self, n: usize, pred: P) -> iter::SplitN<'a, T, A, P>
+    where
+        P: FnMut(&T) -> bool,
+    {
+        iter::SplitN::new(
+            SegmentedSlice::new(self.buf, self.start, self.start + self.len),
+            n,
+            pred,
+        )
+    }
+
+    /// Returns an iterator over subslices separated by elements that match `pred`, limited to at most `n` splits.
+    #[inline]
+    pub fn splitn_mut<P>(&mut self, n: usize, pred: P) -> iter::SplitN<'a, T, A, P>
+    where
+        P: FnMut(&T) -> bool,
+    {
+        iter::SplitN::new(
+            SegmentedSliceMut::new(self.buf, self.start, self.start + self.len),
+            n,
+            pred,
+        )
+    }
+
+    /// Returns an iterator over subslices separated by elements that match `pred`, limited to at most `n` splits, starting from the end.
+    #[inline]
+    pub fn rsplitn<P>(&self, n: usize, pred: P) -> iter::RSplitN<'a, T, A, P>
+    where
+        P: FnMut(&T) -> bool,
+    {
+        iter::RSplitN::new(
+            SegmentedSlice::new(self.buf, self.start, self.start + self.len),
+            n,
+            pred,
+        )
+    }
+
+    /// Returns an iterator over subslices separated by elements that match `pred`, limited to at most `n` splits, starting from the end.
+    #[inline]
+    pub fn rsplitn_mut<P>(&mut self, n: usize, pred: P) -> iter::RSplitN<'a, T, A, P>
+    where
+        P: FnMut(&T) -> bool,
+    {
+        iter::RSplitN::new(
+            SegmentedSliceMut::new(self.buf, self.start, self.start + self.len),
+            n,
+            pred,
+        )
+    }
+
+    #[inline]
+    pub fn split_once<F>(
+        &self,
+        pred: F,
+    ) -> Option<(SegmentedSlice<'a, T, A>, SegmentedSlice<'a, T, A>)>
+    where
+        F: FnMut(&T) -> bool,
+    {
+        let index = self.iter().position(pred)?;
+        Some((&self[..index], &self[index + 1..]))
+    }
+
+    #[inline]
+    pub fn rsplit_once<F>(
+        &self,
+        pred: F,
+    ) -> Option<(SegmentedSlice<'a, T, A>, SegmentedSlice<'a, T, A>)>
+    where
+        F: FnMut(&T) -> bool,
+    {
+        let index = self.iter().rposition(pred)?;
+        Some((&self[..index], &self[index + 1..]))
+    }
+
+    /// Returns `true` if the slice contains an element with the given value.
+    #[inline]
+    pub fn contains(&self, x: &T) -> bool
+    where
+        T: PartialEq,
+    {
+        self.iter().any(|elem| elem == x)
+    }
+
+    /// Returns `true` if `needle` is a prefix of the slice.
+    #[inline]
+    pub fn starts_with(&self, needle: &[T]) -> bool
+    where
+        T: PartialEq,
+    {
+        let n = needle.len();
+        self.len() >= n && self.iter().take(n).eq(needle.iter())
+    }
+
+    /// Returns `true` if `needle` is a suffix of the slice.
+    #[inline]
+    pub fn ends_with(&self, needle: &[T]) -> bool
+    where
+        T: PartialEq,
+    {
+        let n = needle.len();
+        self.len() >= n && self.iter().skip(self.len() - n).eq(needle.iter())
+    }
+
+    #[must_use = "returns the subslice without modifying the original"]
+    #[stable(feature = "slice_strip", since = "1.51.0")]
+    pub fn strip_prefix<P: SlicePattern<Item = T> + ?Sized>(
+        &self,
+        prefix: &P,
+    ) -> Option<SegmentedSlice<'a, T, A>>
+    where
+        T: PartialEq,
+    {
+        // This function will need rewriting if and when SlicePattern becomes more sophisticated.
+        let prefix = prefix.as_slice();
+        let n = prefix.len();
+        if n <= self.len() {
+            let (head, tail) = self.split_at(n);
+            if head == prefix {
+                return Some(tail);
+            }
+        }
+        None
+    }
+
+    /// Returns a sub-slice of the slice.
+    #[inline]
+    #[must_use]
+    pub fn slice<R: RangeBounds<usize>>(&self, range: R) -> SegmentedSlice<'a, T, A> {
+        let len = self.len();
+        let start = match range.start_bound() {
+            core::ops::Bound::Included(&s) => s,
+            core::ops::Bound::Excluded(&s) => s + 1,
+            core::ops::Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            core::ops::Bound::Included(&e) => e + 1,
+            core::ops::Bound::Excluded(&e) => e,
+            core::ops::Bound::Unbounded => len,
+        };
+        assert!(start <= end && end <= len);
+        SegmentedSlice::new(self.buf, self.start + start, self.start + end)
+    }
+
+    /// Returns a reference to the element at the given index, or panics if the index is out of bounds.
+    #[inline]
+    pub fn index<I>(&self, index: I) -> I::Output<'_>
+    where
+        I: SliceIndex<Self>,
+    {
+        index.index(self)
+    }
+}
+
+impl<'a, T, A: Allocator> SegmentedSliceMut<'a, T, A> {
+    /// Returns a mutable sub-slice of the slice.
+    #[inline]
+    #[must_use]
+    pub fn slice_mut<R: RangeBounds<usize>>(&mut self, range: R) -> Self {
+        let len = self.len();
+        let start = match range.start_bound() {
+            core::ops::Bound::Included(&s) => s,
+            core::ops::Bound::Excluded(&s) => s + 1,
+            core::ops::Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            core::ops::Bound::Included(&e) => e + 1,
+            core::ops::Bound::Excluded(&e) => e,
+            core::ops::Bound::Unbounded => len,
+        };
+        assert!(start <= end && end <= len);
+        Self::new(self.buf, self.start + start, self.start + end)
+    }
+
+    /// Returns a mutable reference to the element at the given index, or panics if the index is out of bounds.
+    #[inline]
+    pub fn index_mut<I>(&mut self, index: I) -> I::OutputMut<'_>
+    where
+        I: SliceIndex<Self>,
+    {
+        index.index_mut(self)
+    }
+}
+
+impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
+    /// Divides one slice into two at an index.
+    #[inline]
+    #[track_caller]
+    pub fn split_at(&self, mid: usize) -> (SegmentedSlice<'a, T, A>, SegmentedSlice<'a, T, A>) {
+        assert!(mid <= self.len(), "mid > len");
+
+        let left = SegmentedSlice::new(self.buf, self.start, self.start + mid);
+        let right = SegmentedSlice::new(self.buf, self.start + mid, self.start + self.len);
 
         (left, right)
     }
 
     /// Divides one slice into two at an index, returning `None` if the slice is too short.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let vec: SegmentedVec<i32> = (0..10).collect();
-    /// let slice = vec.as_slice();
-    ///
-    /// assert!(slice.split_at_checked(5).is_some());
-    /// assert!(slice.split_at_checked(100).is_none());
-    /// ```
     #[inline]
     pub fn split_at_checked(
         &self,
@@ -920,18 +1432,6 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
     }
 
     /// Returns `true` if the slice contains an element with the given value.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let vec: SegmentedVec<i32> = (0..10).collect();
-    /// let slice = vec.as_slice();
-    ///
-    /// assert!(slice.contains(&5));
-    /// assert!(!slice.contains(&100));
-    /// ```
     #[inline]
     pub fn contains(&self, x: &T) -> bool
     where
@@ -941,18 +1441,6 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
     }
 
     /// Returns `true` if `needle` is a prefix of the slice.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let vec: SegmentedVec<i32> = (0..10).collect();
-    /// let slice = vec.as_slice();
-    ///
-    /// assert!(slice.starts_with(&[0, 1, 2]));
-    /// assert!(!slice.starts_with(&[5, 6, 7]));
-    /// ```
     #[inline]
     pub fn starts_with(&self, needle: &[T]) -> bool
     where
@@ -963,18 +1451,6 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
     }
 
     /// Returns `true` if `needle` is a suffix of the slice.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let vec: SegmentedVec<i32> = (0..10).collect();
-    /// let slice = vec.as_slice();
-    ///
-    /// assert!(slice.ends_with(&[7, 8, 9]));
-    /// assert!(!slice.ends_with(&[0, 1, 2]));
-    /// ```
     #[inline]
     pub fn ends_with(&self, needle: &[T]) -> bool
     where
@@ -985,26 +1461,6 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
     }
 
     /// Binary searches this slice for a given element.
-    ///
-    /// If the value is found then [`Result::Ok`] is returned, containing the
-    /// index of the matching element. If there are multiple matches, then any
-    /// one of the matches could be returned.
-    ///
-    /// If the value is not found then [`Result::Err`] is returned, containing
-    /// the index where a matching element could be inserted while maintaining
-    /// sorted order.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let vec: SegmentedVec<i32> = (0..10).collect();
-    /// let slice = vec.as_slice();
-    ///
-    /// assert_eq!(slice.binary_search(&5), Ok(5));
-    /// assert_eq!(slice.binary_search(&100), Err(10));
-    /// ```
     #[inline]
     pub fn binary_search(&self, x: &T) -> Result<usize, usize>
     where
@@ -1014,18 +1470,6 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
     }
 
     /// Binary searches this slice with a comparator function.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let vec: SegmentedVec<i32> = (0..10).collect();
-    /// let slice = vec.as_slice();
-    ///
-    /// let result = slice.binary_search_by(|probe| probe.cmp(&5));
-    /// assert_eq!(result, Ok(5));
-    /// ```
     pub fn binary_search_by<F>(&self, mut f: F) -> Result<usize, usize>
     where
         F: FnMut(&T) -> Ordering,
@@ -1056,18 +1500,6 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
     }
 
     /// Binary searches this slice with a key extraction function.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let vec: SegmentedVec<(i32, i32)> = vec![(0, 1), (2, 3), (4, 5)].into_iter().collect();
-    /// let slice = vec.as_slice();
-    ///
-    /// assert_eq!(slice.binary_search_by_key(&2, |&(a, _)| a), Ok(1));
-    /// assert_eq!(slice.binary_search_by_key(&3, |&(a, _)| a), Err(2));
-    /// ```
     #[inline]
     pub fn binary_search_by_key<B, F>(&self, b: &B, mut f: F) -> Result<usize, usize>
     where
@@ -1077,106 +1509,7 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
         self.binary_search_by(|k| f(k).cmp(b))
     }
 
-    /// Returns an iterator over `chunk_size` elements of the slice at a time,
-    /// starting at the beginning of the slice.
-    ///
-    /// The chunks are slices and do not overlap. If `chunk_size` does not divide
-    /// the length of the slice, then the last chunk will not have length `chunk_size`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `chunk_size` is 0.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let vec: SegmentedVec<i32> = (0..10).collect();
-    /// let slice = vec.as_slice();
-    ///
-    /// let mut chunks = slice.chunks(3);
-    /// assert_eq!(chunks.next().unwrap().len(), 3);
-    /// assert_eq!(chunks.next().unwrap().len(), 3);
-    /// assert_eq!(chunks.next().unwrap().len(), 3);
-    /// assert_eq!(chunks.next().unwrap().len(), 1);
-    /// assert!(chunks.next().is_none());
-    /// ```
-    #[inline]
-    #[track_caller]
-    pub fn chunks(&self, chunk_size: usize) -> Chunks<'a, T, A> {
-        assert!(chunk_size != 0, "chunk size must be non-zero");
-        Chunks {
-            buf: self.buf,
-            start: self.start,
-            end: self.start + self.len,
-            chunk_size,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Returns an iterator over `chunk_size` elements of the slice at a time,
-    /// starting at the beginning of the slice.
-    ///
-    /// The chunks are slices and do not overlap. If `chunk_size` does not divide
-    /// the length of the slice, then the last up to `chunk_size-1` elements will
-    /// be omitted and can be retrieved from the `remainder` function of the iterator.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `chunk_size` is 0.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let vec: SegmentedVec<i32> = (0..10).collect();
-    /// let slice = vec.as_slice();
-    ///
-    /// let mut iter = slice.chunks_exact(3);
-    /// assert_eq!(iter.next().unwrap().len(), 3);
-    /// assert_eq!(iter.next().unwrap().len(), 3);
-    /// assert_eq!(iter.next().unwrap().len(), 3);
-    /// assert!(iter.next().is_none());
-    /// assert_eq!(iter.remainder().len(), 1);
-    /// ```
-    #[inline]
-    #[track_caller]
-    pub fn chunks_exact(&self, chunk_size: usize) -> ChunksExact<'a, T, A> {
-        assert!(chunk_size != 0, "chunk size must be non-zero");
-        let end = self.start + self.len;
-        let rem = self.len % chunk_size;
-        let chunks_end = end - rem;
-        ChunksExact {
-            buf: self.buf,
-            start: self.start,
-            end: chunks_end,
-            remainder_start: chunks_end,
-            remainder_end: end,
-            chunk_size,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Returns an iterator over `chunk_size` elements of the slice at a time,
-    /// starting at the end of the slice.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `chunk_size` is 0.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let vec: SegmentedVec<i32> = (0..10).collect();
-    /// let slice = vec.as_slice();
-    ///
-    /// let mut chunks = slice.rchunks(3);
-    /// assert_eq!(chunks.next().unwrap().len(), 3);
-    /// ```
+    /// Returns an iterator over `chunk_size` elements at a time, starting at the end.
     #[inline]
     #[track_caller]
     pub fn rchunks(&self, chunk_size: usize) -> RChunks<'a, T, A> {
@@ -1190,55 +1523,7 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
         }
     }
 
-    /// Returns an iterator over overlapping windows of length `size`.
-    ///
-    /// The windows overlap. If the slice is shorter than `size`, the iterator
-    /// returns no values.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `size` is 0.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let vec: SegmentedVec<i32> = (0..5).collect();
-    /// let slice = vec.as_slice();
-    ///
-    /// let mut windows = slice.windows(3);
-    /// assert_eq!(windows.next().unwrap().len(), 3);
-    /// assert_eq!(windows.next().unwrap().len(), 3);
-    /// assert_eq!(windows.next().unwrap().len(), 3);
-    /// assert!(windows.next().is_none());
-    /// ```
-    #[inline]
-    #[track_caller]
-    pub fn windows(&self, size: usize) -> Windows<'a, T, A> {
-        assert!(size != 0, "window size must be non-zero");
-        Windows {
-            buf: self.buf,
-            start: self.start,
-            end: self.start + self.len,
-            size,
-            _marker: PhantomData,
-        }
-    }
-
     /// Compares two slices lexicographically.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    /// use std::cmp::Ordering;
-    ///
-    /// let vec1: SegmentedVec<i32> = (0..5).collect();
-    /// let vec2: SegmentedVec<i32> = (0..10).collect();
-    ///
-    /// assert_eq!(vec1.as_slice().cmp(&vec2.as_slice()), Ordering::Less);
-    /// ```
     pub fn cmp_with(&self, other: &SegmentedSlice<'_, T, A>) -> Ordering
     where
         T: Ord,
@@ -1247,18 +1532,6 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
     }
 
     /// Copies elements into a `Vec`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let vec: SegmentedVec<i32> = (0..5).collect();
-    /// let slice = vec.as_slice();
-    ///
-    /// let v: Vec<i32> = slice.to_vec();
-    /// assert_eq!(v, vec![0, 1, 2, 3, 4]);
-    /// ```
     #[inline]
     pub fn to_vec(&self) -> Vec<T>
     where
@@ -1267,28 +1540,7 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
         self.iter().cloned().collect()
     }
 
-    /// Returns a mutable iterator over the slice.
-    #[inline]
-    pub fn iter_mut(&mut self) -> SliceIterMut<'_, T, A> {
-        SliceIterMut::new(self.buf, self.start, self.start + self.len)
-    }
-
-    /// Returns an iterator over subslices separated by elements that match
-    /// `pred`. The matched element is not contained in the subslices.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let vec: SegmentedVec<i32> = vec![10, 40, 33, 20].into_iter().collect();
-    /// let slice = vec.as_slice();
-    ///
-    /// let mut iter = slice.split(|num| *num % 3 == 0);
-    /// assert_eq!(iter.next().unwrap().len(), 2); // [10, 40]
-    /// assert_eq!(iter.next().unwrap().len(), 1); // [20]
-    /// assert!(iter.next().is_none());
-    /// ```
+    /// Returns an iterator over subslices separated by elements that match `pred`.
     #[inline]
     pub fn split<P>(&self, pred: P) -> iter::Split<'a, T, A, P>
     where
@@ -1300,21 +1552,7 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
         )
     }
 
-    /// Returns an iterator over subslices separated by elements that match
-    /// `pred`, starting from the end of the slice.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let vec: SegmentedVec<i32> = vec![11, 22, 33, 0, 44, 55].into_iter().collect();
-    /// let slice = vec.as_slice();
-    ///
-    /// let mut iter = slice.rsplit(|num| *num == 0);
-    /// assert_eq!(iter.next().unwrap().len(), 2); // [44, 55]
-    /// assert_eq!(iter.next().unwrap().len(), 3); // [11, 22, 33]
-    /// ```
+    /// Returns an iterator over subslices separated by elements that match `pred`, starting from the end.
     #[inline]
     pub fn rsplit<P>(&self, pred: P) -> iter::RSplit<'a, T, A, P>
     where
@@ -1326,22 +1564,7 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
         )
     }
 
-    /// Returns an iterator over subslices separated by elements that match
-    /// `pred`. The matched element is included as the terminator of the
-    /// subslice.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let vec: SegmentedVec<i32> = vec![10, 40, 33, 20].into_iter().collect();
-    /// let slice = vec.as_slice();
-    ///
-    /// let mut iter = slice.split_inclusive(|num| *num % 3 == 0);
-    /// assert_eq!(iter.next().unwrap().len(), 3); // [10, 40, 33]
-    /// assert_eq!(iter.next().unwrap().len(), 1); // [20]
-    /// ```
+    /// Returns an iterator over subslices separated by elements that match `pred`.
     #[inline]
     pub fn split_inclusive<P>(&self, pred: P) -> iter::SplitInclusive<'a, T, A, P>
     where
@@ -1353,21 +1576,7 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
         )
     }
 
-    /// Returns an iterator over subslices separated by elements that match
-    /// `pred`, limited to at most `n` splits.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let vec: SegmentedVec<i32> = vec![10, 40, 30, 20, 60, 50].into_iter().collect();
-    /// let slice = vec.as_slice();
-    ///
-    /// let mut iter = slice.splitn(2, |num| *num % 3 == 0);
-    /// assert_eq!(iter.next().unwrap().len(), 2); // [10, 40]
-    /// assert_eq!(iter.next().unwrap().len(), 3); // [20, 60, 50]
-    /// ```
+    /// Returns an iterator over subslices separated by elements that match `pred`, limited to at most `n` splits.
     #[inline]
     pub fn splitn<P>(&self, n: usize, pred: P) -> iter::SplitN<'a, T, A, P>
     where
@@ -1380,21 +1589,7 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
         )
     }
 
-    /// Returns an iterator over subslices separated by elements that match
-    /// `pred`, limited to at most `n` splits, starting from the end.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let vec: SegmentedVec<i32> = vec![10, 40, 30, 20, 60, 50].into_iter().collect();
-    /// let slice = vec.as_slice();
-    ///
-    /// let mut iter = slice.rsplitn(2, |num| *num % 3 == 0);
-    /// assert_eq!(iter.next().unwrap().len(), 1); // [50]
-    /// assert_eq!(iter.next().unwrap().len(), 4); // [10, 40, 30, 20]
-    /// ```
+    /// Returns an iterator over subslices separated by elements that match `pred`, limited to at most `n` splits, starting from the end.
     #[inline]
     pub fn rsplitn<P>(&self, n: usize, pred: P) -> iter::RSplitN<'a, T, A, P>
     where
@@ -1407,96 +1602,85 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
         )
     }
 
-    /// Returns an iterator over `chunk_size` elements of the slice at a time,
-    /// starting at the beginning of the slice. The iterator yields mutable
-    /// subslices.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `chunk_size` is 0.
-    #[inline]
-    #[track_caller]
-    pub fn chunks_mut(&mut self, chunk_size: usize) -> iter::ChunksMut<'a, T, A> {
-        iter::ChunksMut::new(self, chunk_size)
-    }
-
-    /// Returns an iterator over `chunk_size` elements of the slice at a time,
-    /// starting at the beginning of the slice.
-    ///
-    /// The chunks are slices and do not overlap. If `chunk_size` does not divide
-    /// the length of the slice, the last up to `chunk_size-1` elements will be
-    /// omitted and can be retrieved from the `into_remainder` function of the
-    /// iterator.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `chunk_size` is 0.
-    #[inline]
-    #[track_caller]
-    pub fn chunks_exact_mut(&mut self, chunk_size: usize) -> iter::ChunksExactMut<'a, T, A> {
-        iter::ChunksExactMut::new(self, chunk_size)
-    }
-
-    /// Returns an iterator over `chunk_size` elements of the slice at a time,
-    /// starting at the end of the slice.
-    ///
-    /// The chunks are slices and do not overlap. If `chunk_size` does not divide
-    /// the length of the slice, the last up to `chunk_size-1` elements will be
-    /// omitted and can be retrieved from the `remainder` function of the
-    /// iterator.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `chunk_size` is 0.
+    /// Returns an iterator over `chunk_size` elements of the slice at a time, starting at the end.
     #[inline]
     #[track_caller]
     pub fn rchunks_exact(&self, chunk_size: usize) -> iter::RChunksExact<'a, T, A> {
         iter::RChunksExact::new(self, chunk_size)
     }
+}
 
-    /// Returns an iterator over `chunk_size` elements of the slice at a time,
-    /// starting at the end of the slice. The iterator yields mutable subslices.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `chunk_size` is 0.
+impl<'a, T, A: Allocator> SegmentedSliceMut<'a, T, A> {
+    /// Binary searches this slice for a given element.
     #[inline]
-    #[track_caller]
-    pub fn rchunks_mut(&mut self, chunk_size: usize) -> iter::RChunksMut<'a, T, A> {
-        iter::RChunksMut::new(self, chunk_size)
+    pub fn binary_search(&self, x: &T) -> Result<usize, usize>
+    where
+        T: Ord,
+    {
+        self.binary_search_by(|p| p.cmp(x))
     }
 
-    /// Returns an iterator over `chunk_size` elements of the slice at a time,
-    /// starting at the end of the slice.
-    ///
-    /// The chunks are slices and do not overlap. If `chunk_size` does not divide
-    /// the length of the slice, the last up to `chunk_size-1` elements will be
-    /// omitted and can be retrieved from the `into_remainder` function of the
-    /// iterator.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `chunk_size` is 0.
-    #[inline]
-    #[track_caller]
-    pub fn rchunks_exact_mut(&mut self, chunk_size: usize) -> iter::RChunksExactMut<'a, T, A> {
-        iter::RChunksExactMut::new(self, chunk_size)
+    /// Binary searches this slice with a comparator function.
+    pub fn binary_search_by<F>(&self, mut f: F) -> Result<usize, usize>
+    where
+        F: FnMut(&T) -> Ordering,
+    {
+        let mut size = self.len();
+        if size == 0 {
+            return Err(0);
+        }
+
+        let mut base = 0usize;
+
+        while size > 1 {
+            let half = size / 2;
+            let mid = base + half;
+
+            // Use get_unchecked (SegmentedSliceMut should have it too)
+            let cmp = f(unsafe { self.get_unchecked(mid) });
+
+            base = if cmp == Ordering::Greater { base } else { mid };
+            size -= half;
+        }
+
+        let cmp = f(unsafe { self.get_unchecked(base) });
+        if cmp == Ordering::Equal {
+            Ok(base)
+        } else {
+            Err(base + (cmp == Ordering::Less) as usize)
+        }
     }
 
+    /// Binary searches this slice with a key extraction function.
+    #[inline]
+    pub fn binary_search_by_key<B, F>(&self, b: &B, mut f: F) -> Result<usize, usize>
+    where
+        F: FnMut(&T) -> B,
+        B: Ord,
+    {
+        self.binary_search_by(|k| f(k).cmp(b))
+    }
+
+    /// Compares two slices lexicographically.
+    pub fn cmp_with(&self, other: &SegmentedSlice<'_, T, A>) -> Ordering
+    where
+        T: Ord,
+    {
+        self.iter().cmp(other.iter())
+    }
+
+    /// Copies elements into a `Vec`.
+    #[inline]
+    pub fn to_vec(&self) -> Vec<T>
+    where
+        T: Clone,
+    {
+        self.iter().cloned().collect()
+    }
+}
+
+impl<'a, T, A: Allocator> SegmentedSliceMut<'a, T, A> {
     /// Fills `self` with elements by cloning `value`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let mut vec: SegmentedVec<i32> = (0..5).collect();
-    /// vec.as_mut_slice().fill(42);
-    ///
-    /// for &val in vec.iter() {
-    ///     assert_eq!(val, 42);
-    /// }
-    /// ```
     pub fn fill(&mut self, value: T)
     where
         T: Clone,
@@ -1511,22 +1695,6 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
     }
 
     /// Fills `self` with elements returned by calling a closure repeatedly.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let mut vec: SegmentedVec<i32> = (0..5).collect();
-    /// let mut counter = 0;
-    /// vec.as_mut_slice().fill_with(|| {
-    ///     counter += 1;
-    ///     counter
-    /// });
-    ///
-    /// assert_eq!(vec[0], 1);
-    /// assert_eq!(vec[4], 5);
-    /// ```
     pub fn fill_with<F>(&mut self, mut f: F)
     where
         F: FnMut() -> T,
@@ -1542,22 +1710,6 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
 
     /// Rotates the slice in-place such that the first `mid` elements move
     /// to the end of the slice.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `mid > len`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let mut vec: SegmentedVec<i32> = (0..5).collect();
-    /// vec.as_mut_slice().rotate_left(2);
-    ///
-    /// assert_eq!(vec[0], 2);
-    /// assert_eq!(vec[4], 1);
-    /// ```
     #[track_caller]
     pub fn rotate_left(&mut self, mid: usize) {
         let len = self.len();
@@ -1597,22 +1749,6 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
 
     /// Rotates the slice in-place such that the last `k` elements move
     /// to the front of the slice.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `k > len`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let mut vec: SegmentedVec<i32> = (0..5).collect();
-    /// vec.as_mut_slice().rotate_right(2);
-    ///
-    /// assert_eq!(vec[0], 3);
-    /// assert_eq!(vec[4], 2);
-    /// ```
     #[track_caller]
     pub fn rotate_right(&mut self, k: usize) {
         let len = self.len();
@@ -1624,20 +1760,6 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
     }
 
     /// Sorts the slice in ascending order.
-    ///
-    /// This sort is stable (i.e., does not reorder equal elements).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let mut vec: SegmentedVec<i32> = vec![3, 1, 4, 1, 5, 9, 2, 6].into_iter().collect();
-    /// vec.as_mut_slice().sort();
-    ///
-    /// assert_eq!(vec[0], 1);
-    /// assert_eq!(vec[7], 9);
-    /// ```
     #[inline]
     pub fn sort(&mut self)
     where
@@ -1647,20 +1769,6 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
     }
 
     /// Sorts the slice with a comparator function.
-    ///
-    /// This sort is stable (i.e., does not reorder equal elements).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let mut vec: SegmentedVec<i32> = vec![3, 1, 4, 1, 5, 9, 2, 6].into_iter().collect();
-    /// vec.as_mut_slice().sort_by(|a, b| b.cmp(a)); // reverse order
-    ///
-    /// assert_eq!(vec[0], 9);
-    /// assert_eq!(vec[7], 1);
-    /// ```
     pub fn sort_by<F>(&mut self, mut compare: F)
     where
         F: FnMut(&T, &T) -> Ordering,
@@ -1671,19 +1779,6 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
     }
 
     /// Sorts the slice with a key extraction function.
-    ///
-    /// This sort is stable (i.e., does not reorder equal elements).
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let mut vec: SegmentedVec<(i32, i32)> = vec![(3, 0), (1, 1), (2, 2)].into_iter().collect();
-    /// vec.as_mut_slice().sort_by_key(|&(a, _)| a);
-    ///
-    /// assert_eq!(vec[0], (1, 1));
-    /// ```
     #[inline]
     pub fn sort_by_key<K, F>(&mut self, mut f: F)
     where
@@ -1694,20 +1789,6 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
     }
 
     /// Sorts the slice in ascending order **without** preserving the initial order of equal elements.
-    ///
-    /// This sort is unstable but typically faster than stable sort.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let mut vec: SegmentedVec<i32> = vec![3, 1, 4, 1, 5, 9, 2, 6].into_iter().collect();
-    /// vec.as_mut_slice().sort_unstable();
-    ///
-    /// assert_eq!(vec[0], 1);
-    /// assert_eq!(vec[7], 9);
-    /// ```
     #[inline]
     pub fn sort_unstable(&mut self)
     where
@@ -1721,7 +1802,6 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
     where
         F: FnMut(&T, &T) -> Ordering,
     {
-        // Use heapsort for unstable sort - simple and in-place
         heapsort(self, &mut compare);
     }
 
@@ -1736,24 +1816,6 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
     }
 
     /// Copies elements from another slice into `self`.
-    ///
-    /// The length of `src` must be the same as `self`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the two slices have different lengths.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use segmented_vec::SegmentedVec;
-    ///
-    /// let mut vec: SegmentedVec<i32> = (0..5).collect();
-    /// vec.as_mut_slice().copy_from_slice(&[10, 20, 30, 40, 50]);
-    ///
-    /// assert_eq!(vec[0], 10);
-    /// assert_eq!(vec[4], 50);
-    /// ```
     #[track_caller]
     pub fn copy_from_slice(&mut self, src: &[T])
     where
@@ -1777,12 +1839,6 @@ impl<'a, T, A: Allocator> SegmentedSlice<'a, T, A> {
     }
 
     /// Copies elements from another slice into `self`.
-    ///
-    /// The length of `src` must be the same as `self`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the two slices have different lengths.
     #[track_caller]
     pub fn clone_from_slice(&mut self, src: &[T])
     where
@@ -1815,7 +1871,16 @@ impl<T, A: Allocator> Index<usize> for SegmentedSlice<'_, T, A> {
     }
 }
 
-impl<T, A: Allocator> IndexMut<usize> for SegmentedSlice<'_, T, A> {
+impl<T, A: Allocator> Index<usize> for SegmentedSliceMut<'_, T, A> {
+    type Output = T;
+
+    #[inline]
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index).expect("index out of bounds")
+    }
+}
+
+impl<T, A: Allocator> IndexMut<usize> for SegmentedSliceMut<'_, T, A> {
     #[inline]
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         self.get_mut(index).expect("index out of bounds")
@@ -1834,7 +1899,7 @@ fn gcd(mut a: usize, mut b: usize) -> usize {
 }
 
 /// Merge sort for stable sorting
-fn merge_sort<T, A: Allocator, F>(slice: &mut SegmentedSlice<'_, T, A>, compare: &mut F)
+fn merge_sort<T, A: Allocator, F>(slice: &mut SegmentedSliceMut<'_, T, A>, compare: &mut F)
 where
     F: FnMut(&T, &T) -> Ordering,
 {
@@ -1872,7 +1937,7 @@ where
 
 /// Merge two sorted runs in-place using temporary storage
 fn merge_inplace<T, A: Allocator, F>(
-    slice: &mut SegmentedSlice<'_, T, A>,
+    slice: &mut SegmentedSliceMut<'_, T, A>,
     left: usize,
     mid: usize,
     right: usize,
@@ -1932,7 +1997,7 @@ fn merge_inplace<T, A: Allocator, F>(
 }
 
 /// Insertion sort for small slices
-fn insertion_sort<T, A: Allocator, F>(slice: &mut SegmentedSlice<'_, T, A>, compare: &mut F)
+fn insertion_sort<T, A: Allocator, F>(slice: &mut SegmentedSliceMut<'_, T, A>, compare: &mut F)
 where
     F: FnMut(&T, &T) -> Ordering,
 {
@@ -1955,7 +2020,7 @@ where
 }
 
 /// Heapsort for unstable sorting
-fn heapsort<T, A: Allocator, F>(slice: &mut SegmentedSlice<'_, T, A>, compare: &mut F)
+fn heapsort<T, A: Allocator, F>(slice: &mut SegmentedSliceMut<'_, T, A>, compare: &mut F)
 where
     F: FnMut(&T, &T) -> Ordering,
 {
@@ -1978,7 +2043,7 @@ where
 
 /// Sift down for heapsort
 fn sift_down<T, A: Allocator, F>(
-    slice: &mut SegmentedSlice<'_, T, A>,
+    slice: &mut SegmentedSliceMut<'_, T, A>,
     mut root: usize,
     end: usize,
     compare: &mut F,

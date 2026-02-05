@@ -7,9 +7,10 @@
 use allocator_api2::alloc::{Allocator, Global};
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
+use std::num::NonZero;
 
 use crate::raw_vec::RawSegmentedVec;
-use crate::slice::SegmentedSlice;
+use crate::slice::{SegmentedSlice, SegmentedSliceMut};
 
 impl<'a, T, A: Allocator> IntoIterator for SegmentedSlice<'a, T, A> {
     type Item = &'a T;
@@ -29,13 +30,23 @@ impl<'a, T, A: Allocator> IntoIterator for &SegmentedSlice<'a, T, A> {
     }
 }
 
-impl<'a, 'b, T, A: Allocator> IntoIterator for &'b mut SegmentedSlice<'a, T, A> {
-    type Item = &'b mut T;
-    type IntoIter = SliceIterMut<'b, T, A>;
+impl<'a, T, A: Allocator> IntoIterator for &mut SegmentedSliceMut<'a, T, A> {
+    type Item = &'a mut T;
+    type IntoIter = SliceIterMut<'a, T, A>;
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
         self.iter_mut()
+    }
+}
+
+impl<'a, T, A: Allocator> IntoIterator for SegmentedSliceMut<'a, T, A> {
+    type Item = &'a mut T;
+    type IntoIter = SliceIterMut<'a, T, A>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        SliceIterMut::new(self.buf, self.start, self.start + self.len)
     }
 }
 
@@ -75,13 +86,12 @@ unsafe impl<T: Sync, A: Allocator + Sync> Send for SliceIter<'_, T, A> {}
 impl<'a, T, A: Allocator> SliceIter<'a, T, A> {
     /// Creates a new `SliceIter` from a buffer and index range.
     #[inline]
-    pub(crate) fn new(buf: *const RawSegmentedVec<T, A>, start: usize, end: usize) -> Self {
-        debug_assert!(start <= end);
-        let len = end - start;
+    pub(crate) fn new(slice: &'a SegmentedSlice<'a, T, A>) -> Self {
+        let len = slice.len;
 
         if len == 0 || std::mem::size_of::<T>() == 0 {
             return Self {
-                buf,
+                buf: slice.buf,
                 ptr: std::ptr::NonNull::<T>::dangling().as_ptr(),
                 seg_end: std::ptr::NonNull::<T>::dangling().as_ptr(),
                 seg: 0,
@@ -94,22 +104,22 @@ impl<'a, T, A: Allocator> SliceIter<'a, T, A> {
         }
 
         // SAFETY: buf is valid for the lifetime 'a
-        let buf_ref = unsafe { &*buf };
+        let buf_ref = unsafe { &*slice.buf };
 
         // Compute forward iteration state
-        let (start_seg, start_offset) = RawSegmentedVec::<T, A>::location(start);
+        let (start_seg, start_offset) = RawSegmentedVec::<T, A>::location(slice.start);
         let start_ptr = unsafe { buf_ref.segment_ptr(start_seg).add(start_offset) };
         let start_seg_cap = RawSegmentedVec::<T, A>::segment_capacity(start_seg);
         let start_seg_end = unsafe { buf_ref.segment_ptr(start_seg).add(start_seg_cap) };
 
         // Compute backward iteration state
-        let last_idx = end - 1;
+        let last_idx = slice.end - 1;
         let (end_seg, end_offset) = RawSegmentedVec::<T, A>::location(last_idx);
         let back_ptr = unsafe { buf_ref.segment_ptr(end_seg).add(end_offset) };
         let back_seg_start = unsafe { buf_ref.segment_ptr(end_seg) };
 
         Self {
-            buf,
+            buf: slice.buf,
             ptr: start_ptr,
             seg_end: start_seg_end,
             seg: start_seg,
@@ -199,13 +209,12 @@ pub struct SliceIterMut<'a, T, A: Allocator + 'a = Global> {
 impl<'a, T, A: Allocator> SliceIterMut<'a, T, A> {
     /// Creates a new `SliceIterMut` from a buffer and index range.
     #[inline]
-    pub(crate) fn new(buf: *const RawSegmentedVec<T, A>, start: usize, end: usize) -> Self {
-        debug_assert!(start <= end);
-        let len = end - start;
+    pub(crate) fn new(slice: &'a mut SegmentedSliceMut<'a, T, A>) -> Self {
+        let len = slice.len();
 
         if len == 0 || std::mem::size_of::<T>() == 0 {
             return Self {
-                buf,
+                buf: slice.buf,
                 ptr: std::ptr::NonNull::<T>::dangling().as_ptr(),
                 seg_end: std::ptr::NonNull::<T>::dangling().as_ptr(),
                 seg: 0,
@@ -218,22 +227,22 @@ impl<'a, T, A: Allocator> SliceIterMut<'a, T, A> {
         }
 
         // SAFETY: buf is valid for the lifetime 'a
-        let buf_ref = unsafe { &*buf };
+        let buf_ref = unsafe { &*slice.buf };
 
         // Compute forward iteration state
-        let (start_seg, start_offset) = RawSegmentedVec::<T, A>::location(start);
+        let (start_seg, start_offset) = RawSegmentedVec::<T, A>::location(slice.start);
         let start_ptr = unsafe { buf_ref.segment_ptr(start_seg).add(start_offset) };
         let start_seg_cap = RawSegmentedVec::<T, A>::segment_capacity(start_seg);
         let start_seg_end = unsafe { buf_ref.segment_ptr(start_seg).add(start_seg_cap) };
 
         // Compute backward iteration state
-        let last_idx = end - 1;
+        let last_idx = slice.end - 1;
         let (end_seg, end_offset) = RawSegmentedVec::<T, A>::location(last_idx);
         let back_ptr = unsafe { buf_ref.segment_ptr(end_seg).add(end_offset) };
         let back_seg_start = unsafe { buf_ref.segment_ptr(end_seg) };
 
         Self {
-            buf,
+            buf: slice.buf,
             ptr: start_ptr,
             seg_end: start_seg_end,
             seg: start_seg,
@@ -245,6 +254,33 @@ impl<'a, T, A: Allocator> SliceIterMut<'a, T, A> {
         }
     }
 
+    #[must_use]
+    #[inline]
+    pub fn into_slice(self) -> SegmentedSlice<'a, T, A> {
+        if self.remaining == 0 {
+            return SegmentedSlice::new(self.buf, 0, 0);
+        }
+
+        let buf = self.buf();
+        // SAFETY: self.remaining > 0 implies ptr is valid within the current segment
+        let segment_base_ptr = unsafe { buf.segment_ptr(self.seg) };
+        let offset = unsafe { self.ptr.offset_from(segment_base_ptr) as usize };
+        let segment_start = buf.segment_start_index(self.seg);
+        let start = segment_start + offset;
+
+        // Construct SegmentedSlice directly to avoid re-calculating end location
+        // end_ptr is exclusive, so it is back_ptr + 1
+        let end_ptr = unsafe { self.back_ptr.add(1) as *mut T };
+
+        SegmentedSlice {
+            buf: self.buf,
+            start,
+            len: self.remaining,
+            end_ptr,
+            end_seg: self.back_seg,
+            _marker: PhantomData,
+        }
+    }
     #[inline]
     fn buf(&self) -> &RawSegmentedVec<T, A> {
         // SAFETY: The pointer is valid for the lifetime 'a
@@ -670,7 +706,7 @@ pub struct ChunksMut<'a, T, A: Allocator + 'a = Global> {
 
 impl<'a, T, A: Allocator + 'a> ChunksMut<'a, T, A> {
     #[inline]
-    pub(crate) fn new(slice: &mut SegmentedSlice<'a, T, A>, chunk_size: usize) -> Self {
+    pub(crate) fn new(slice: &mut SegmentedSliceMut<'a, T, A>, chunk_size: usize) -> Self {
         assert!(chunk_size != 0, "chunk_size must be non-zero");
         Self {
             buf: slice.buf,
@@ -683,7 +719,7 @@ impl<'a, T, A: Allocator + 'a> ChunksMut<'a, T, A> {
 }
 
 impl<'a, T, A: Allocator + 'a> Iterator for ChunksMut<'a, T, A> {
-    type Item = SegmentedSlice<'a, T, A>;
+    type Item = SegmentedSliceMut<'a, T, A>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -691,7 +727,7 @@ impl<'a, T, A: Allocator + 'a> Iterator for ChunksMut<'a, T, A> {
             None
         } else {
             let chunk_end = std::cmp::min(self.start + self.chunk_size, self.end);
-            let result = SegmentedSlice::new(self.buf, self.start, chunk_end);
+            let result = SegmentedSliceMut::new(self.buf, self.start, chunk_end);
             self.start = chunk_end;
             Some(result)
         }
@@ -728,7 +764,7 @@ impl<'a, T, A: Allocator + 'a> DoubleEndedIterator for ChunksMut<'a, T, A> {
                 self.chunk_size
             };
             let chunk_start = self.end - chunk_size;
-            let result = SegmentedSlice::new(self.buf, chunk_start, self.end);
+            let result = SegmentedSliceMut::new(self.buf, chunk_start, self.end);
             self.end = chunk_start;
             Some(result)
         }
@@ -761,7 +797,7 @@ pub struct ChunksExactMut<'a, T, A: Allocator + 'a = Global> {
 
 impl<'a, T, A: Allocator + 'a> ChunksExactMut<'a, T, A> {
     #[inline]
-    pub(crate) fn new(slice: &mut SegmentedSlice<'a, T, A>, chunk_size: usize) -> Self {
+    pub(crate) fn new(slice: &mut SegmentedSliceMut<'a, T, A>, chunk_size: usize) -> Self {
         assert!(chunk_size != 0, "chunk_size must be non-zero");
         let len = slice.len;
         let rem = len % chunk_size;
@@ -779,13 +815,13 @@ impl<'a, T, A: Allocator + 'a> ChunksExactMut<'a, T, A> {
     /// Returns the remainder of the original slice that is not covered by
     /// the iterator.
     #[inline]
-    pub fn into_remainder(self) -> SegmentedSlice<'a, T, A> {
-        SegmentedSlice::new(self.buf, self.end, self.full_end)
+    pub fn into_remainder(self) -> SegmentedSliceMut<'a, T, A> {
+        SegmentedSliceMut::new(self.buf, self.end, self.full_end)
     }
 }
 
 impl<'a, T, A: Allocator + 'a> Iterator for ChunksExactMut<'a, T, A> {
-    type Item = SegmentedSlice<'a, T, A>;
+    type Item = SegmentedSliceMut<'a, T, A>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -793,7 +829,7 @@ impl<'a, T, A: Allocator + 'a> Iterator for ChunksExactMut<'a, T, A> {
             None
         } else {
             let chunk_end = self.start + self.chunk_size;
-            let result = SegmentedSlice::new(self.buf, self.start, chunk_end);
+            let result = SegmentedSliceMut::new(self.buf, self.start, chunk_end);
             self.start = chunk_end;
             Some(result)
         }
@@ -818,7 +854,7 @@ impl<'a, T, A: Allocator + 'a> DoubleEndedIterator for ChunksExactMut<'a, T, A> 
             None
         } else {
             let chunk_start = self.end - self.chunk_size;
-            let result = SegmentedSlice::new(self.buf, chunk_start, self.end);
+            let result = SegmentedSliceMut::new(self.buf, chunk_start, self.end);
             self.end = chunk_start;
             Some(result)
         }
@@ -892,7 +928,7 @@ impl<'a, T, A: Allocator + 'a> Iterator for RChunksExact<'a, T, A> {
             None
         } else {
             let chunk_start = self.end - self.chunk_size;
-            let result = SegmentedSlice::new(self.buf, chunk_start, self.end);
+            let result = SegmentedSliceMut::new(self.buf, chunk_start, self.end);
             self.end = chunk_start;
             Some(result)
         }
@@ -917,7 +953,7 @@ impl<'a, T, A: Allocator + 'a> DoubleEndedIterator for RChunksExact<'a, T, A> {
             None
         } else {
             let chunk_end = self.start + self.chunk_size;
-            let result = SegmentedSlice::new(self.buf, self.start, chunk_end);
+            let result = SegmentedSliceMut::new(self.buf, self.start, chunk_end);
             self.start = chunk_end;
             Some(result)
         }
@@ -943,7 +979,7 @@ pub struct RChunksMut<'a, T, A: Allocator + 'a = Global> {
 
 impl<'a, T, A: Allocator + 'a> RChunksMut<'a, T, A> {
     #[inline]
-    pub(crate) fn new(slice: &mut SegmentedSlice<'a, T, A>, chunk_size: usize) -> Self {
+    pub(crate) fn new(slice: &mut SegmentedSliceMut<'a, T, A>, chunk_size: usize) -> Self {
         assert!(chunk_size != 0, "chunk_size must be non-zero");
         Self {
             buf: slice.buf,
@@ -956,7 +992,7 @@ impl<'a, T, A: Allocator + 'a> RChunksMut<'a, T, A> {
 }
 
 impl<'a, T, A: Allocator + 'a> Iterator for RChunksMut<'a, T, A> {
-    type Item = SegmentedSlice<'a, T, A>;
+    type Item = SegmentedSliceMut<'a, T, A>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -964,7 +1000,7 @@ impl<'a, T, A: Allocator + 'a> Iterator for RChunksMut<'a, T, A> {
             None
         } else {
             let chunk_start = self.end.saturating_sub(self.chunk_size).max(self.start);
-            let result = SegmentedSlice::new(self.buf, chunk_start, self.end);
+            let result = SegmentedSliceMut::new(self.buf, chunk_start, self.end);
             self.end = chunk_start;
             Some(result)
         }
@@ -1001,7 +1037,7 @@ impl<'a, T, A: Allocator + 'a> DoubleEndedIterator for RChunksMut<'a, T, A> {
                 self.chunk_size
             };
             let chunk_end = self.start + chunk_size;
-            let result = SegmentedSlice::new(self.buf, self.start, chunk_end);
+            let result = SegmentedSliceMut::new(self.buf, self.start, chunk_end);
             self.start = chunk_end;
             Some(result)
         }
@@ -1028,7 +1064,7 @@ pub struct RChunksExactMut<'a, T, A: Allocator + 'a = Global> {
 
 impl<'a, T, A: Allocator + 'a> RChunksExactMut<'a, T, A> {
     #[inline]
-    pub(crate) fn new(slice: &mut SegmentedSlice<'a, T, A>, chunk_size: usize) -> Self {
+    pub(crate) fn new(slice: &mut SegmentedSliceMut<'a, T, A>, chunk_size: usize) -> Self {
         assert!(chunk_size != 0, "chunk_size must be non-zero");
         let len = slice.len;
         let rem = len % chunk_size;
@@ -1046,13 +1082,13 @@ impl<'a, T, A: Allocator + 'a> RChunksExactMut<'a, T, A> {
     /// Returns the remainder of the original slice that is not covered by
     /// the iterator.
     #[inline]
-    pub fn into_remainder(self) -> SegmentedSlice<'a, T, A> {
-        SegmentedSlice::new(self.buf, self.full_start, self.start)
+    pub fn into_remainder(self) -> SegmentedSliceMut<'a, T, A> {
+        SegmentedSliceMut::new(self.buf, self.full_start, self.start)
     }
 }
 
 impl<'a, T, A: Allocator + 'a> Iterator for RChunksExactMut<'a, T, A> {
-    type Item = SegmentedSlice<'a, T, A>;
+    type Item = SegmentedSliceMut<'a, T, A>;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -1060,7 +1096,7 @@ impl<'a, T, A: Allocator + 'a> Iterator for RChunksExactMut<'a, T, A> {
             None
         } else {
             let chunk_start = self.end - self.chunk_size;
-            let result = SegmentedSlice::new(self.buf, chunk_start, self.end);
+            let result = SegmentedSliceMut::new(self.buf, chunk_start, self.end);
             self.end = chunk_start;
             Some(result)
         }
@@ -1085,7 +1121,7 @@ impl<'a, T, A: Allocator + 'a> DoubleEndedIterator for RChunksExactMut<'a, T, A>
             None
         } else {
             let chunk_end = self.start + self.chunk_size;
-            let result = SegmentedSlice::new(self.buf, self.start, chunk_end);
+            let result = SegmentedSliceMut::new(self.buf, self.start, chunk_end);
             self.start = chunk_end;
             Some(result)
         }
@@ -1498,18 +1534,8 @@ impl<T, A: Allocator> std::iter::FusedIterator for RChunks<'_, T, A> {}
 
 /// An iterator over overlapping windows of a `SegmentedSlice`.
 pub struct Windows<'a, T, A: Allocator + 'a = Global> {
-    pub(crate) buf: *const RawSegmentedVec<T, A>,
-    pub(crate) start: usize,
-    pub(crate) end: usize,
-    pub(crate) size: usize,
-    pub(crate) _marker: PhantomData<&'a T>,
-}
-
-impl<'a, T, A: Allocator> Windows<'a, T, A> {
-    #[inline]
-    fn buf(&self) -> &RawSegmentedVec<T, A> {
-        unsafe { &*self.buf }
-    }
+    pub(crate) slice: SegmentedSlice<'a, T, A>,
+    pub(crate) size: NonZero<usize>,
 }
 
 impl<'a, T, A: Allocator + 'a> Iterator for Windows<'a, T, A> {
@@ -1517,37 +1543,37 @@ impl<'a, T, A: Allocator + 'a> Iterator for Windows<'a, T, A> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        let remaining = self.end.saturating_sub(self.start);
-        if remaining < self.size {
-            None
-        } else {
-            let window_end = self.start + self.size;
-
-            // Compute start optimization fields
-            let (start_seg, start_offset) = RawSegmentedVec::<T, A>::location(self.start);
-            let _start_ptr = unsafe { self.buf().segment_ptr(start_seg).add(start_offset) };
-
-            // Compute end optimization fields
-            let (mut end_seg, end_offset) = RawSegmentedVec::<T, A>::location(window_end);
-            let end_ptr = if end_seg >= self.buf().segment_count() {
-                let (last_seg, last_offset) = RawSegmentedVec::<T, A>::location(window_end - 1);
-                end_seg = last_seg;
-                unsafe { self.buf().segment_ptr(last_seg).add(last_offset + 1) }
-            } else {
-                unsafe { self.buf().segment_ptr(end_seg).add(end_offset) }
-            };
-
-            let window = SegmentedSlice {
-                buf: self.buf,
-                start: self.start,
-                len: self.size,
-                end_ptr,
-                end_seg,
-                _marker: PhantomData,
-            };
-            self.start += 1;
-            Some(window)
+        let size = self.size.get();
+        if self.slice.len() < size {
+            return None;
         }
+
+        let window_end = self.slice.start + size;
+
+        // Compute start optimization fields
+        let (start_seg, start_offset) = RawSegmentedVec::<T, A>::location(self.start);
+        let _start_ptr = unsafe { self.buf().segment_ptr(start_seg).add(start_offset) };
+
+        // Compute end optimization fields
+        let (mut end_seg, end_offset) = RawSegmentedVec::<T, A>::location(window_end);
+        let end_ptr = if end_seg >= self.buf().segment_count() {
+            let (last_seg, last_offset) = RawSegmentedVec::<T, A>::location(window_end - 1);
+            end_seg = last_seg;
+            unsafe { self.buf().segment_ptr(last_seg).add(last_offset + 1) }
+        } else {
+            unsafe { self.buf().segment_ptr(end_seg).add(end_offset) }
+        };
+
+        let window = SegmentedSlice {
+            buf: self.buf,
+            start: self.start,
+            len: self.size,
+            end_ptr,
+            end_seg,
+            _marker: PhantomData,
+        };
+        self.start += 1;
+        Some(window)
     }
 
     #[inline]
@@ -1567,3 +1593,147 @@ impl<T, A: Allocator> std::iter::FusedIterator for Windows<'_, T, A> {}
 
 unsafe impl<T: Send, A: Allocator + Send> Send for SliceIterMut<'_, T, A> {}
 unsafe impl<T: Sync, A: Allocator + Sync> Sync for SliceIterMut<'_, T, A> {}
+
+/// An iterator over subslices separated by elements that match a predicate function.
+pub struct SplitMut<'a, T, A: Allocator + 'a, P>
+where
+    P: FnMut(&T) -> bool,
+{
+    slice: SegmentedSliceMut<'a, T, A>,
+    pred: P,
+    finished: bool,
+}
+
+impl<'a, T, A: Allocator + 'a, P: FnMut(&T) -> bool> SplitMut<'a, T, A, P> {
+    #[inline]
+    pub(crate) fn new(slice: SegmentedSliceMut<'a, T, A>, pred: P) -> Self {
+        let finished = slice.is_empty();
+        Self {
+            slice,
+            pred,
+            finished,
+        }
+    }
+}
+
+impl<'a, T, A: Allocator + 'a, P> Iterator for SplitMut<'a, T, A, P>
+where
+    P: FnMut(&T) -> bool,
+{
+    type Item = SegmentedSliceMut<'a, T, A>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+
+        // Find the position of the next matching element
+        let mut idx = None;
+        // SegmentedSliceMut::iter() returns mutable references, but we only need to read for predicate.
+        // But predicate takes &T. So &mut T -> &T coercion works? Yes.
+        // Wait, iter() consumes self? No, iter() on reference.
+        // But self.slice is owned SegmentedSliceMut.
+        // We can create iterator from reference to self.slice.
+        for (i, elem) in self.slice.iter().enumerate() {
+            if (self.pred)(elem) {
+                idx = Some(i);
+                break;
+            }
+        }
+
+        match idx {
+            None => {
+                self.finished = true;
+                // Return the remaining slice
+                let result = SegmentedSliceMut::new(
+                    self.slice.buf,
+                    self.slice.start,
+                    self.slice.start + self.slice.len,
+                );
+                // Set slice to empty
+                self.slice = SegmentedSliceMut::new(
+                    self.slice.buf,
+                    self.slice.start + self.slice.len,
+                    self.slice.start + self.slice.len,
+                );
+                Some(result)
+            }
+            Some(idx) => {
+                let result = SegmentedSliceMut::new(
+                    self.slice.buf,
+                    self.slice.start,
+                    self.slice.start + idx,
+                );
+                // Skip the separator element
+                self.slice = SegmentedSliceMut::new(
+                    self.slice.buf,
+                    self.slice.start + idx + 1,
+                    self.slice.start + self.slice.len,
+                );
+                Some(result)
+            }
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.finished {
+            (0, Some(0))
+        } else {
+            // At least 1, at most len + 1
+            (1, Some(self.slice.len() + 1))
+        }
+    }
+}
+
+impl<'a, T, A: Allocator + 'a, P> DoubleEndedIterator for SplitMut<'a, T, A, P>
+where
+    P: FnMut(&T) -> bool,
+{
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+
+        // Find the position of the last matching element
+        let mut idx = None;
+        for (i, elem) in self.slice.iter().enumerate().rev() {
+            if (self.pred)(elem) {
+                idx = Some(i);
+                break;
+            }
+        }
+
+        match idx {
+            None => {
+                self.finished = true;
+                let result = SegmentedSliceMut::new(
+                    self.slice.buf,
+                    self.slice.start,
+                    self.slice.start + self.slice.len,
+                );
+                self.slice =
+                    SegmentedSliceMut::new(self.slice.buf, self.slice.start, self.slice.start);
+                Some(result)
+            }
+            Some(idx) => {
+                let result = SegmentedSliceMut::new(
+                    self.slice.buf,
+                    self.slice.start + idx + 1,
+                    self.slice.start + self.slice.len,
+                );
+                // Update slice to exclude the separator and everything after
+                self.slice = SegmentedSliceMut::new(
+                    self.slice.buf,
+                    self.slice.start,
+                    self.slice.start + idx,
+                );
+                Some(result)
+            }
+        }
+    }
+}
+
+impl<'a, T, A: Allocator + 'a, P> FusedIterator for SplitMut<'a, T, A, P> where P: FnMut(&T) -> bool {}
