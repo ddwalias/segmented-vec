@@ -122,12 +122,17 @@ impl<'a, T, A: Allocator> SliceIter<'a, T, A> {
             return SegmentedSlice::new(self.buf, 0, 0);
         }
 
-        let buf = self.buf();
-        // SAFETY: self.remaining > 0 implies ptr is valid within the current segment
-        let segment_base_ptr = unsafe { buf.segment_ptr(self.seg) };
-        let offset = unsafe { self.ptr.as_ptr().offset_from(segment_base_ptr) as usize };
-        let segment_start = buf.segment_start_index(self.seg);
-        let start = segment_start + offset;
+        // Optimize: calculate offset from seg_end to avoid loading segment_ptr from memory.
+        let start = if std::mem::size_of::<T>() == 0 {
+            0
+        } else {
+            let seg_cap = RawSegmentedVec::<T, A>::segment_capacity(self.seg);
+            let dist_to_end =
+                unsafe { self.seg_end.as_ptr().offset_from(self.ptr.as_ptr()) as usize };
+            let offset = seg_cap - dist_to_end;
+            let segment_start = self.buf().segment_start_index(self.seg);
+            segment_start + offset
+        };
 
         // Construct SegmentedSlice directly to avoid re-calculating end location
         // end_ptr is exclusive, so it is back_ptr + 1
@@ -273,12 +278,17 @@ impl<'a, T, A: Allocator> SliceIterMut<'a, T, A> {
             return SegmentedSlice::new(self.buf, 0, 0);
         }
 
-        let buf = self.buf();
-        // SAFETY: self.remaining > 0 implies ptr is valid within the current segment
-        let segment_base_ptr = unsafe { buf.segment_ptr(self.seg) };
-        let offset = unsafe { self.ptr.as_ptr().offset_from(segment_base_ptr) as usize };
-        let segment_start = buf.segment_start_index(self.seg);
-        let start = segment_start + offset;
+        // Optimize: calculate offset from seg_end to avoid loading segment_ptr from memory.
+        let start = if std::mem::size_of::<T>() == 0 {
+            0
+        } else {
+            let seg_cap = RawSegmentedVec::<T, A>::segment_capacity(self.seg);
+            let dist_to_end =
+                unsafe { self.seg_end.as_ptr().offset_from(self.ptr.as_ptr()) as usize };
+            let offset = seg_cap - dist_to_end;
+            let segment_start = self.buf().segment_start_index(self.seg);
+            segment_start + offset
+        };
 
         // Construct SegmentedSlice directly to avoid re-calculating end location
         // end_ptr is exclusive, so it is back_ptr + 1
