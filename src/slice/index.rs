@@ -1,6 +1,7 @@
 use core::ops::{Range, RangeFrom, RangeFull, RangeInclusive, RangeTo, RangeToInclusive};
 
 use crate::slice::{SegmentedSlice, SegmentedSliceMut};
+use crate::SegmentedVec; // Import SegmentedVec
 use allocator_api2::alloc::Allocator;
 
 /// A helper trait for generic indexing into [`SegmentedVec`] or [`SegmentedSlice`].
@@ -52,7 +53,7 @@ unsafe impl<'a, T, A: Allocator + 'a> SliceIndex<SegmentedSlice<'a, T, A>> for u
 
     #[inline]
     unsafe fn get_unchecked(self, slice: &SegmentedSlice<'a, T, A>) -> Self::Output<'a> {
-        &*slice.buf().ptr_at(slice.start + self)
+        &*slice.buf.as_ref().ptr_at(slice.start + self)
     }
 
     #[inline]
@@ -104,7 +105,7 @@ unsafe impl<'a, T, A: Allocator + 'a> SliceIndex<SegmentedSliceMut<'a, T, A>> fo
 
     #[inline]
     unsafe fn get_unchecked(self, slice: &SegmentedSliceMut<'a, T, A>) -> Self::Output<'a> {
-        &*slice.buf().ptr_at(slice.start + self)
+        &*slice.buf.as_ref().ptr_at(slice.start + self)
     }
 
     #[inline]
@@ -112,7 +113,7 @@ unsafe impl<'a, T, A: Allocator + 'a> SliceIndex<SegmentedSliceMut<'a, T, A>> fo
         self,
         slice: &mut SegmentedSliceMut<'a, T, A>,
     ) -> Self::OutputMut<'a> {
-        &mut *slice.buf_mut().ptr_at(slice.start + self)
+        &mut *slice.buf.as_ref().ptr_at(slice.start + self)
     }
 
     #[inline]
@@ -142,13 +143,17 @@ macro_rules! impl_range_index {
 
             #[inline]
             fn get(self, slice: &$SliceType<'a, T, A>) -> Option<Self::Output<'a>> {
-                let range = $normalize(self.clone(), slice.len())?;
+                if $normalize(self.clone(), slice.len()).is_none() {
+                    return None;
+                }
                 unsafe { Some(self.get_unchecked(slice)) }
             }
 
             #[inline]
             fn get_mut(self, slice: &mut $SliceType<'a, T, A>) -> Option<Self::OutputMut<'a>> {
-                let range = $normalize(self.clone(), slice.len())?;
+                if $normalize(self.clone(), slice.len()).is_none() {
+                    return None;
+                }
                 unsafe { Some(self.get_unchecked_mut(slice)) }
             }
 
@@ -156,7 +161,7 @@ macro_rules! impl_range_index {
             unsafe fn get_unchecked(self, slice: &$SliceType<'a, T, A>) -> Self::Output<'a> {
                 let range = $normalize(self, slice.len()).unwrap_unchecked();
                 SegmentedSlice::new(
-                    slice.buf(),
+                    slice.buf,
                     slice.start + range.start,
                     slice.start + range.end,
                 )
@@ -169,7 +174,7 @@ macro_rules! impl_range_index {
             ) -> Self::OutputMut<'a> {
                 let range = $normalize(self, slice.len()).unwrap_unchecked();
                 <$MutRet>::new(
-                    slice.buf(),
+                    slice.buf,
                     slice.start + range.start,
                     slice.start + range.end,
                 )
@@ -311,3 +316,102 @@ impl_range_index!(
     SegmentedSliceMut<'a, T, A>,
     range_to_inclusive
 );
+
+// --- SegmentedVec ---
+
+unsafe impl<T, A: Allocator> SliceIndex<SegmentedVec<T, A>> for usize {
+    type Output<'a>
+        = &'a T
+    where
+        T: 'a,
+        A: 'a;
+    type OutputMut<'a>
+        = &'a mut T
+    where
+        T: 'a,
+        A: 'a;
+
+    #[inline]
+    fn get(self, vec: &SegmentedVec<T, A>) -> Option<Self::Output<'_>> {
+        vec.as_slice().get(self)
+    }
+
+    #[inline]
+    fn get_mut(self, vec: &mut SegmentedVec<T, A>) -> Option<Self::OutputMut<'_>> {
+        vec.as_mut_slice().get_mut(self)
+    }
+
+    #[inline]
+    unsafe fn get_unchecked(self, vec: &SegmentedVec<T, A>) -> Self::Output<'_> {
+        vec.as_slice().get_unchecked(self)
+    }
+
+    #[inline]
+    unsafe fn get_unchecked_mut(self, vec: &mut SegmentedVec<T, A>) -> Self::OutputMut<'_> {
+        vec.as_mut_slice().get_unchecked_mut(self)
+    }
+
+    #[inline]
+    fn index(self, vec: &SegmentedVec<T, A>) -> Self::Output<'_> {
+        self.get(vec).expect("index out of bounds")
+    }
+
+    #[inline]
+    fn index_mut(self, vec: &mut SegmentedVec<T, A>) -> Self::OutputMut<'_> {
+        self.get_mut(vec).expect("index out of bounds")
+    }
+}
+
+macro_rules! impl_vec_range_index {
+    ($RangeType:ty, $normalize:expr) => {
+        unsafe impl<T, A: Allocator> SliceIndex<SegmentedVec<T, A>> for $RangeType {
+            type Output<'a>
+                = SegmentedSlice<'a, T, A>
+            where
+                T: 'a,
+                A: 'a;
+            type OutputMut<'a>
+                = SegmentedSliceMut<'a, T, A>
+            where
+                T: 'a,
+                A: 'a;
+
+            #[inline]
+            fn get(self, vec: &SegmentedVec<T, A>) -> Option<Self::Output<'_>> {
+                vec.as_slice().get(self)
+            }
+
+            #[inline]
+            fn get_mut(self, vec: &mut SegmentedVec<T, A>) -> Option<Self::OutputMut<'_>> {
+                vec.as_mut_slice().get_mut(self)
+            }
+
+            #[inline]
+            unsafe fn get_unchecked(self, vec: &SegmentedVec<T, A>) -> Self::Output<'_> {
+                vec.as_slice().get_unchecked(self)
+            }
+
+            #[inline]
+            unsafe fn get_unchecked_mut(self, vec: &mut SegmentedVec<T, A>) -> Self::OutputMut<'_> {
+                vec.as_mut_slice().get_unchecked_mut(self)
+            }
+
+            #[inline]
+            fn index(self, vec: &SegmentedVec<T, A>) -> Self::Output<'_> {
+                self.index(&vec.as_slice())
+            }
+
+            #[inline]
+            fn index_mut(self, vec: &mut SegmentedVec<T, A>) -> Self::OutputMut<'_> {
+                self.index_mut(&mut vec.as_mut_slice())
+            }
+        }
+    };
+}
+
+impl_vec_range_index!(Range<usize>, range_bounds);
+impl_vec_range_index!(RangeTo<usize>, range_to);
+impl_vec_range_index!(RangeFrom<usize>, range_from);
+impl_vec_range_index!(RangeFull, range_full);
+impl_vec_range_index!(RangeInclusive<usize>, range_inclusive);
+impl_vec_range_index!(RangeToInclusive<usize>, range_to_inclusive);

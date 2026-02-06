@@ -88,7 +88,7 @@ pub(crate) struct RawSegmentedVec<T, A: Allocator = Global> {
 struct RawSegmentedVecInner<A: Allocator> {
     /// Pointer to the array of segment pointers.
     /// This is allocated using `A`, just like the segments themselves.
-    segments: *mut *mut u8,
+    segments: NonNull<*mut u8>,
     /// Number of *allocated* segments (aka length of the backbone array).
     segment_count: usize,
     /// Capacity of the backbone array (how many segment pointers we can store before reallocating).
@@ -248,7 +248,7 @@ impl<T, A: Allocator> RawSegmentedVec<T, A> {
             return std::ptr::NonNull::<T>::dangling().as_ptr();
         }
         debug_assert!(index < self.inner.segment_count);
-        self.inner.segments.add(index).read() as *mut T
+        self.inner.segments.as_ptr().add(index).read() as *mut T
     }
 
     /// Returns the capacity of a segment at the given index.
@@ -300,7 +300,7 @@ impl<T, A: Allocator> RawSegmentedVec<T, A> {
         }
         let (segment_idx, offset) = Self::location(index);
         debug_assert!(segment_idx < self.inner.segment_count);
-        let segment_ptr = self.inner.segments.add(segment_idx).read() as *mut T;
+        let segment_ptr = self.inner.segments.as_ptr().add(segment_idx).read() as *mut T;
         segment_ptr.add(offset)
     }
 }
@@ -349,7 +349,7 @@ impl<A: Allocator> RawSegmentedVecInner<A> {
     #[inline]
     const fn new_in(alloc: A) -> Self {
         Self {
-            segments: std::ptr::null_mut(),
+            segments: NonNull::dangling(),
             segment_count: 0,
             segments_cap: 0,
             alloc,
@@ -465,25 +465,22 @@ impl<A: Allocator> RawSegmentedVecInner<A> {
             } else {
                 let old_layout = Layout::array::<*mut u8>(self.segments_cap).unwrap();
                 unsafe {
-                    self.alloc.grow(
-                        NonNull::new_unchecked(self.segments).cast(),
-                        old_layout,
-                        backbone_layout,
-                    )
+                    self.alloc
+                        .grow(self.segments.cast(), old_layout, backbone_layout)
                 }
             };
 
             let new_ptr = new_segments
                 .map_err(|_| TryReserveError::alloc_error(backbone_layout))?
                 .cast::<*mut u8>();
-            self.segments = new_ptr.as_ptr();
+            self.segments = new_ptr;
             self.segments_cap = new_cap;
         }
 
         // For ZSTs, we use a dangling pointer and don't actually allocate
         if elem_layout.size() == 0 {
             let ptr = NonNull::<u8>::dangling().as_ptr();
-            self.segments.add(self.segment_count).write(ptr);
+            self.segments.as_ptr().add(self.segment_count).write(ptr);
             self.segment_count += 1;
             return Ok((ptr, usize::MAX));
         }
@@ -504,7 +501,10 @@ impl<A: Allocator> RawSegmentedVecInner<A> {
             .map_err(|_| TryReserveError::alloc_error(layout))?;
 
         let segment_ptr = ptr.as_ptr() as *mut u8;
-        self.segments.add(self.segment_count).write(segment_ptr);
+        self.segments
+            .as_ptr()
+            .add(self.segment_count)
+            .write(segment_ptr);
         self.segment_count += 1;
         Ok((segment_ptr, segment_cap))
     }
@@ -622,11 +622,14 @@ impl<A: Allocator> RawSegmentedVecInner<A> {
                 elem_layout.align(),
             );
 
-            let ptr = self.segments.add(segment_idx).read();
+            let ptr = self.segments.as_ptr().add(segment_idx).read();
             if let Some(ptr) = NonNull::new(ptr) {
                 self.alloc.deallocate(ptr, layout);
             }
-            self.segments.add(segment_idx).write(std::ptr::null_mut());
+            self.segments
+                .as_ptr()
+                .add(segment_idx)
+                .write(std::ptr::null_mut());
         }
 
         Ok(())
@@ -641,7 +644,7 @@ impl<A: Allocator> RawSegmentedVecInner<A> {
                     elem_layout.size() * segment_cap,
                     elem_layout.align(),
                 );
-                let ptr = self.segments.add(i).read();
+                let ptr = self.segments.as_ptr().add(i).read();
                 if let Some(ptr) = NonNull::new(ptr) {
                     self.alloc.deallocate(ptr, layout);
                 }
@@ -650,10 +653,7 @@ impl<A: Allocator> RawSegmentedVecInner<A> {
 
         if self.segments_cap > 0 {
             let backbone_layout = Layout::array::<*mut u8>(self.segments_cap).unwrap();
-            self.alloc.deallocate(
-                NonNull::new_unchecked(self.segments).cast(),
-                backbone_layout,
-            );
+            self.alloc.deallocate(self.segments.cast(), backbone_layout);
         }
     }
 }

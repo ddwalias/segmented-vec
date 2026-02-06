@@ -2,6 +2,7 @@ use crate::raw_vec::RawSegmentedVec;
 use crate::SegmentedVec;
 use allocator_api2::alloc::Global;
 use core::marker::PhantomData;
+use std::ptr::NonNull;
 
 /// Helper trait for FromIterator implementation
 /// Uses size_hint to optimize when exact size is known
@@ -46,8 +47,11 @@ unsafe fn from_iter_exact_size<T, I: Iterator<Item = T>>(
     let mut buf: RawSegmentedVec<T, Global> = RawSegmentedVec::new_in(Global);
 
     let mut i = 0;
-    let mut write_ptr: *mut T = core::ptr::null_mut();
-    let mut segment_end: *mut T = core::ptr::null_mut();
+
+    // Initializing to dangling/null equivalent for logic,
+    // but these will be overwritten before usage in loop if length > 0
+    let mut write_ptr: *mut T = NonNull::dangling().as_ptr();
+    let mut segment_end: *mut T = NonNull::dangling().as_ptr();
 
     while i < length {
         // grow_one returns (segment_ptr, segment_capacity)
@@ -77,8 +81,8 @@ unsafe fn from_iter_exact_size<T, I: Iterator<Item = T>>(
     SegmentedVec {
         buf,
         len: length,
-        write_ptr,
-        segment_end,
+        write_ptr: NonNull::new_unchecked(write_ptr),
+        segment_end: NonNull::new_unchecked(segment_end),
         active_segment_index,
         _marker: PhantomData,
     }

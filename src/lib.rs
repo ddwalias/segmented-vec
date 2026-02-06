@@ -38,7 +38,10 @@ pub use drain::Drain;
 pub use into_iter::IntoIter;
 pub use peek_mut::PeekMut;
 pub use slice::index::SliceIndex;
-pub use slice::{Chunks, ChunksExact, RChunks, SegmentedSlice, SliceIter, SliceIterMut, Windows};
+pub use slice::{
+    Chunks, ChunksExact, RChunks, SegmentedSlice, SegmentedSliceMut, SliceIter, SliceIterMut,
+    Windows,
+};
 pub use slice::{SliceIter as Iter, SliceIterMut as IterMut};
 
 use raw_vec::RawSegmentedVec;
@@ -47,6 +50,7 @@ use std::alloc::Layout;
 use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
+use std::ptr::NonNull;
 
 /// The error type for `try_reserve` operations.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -112,9 +116,9 @@ pub struct SegmentedVec<T, A: Allocator = Global> {
     /// Number of initialized elements
     pub(crate) len: usize,
     /// Cached pointer to the next write position (for fast push)
-    pub(crate) write_ptr: *mut T,
+    pub(crate) write_ptr: NonNull<T>,
     /// Pointer to the end of the current segment
-    pub(crate) segment_end: *mut T,
+    pub(crate) segment_end: NonNull<T>,
     /// Index of the current active segment
     pub(crate) active_segment_index: usize,
     /// Marker for drop check
@@ -187,10 +191,13 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
         let (write_ptr, segment_end) = if capacity > 0 && buf.segment_count() > 0 {
             unsafe {
                 let ptr: *mut T = buf.segment_ptr(0);
-                (ptr, ptr.add(RawSegmentedVec::<T, A>::segment_capacity(0)))
+                (
+                    NonNull::new_unchecked(ptr),
+                    NonNull::new_unchecked(ptr.add(RawSegmentedVec::<T, A>::segment_capacity(0))),
+                )
             }
         } else {
-            (std::ptr::null_mut(), std::ptr::null_mut())
+            (NonNull::dangling(), NonNull::dangling())
         };
 
         Self {
@@ -207,8 +214,8 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
     #[inline]
     fn update_write_ptr_for_len(&mut self, len: usize) {
         if self.buf.segment_count() == 0 {
-            self.write_ptr = std::ptr::null_mut();
-            self.segment_end = std::ptr::null_mut();
+            self.write_ptr = NonNull::dangling();
+            self.segment_end = NonNull::dangling();
             self.active_segment_index = usize::MAX;
             return;
         }
@@ -217,9 +224,10 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
             // Point to start of first segment
             unsafe {
                 self.active_segment_index = 0;
-                self.write_ptr = self.buf.segment_ptr(0);
+                let ptr = self.buf.segment_ptr(0);
+                self.write_ptr = NonNull::new_unchecked(ptr);
                 let cap = RawSegmentedVec::<T, A>::segment_capacity(0);
-                self.segment_end = self.write_ptr.add(cap);
+                self.segment_end = NonNull::new_unchecked(ptr.add(cap));
             }
         } else {
             // Find segment and offset for current length
@@ -241,8 +249,8 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
             unsafe {
                 self.active_segment_index = seg_idx;
                 let seg_ptr = self.buf.segment_ptr(seg_idx);
-                self.write_ptr = seg_ptr.add(offset);
-                self.segment_end = seg_ptr.add(seg_cap);
+                self.write_ptr = NonNull::new_unchecked(seg_ptr.add(offset));
+                self.segment_end = NonNull::new_unchecked(seg_ptr.add(seg_cap));
             }
         }
     }
@@ -273,18 +281,18 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
 
                 if this.active_segment_index >= this.buf.segment_count() {
                     let (ptr, cap) = this.buf.grow_one();
-                    this.write_ptr = ptr;
-                    this.segment_end = ptr.add(cap);
+                    this.write_ptr = NonNull::new_unchecked(ptr);
+                    this.segment_end = NonNull::new_unchecked(ptr.add(cap));
                 } else {
                     let ptr = this.buf.segment_ptr(this.active_segment_index);
                     let cap = RawSegmentedVec::<T, A>::segment_capacity(this.active_segment_index);
-                    this.write_ptr = ptr;
-                    this.segment_end = ptr.add(cap);
+                    this.write_ptr = NonNull::new_unchecked(ptr);
+                    this.segment_end = NonNull::new_unchecked(ptr.add(cap));
                 }
 
-                let ptr = this.write_ptr;
+                let ptr = this.write_ptr.as_ptr();
                 std::ptr::write(ptr, value);
-                this.write_ptr = ptr.add(1);
+                this.write_ptr = NonNull::new_unchecked(ptr.add(1));
                 this.len += 1;
                 &mut *ptr
             }
@@ -293,9 +301,9 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
         // Fast path: we have space in the current segment
         if self.write_ptr < self.segment_end {
             unsafe {
-                let ptr = self.write_ptr;
+                let ptr = self.write_ptr.as_ptr();
                 std::ptr::write(ptr, value);
-                self.write_ptr = ptr.add(1);
+                self.write_ptr = NonNull::new_unchecked(ptr.add(1));
                 self.len += 1;
                 return &mut *ptr;
             }
@@ -311,8 +319,8 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
         Self {
             buf: RawSegmentedVec::new_in(alloc),
             len: 0,
-            write_ptr: std::ptr::null_mut(),
-            segment_end: std::ptr::null_mut(),
+            write_ptr: NonNull::dangling(),
+            segment_end: NonNull::dangling(),
             active_segment_index: usize::MAX,
             _marker: PhantomData,
         }
@@ -328,10 +336,13 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
         let (write_ptr, segment_end) = if capacity > 0 && buf.segment_count() > 0 {
             unsafe {
                 let ptr: *mut T = buf.segment_ptr(0);
-                (ptr, ptr.add(RawSegmentedVec::<T, A>::segment_capacity(0)))
+                (
+                    NonNull::new_unchecked(ptr),
+                    NonNull::new_unchecked(ptr.add(RawSegmentedVec::<T, A>::segment_capacity(0))),
+                )
             }
         } else {
-            (std::ptr::null_mut(), std::ptr::null_mut())
+            (NonNull::dangling(), NonNull::dangling())
         };
 
         Ok(Self {
@@ -377,8 +388,8 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
                     )
                 };
 
-                self.write_ptr = ptr;
-                self.segment_end = ptr.add(cap);
+                self.write_ptr = NonNull::new_unchecked(ptr);
+                self.segment_end = NonNull::new_unchecked(ptr.add(cap));
             }
         }
     }
@@ -403,8 +414,8 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
                     )
                 };
 
-                self.write_ptr = ptr;
-                self.segment_end = ptr.add(cap);
+                self.write_ptr = NonNull::new_unchecked(ptr);
+                self.segment_end = NonNull::new_unchecked(ptr.add(cap));
             }
         }
         Ok(())
@@ -425,7 +436,7 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
                 // Logic: segment_end = start + capacity
                 // If write_ptr == start, then write_ptr + capacity == segment_end.
                 let seg_cap = RawSegmentedVec::<T, A>::segment_capacity(self.active_segment_index);
-                if unsafe { self.write_ptr.add(seg_cap) } == self.segment_end {
+                if unsafe { self.write_ptr.as_ptr().add(seg_cap) } == self.segment_end.as_ptr() {
                     self.active_segment_index
                 } else {
                     self.active_segment_index.wrapping_add(1)
@@ -454,7 +465,8 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
                 } else {
                     let seg_cap =
                         RawSegmentedVec::<T, A>::segment_capacity(self.active_segment_index);
-                    if unsafe { self.write_ptr.add(seg_cap) } == self.segment_end {
+                    if unsafe { self.write_ptr.as_ptr().add(seg_cap) } == self.segment_end.as_ptr()
+                    {
                         self.active_segment_index
                     } else {
                         self.active_segment_index + 1
@@ -567,11 +579,11 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
                 // The hole IS the last element, just update len and pointers
                 // Use the same logic as pop's fast path
                 let seg_cap = RawSegmentedVec::<T, A>::segment_capacity(self.active_segment_index);
-                let segment_start = self.segment_end.sub(seg_cap);
+                let segment_start = self.segment_end.as_ptr().sub(seg_cap);
 
                 self.len -= 1;
-                if self.write_ptr > segment_start {
-                    self.write_ptr = self.write_ptr.sub(1);
+                if self.write_ptr.as_ptr() > segment_start {
+                    self.write_ptr = NonNull::new_unchecked(self.write_ptr.as_ptr().sub(1));
                 } else {
                     // At segment boundary - recalculate pointers
                     self.update_write_ptr_for_len(self.len);
@@ -987,23 +999,23 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
             unsafe {
                 let ptr = this.buf.segment_ptr(this.active_segment_index);
                 let cap = RawSegmentedVec::<T, A>::segment_capacity(this.active_segment_index);
-                this.segment_end = ptr.add(cap);
-                this.write_ptr = this.segment_end.sub(1);
+                this.segment_end = NonNull::new_unchecked(ptr.add(cap));
+                this.write_ptr = NonNull::new_unchecked(this.segment_end.as_ptr().sub(1));
                 this.len -= 1;
-                std::ptr::read(this.write_ptr)
+                std::ptr::read(this.write_ptr.as_ptr())
             }
         }
 
         // Compute segment start from segment_end and capacity
         let seg_cap = RawSegmentedVec::<T, A>::segment_capacity(self.active_segment_index);
-        let segment_start = unsafe { self.segment_end.sub(seg_cap) };
+        let segment_start = unsafe { self.segment_end.as_ptr().sub(seg_cap) };
 
         // Fast path: we're not at the segment boundary
-        if self.write_ptr > segment_start {
+        if self.write_ptr.as_ptr() > segment_start {
             unsafe {
-                self.write_ptr = self.write_ptr.sub(1);
+                self.write_ptr = NonNull::new_unchecked(self.write_ptr.as_ptr().sub(1));
                 self.len -= 1;
-                Some(std::ptr::read(self.write_ptr))
+                Some(std::ptr::read(self.write_ptr.as_ptr()))
             }
         } else {
             // Slow path: segment boundary crossing
@@ -1073,12 +1085,13 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
                     // Update write_ptr and potentially move to next segment
                     if dst_off + to_copy >= dst_seg_cap && self.len < self.buf.capacity() {
                         self.active_segment_index += 1;
-                        self.segment_end =
+                        self.segment_end = NonNull::new_unchecked(
                             self.buf
                                 .segment_ptr(self.active_segment_index)
                                 .add(RawSegmentedVec::<T, A>::segment_capacity(
                                     self.active_segment_index,
-                                ));
+                                )),
+                        );
                     }
                 }
 
@@ -1270,13 +1283,13 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
     /// Returns an iterator over the vector.
     #[inline]
     pub fn iter(&self) -> Iter<'_, T, A> {
-        Iter::new(&self.buf, 0, self.len)
+        Iter::new(&self.as_slice())
     }
 
     /// Returns a mutable iterator over the vector.
     #[inline]
     pub fn iter_mut(&mut self) -> IterMut<'_, T, A> {
-        IterMut::new(&self.buf, 0, self.len)
+        IterMut::new(&mut self.as_mut_slice())
     }
 
     // =========================================================================
@@ -1723,8 +1736,8 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
                     &self.buf as *const RawSegmentedVec<T, A> as *const RawSegmentedVec<U, A>,
                 ),
                 len: 0,
-                write_ptr: std::ptr::null_mut(),
-                segment_end: std::ptr::null_mut(),
+                write_ptr: NonNull::dangling(),
+                segment_end: NonNull::dangling(),
                 active_segment_index: 0,
                 _marker: PhantomData,
             };
@@ -1752,18 +1765,18 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
                     // SAFETY: We verified capacity exists, so next segment is allocated.
                     unsafe {
                         let ptr = self.buf.segment_ptr(self.active_segment_index);
-                        self.write_ptr = ptr;
+                        self.write_ptr = NonNull::new_unchecked(ptr);
                         let cap =
                             RawSegmentedVec::<T, A>::segment_capacity(self.active_segment_index);
-                        self.segment_end = ptr.add(cap);
+                        self.segment_end = NonNull::new_unchecked(ptr.add(cap));
                     }
                 }
             }
 
             // SAFETY: We verified write_ptr < segment_end (or made space)
             unsafe {
-                let mut ptr = self.write_ptr;
-                let end = self.segment_end;
+                let mut ptr = self.write_ptr.as_ptr();
+                let end = self.segment_end.as_ptr();
 
                 // Write the first item verified by the outer loop
                 std::ptr::write(ptr, item);
@@ -1775,17 +1788,17 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
                         ptr = ptr.add(1);
                     } else {
                         // Iterator exhausted
-                        let count = ptr.offset_from(self.write_ptr) as usize;
+                        let count = ptr.offset_from(self.write_ptr.as_ptr()) as usize;
                         self.len += count;
-                        self.write_ptr = ptr;
+                        self.write_ptr = NonNull::new_unchecked(ptr);
                         return;
                     }
                 }
 
                 // Segment full
-                let count = ptr.offset_from(self.write_ptr) as usize;
+                let count = ptr.offset_from(self.write_ptr.as_ptr()) as usize;
                 self.len += count;
-                self.write_ptr = ptr;
+                self.write_ptr = NonNull::new_unchecked(ptr);
             }
         }
     }

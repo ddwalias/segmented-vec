@@ -5,6 +5,7 @@
 
 use crate::SegmentedVec;
 use allocator_api2::alloc::Allocator;
+use std::ptr::NonNull;
 
 /// Extend using runtime size_hint check.
 /// If size_hint provides an exact count (lower == upper), use incremental allocation.
@@ -55,7 +56,7 @@ fn extend_with_exact_count<T, A: Allocator, I: Iterator<Item = T>>(
     unsafe {
         while remaining > 0 {
             // Check if current segment has space
-            if vec.write_ptr >= vec.segment_end || vec.write_ptr.is_null() {
+            if vec.write_ptr >= vec.segment_end {
                 // Check if we have a next segment available
                 // Note: active_segment_index is initialized to usize::MAX when empty,
                 // so we use wrapping_add to check for segment 0.
@@ -64,30 +65,31 @@ fn extend_with_exact_count<T, A: Allocator, I: Iterator<Item = T>>(
                     // Reuse existing next segment
                     vec.active_segment_index = next_seg;
                     let ptr = vec.buf.segment_ptr(next_seg);
-                    vec.write_ptr = ptr;
+                    vec.write_ptr = NonNull::new_unchecked(ptr);
                     let cap = crate::RawSegmentedVec::<T, A>::segment_capacity(next_seg);
-                    vec.segment_end = ptr.add(cap);
+                    vec.segment_end = NonNull::new_unchecked(ptr.add(cap));
                 } else {
                     // Need a new segment
                     // grow_one returns (segment_ptr, segment_capacity)
                     let (seg_ptr, seg_cap) = vec.buf.grow_one();
                     let seg_idx = vec.buf.segment_count() - 1;
-                    vec.write_ptr = seg_ptr;
-                    vec.segment_end = seg_ptr.add(seg_cap);
+                    vec.write_ptr = NonNull::new_unchecked(seg_ptr);
+                    vec.segment_end = NonNull::new_unchecked(seg_ptr.add(seg_cap));
                     vec.active_segment_index = seg_idx;
                 }
             }
 
             // Calculate how many elements fit in current segment
-            let space = vec.segment_end.offset_from(vec.write_ptr) as usize;
+            // Use as_ptr() for pointer arithmetic
+            let space = vec.segment_end.as_ptr().offset_from(vec.write_ptr.as_ptr()) as usize;
             let batch = std::cmp::min(remaining, space);
 
             // Fill current segment
             for _ in 0..batch {
                 // SAFETY: We verified exact size from size_hint
                 let element = iter.next().unwrap_unchecked();
-                std::ptr::write(vec.write_ptr, element);
-                vec.write_ptr = vec.write_ptr.add(1);
+                std::ptr::write(vec.write_ptr.as_ptr(), element);
+                vec.write_ptr = NonNull::new_unchecked(vec.write_ptr.as_ptr().add(1));
             }
 
             vec.len += batch;
