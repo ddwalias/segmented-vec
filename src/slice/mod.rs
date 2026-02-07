@@ -2257,13 +2257,6 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
     /// Panics if the range is out of bounds.
     #[inline]
     #[track_caller]
-    /// Returns a slice over the given range.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the range is out of bounds.
-    #[inline]
-    #[track_caller]
     pub fn slice<R: RangeBounds<usize>>(&self, range: R) -> SegmentedSlice<'_, T, A> {
         let start = match range.start_bound() {
             std::ops::Bound::Included(&n) => n,

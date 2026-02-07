@@ -5,6 +5,7 @@
 //! - Mutable chunk iterators (`ChunksMut`, `ChunksExactMut`, etc.)
 
 use allocator_api2::alloc::{Allocator, Global};
+use std::cmp;
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
 use std::num::NonZero;
@@ -537,7 +538,13 @@ where
 
         loop {
             if iter.remaining == 0 {
-                return self.finish();
+                if self.finished || self.slice.is_empty() {
+                    self.finished = true;
+                    return None;
+                } else {
+                    self.finished = true;
+                    return Some(self.slice);
+                }
             }
 
             // SAFETY: iter.remaining > 0 means ptr is valid
@@ -598,7 +605,13 @@ where
 
         loop {
             if iter.remaining == 0 {
-                return self.finish();
+                if self.finished || self.slice.is_empty() {
+                    self.finished = true;
+                    return None;
+                } else {
+                    self.finished = true;
+                    return Some(self.slice);
+                }
             }
 
             // SAFETY: iter.remaining > 0 means back_ptr is valid
@@ -643,21 +656,6 @@ where
 
             iter.next_back();
             consumed += 1;
-        }
-    }
-}
-
-impl<'a, T, A: Allocator + 'a, P> SplitIter for SplitInclusive<'a, T, A, P>
-where
-    P: FnMut(&T) -> bool,
-{
-    #[inline]
-    fn finish(&mut self) -> Option<SegmentedSlice<'a, T, A>> {
-        if self.finished {
-            None
-        } else {
-            self.finished = true;
-            Some(self.slice)
         }
     }
 }
@@ -945,8 +943,13 @@ where
 
         loop {
             if iter.remaining == 0 {
-                self.slice = slice;
-                return self.finish();
+                if self.finished || slice.is_empty() {
+                    self.finished = true;
+                    return None;
+                } else {
+                    self.finished = true;
+                    return Some(slice);
+                }
             }
 
             // SAFETY: iter.remaining > 0 means iter.ptr is valid
@@ -1026,8 +1029,13 @@ where
 
         loop {
             if iter.remaining == 0 {
-                self.slice = slice;
-                return self.finish();
+                if self.finished || slice.is_empty() {
+                    self.finished = true;
+                    return None;
+                } else {
+                    self.finished = true;
+                    return Some(slice);
+                }
             }
 
             // SAFETY: iter.remaining > 0 means back_ptr is valid
@@ -1069,35 +1077,6 @@ where
 
             iter.next_back();
             consumed += 1;
-        }
-    }
-}
-
-impl<'a, T, A: Allocator + 'a, P> SplitIter for SplitInclusiveMut<'a, T, A, P>
-where
-    P: FnMut(&T) -> bool,
-{
-    #[inline]
-    fn finish(&mut self) -> Option<SegmentedSliceMut<'a, T, A>> {
-        if self.finished {
-            None
-        } else {
-            self.finished = true;
-            // Capture fields before borrowing slice mutably
-            let slice_buf = self.slice.buf;
-            let slice_start = self.slice.start;
-
-            Some(std::mem::replace(
-                &mut self.slice,
-                SegmentedSliceMut {
-                    buf: slice_buf,
-                    start: slice_start,
-                    len: 0,
-                    end_ptr: NonNull::dangling(),
-                    end_seg: 0,
-                    _marker: PhantomData,
-                },
-            ))
         }
     }
 }
@@ -1157,6 +1136,16 @@ where
     }
 }
 
+impl<'a, T, A: Allocator + 'a, P> SplitIter for RSplit<'a, T, A, P>
+where
+    P: FnMut(&T) -> bool,
+{
+    #[inline]
+    fn finish(&mut self) -> Option<SegmentedSlice<'a, T, A>> {
+        self.inner.finish()
+    }
+}
+
 impl<'a, T, A: Allocator + 'a, P> FusedIterator for RSplit<'a, T, A, P> where P: FnMut(&T) -> bool {}
 
 #[derive(Debug)]
@@ -1165,6 +1154,16 @@ where
     P: FnMut(&T) -> bool,
 {
     inner: SplitMut<'a, T, A, P>,
+}
+
+impl<'a, T, A: Allocator + 'a, P> SplitIter for RSplitMut<'a, T, A, P>
+where
+    P: FnMut(&T) -> bool,
+{
+    #[inline]
+    fn finish(&mut self) -> Option<SegmentedSliceMut<'a, T, A>> {
+        self.inner.finish()
+    }
 }
 
 impl<'a, T, A: Allocator + 'a, P: FnMut(&T) -> bool> RSplitMut<'a, T, A, P> {
@@ -1205,6 +1204,43 @@ where
 impl<'a, T, A: Allocator + 'a, P> FusedIterator for RSplitMut<'a, T, A, P> where P: FnMut(&T) -> bool
 {}
 
+/// An private iterator over subslices separated by elements that
+/// match a predicate function, splitting at most a fixed number of
+/// times.
+#[derive(Debug)]
+struct GenericSplitN<I> {
+    iter: I,
+    count: usize,
+}
+
+impl<T, I: SplitIter<Item = T>> Iterator for GenericSplitN<I> {
+    type Item = T;
+
+    #[inline]
+    fn next(&mut self) -> Option<T> {
+        match self.count {
+            0 => None,
+            1 => {
+                self.count -= 1;
+                self.iter.finish()
+            }
+            _ => {
+                self.count -= 1;
+                self.iter.next()
+            }
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let (lower, upper_opt) = self.iter.size_hint();
+        (
+            cmp::min(self.count, lower),
+            Some(upper_opt.map_or(self.count, |upper| cmp::min(self.count, upper))),
+        )
+    }
+}
+
 /// An iterator over subslices separated by elements that match a predicate
 /// function, limited to a given number of splits.
 ///
@@ -1215,16 +1251,17 @@ pub struct SplitN<'a, T, A: Allocator + 'a, P>
 where
     P: FnMut(&T) -> bool,
 {
-    inner: Split<'a, T, A, P>,
-    count: usize,
+    inner: GenericSplitN<Split<'a, T, A, P>>,
 }
 
 impl<'a, T, A: Allocator + 'a, P: FnMut(&T) -> bool> SplitN<'a, T, A, P> {
     #[inline]
     pub(crate) fn new(slice: SegmentedSlice<'a, T, A>, n: usize, pred: P) -> Self {
         Self {
-            inner: Split::new(slice, pred),
-            count: n,
+            inner: GenericSplitN {
+                iter: Split::new(slice, pred),
+                count: n,
+            },
         }
     }
 }
@@ -1237,36 +1274,12 @@ where
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        match self.count {
-            0 => None,
-            1 => {
-                self.count = 0;
-                if self.inner.finished {
-                    None
-                } else {
-                    self.inner.finished = true;
-                    let slice = &self.inner.slice;
-                    Some(SegmentedSlice::new(
-                        slice.buf,
-                        slice.start,
-                        slice.start + slice.len,
-                    ))
-                }
-            }
-            _ => {
-                self.count -= 1;
-                self.inner.next()
-            }
-        }
+        self.inner.next()
     }
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let (lower, upper) = self.inner.size_hint();
-        (
-            std::cmp::min(self.count, lower),
-            Some(upper.map_or(self.count, |u| std::cmp::min(self.count, u))),
-        )
+        self.inner.size_hint()
     }
 }
 
@@ -1282,16 +1295,17 @@ pub struct RSplitN<'a, T, A: Allocator + 'a, P>
 where
     P: FnMut(&T) -> bool,
 {
-    inner: RSplit<'a, T, A, P>,
-    count: usize,
+    inner: GenericSplitN<RSplit<'a, T, A, P>>,
 }
 
 impl<'a, T, A: Allocator + 'a, P: FnMut(&T) -> bool> RSplitN<'a, T, A, P> {
     #[inline]
     pub(crate) fn new(slice: SegmentedSlice<'a, T, A>, n: usize, pred: P) -> Self {
         Self {
-            inner: RSplit::new(slice, pred),
-            count: n,
+            inner: GenericSplitN {
+                iter: RSplit::new(slice, pred),
+                count: n,
+            },
         }
     }
 }
@@ -1304,36 +1318,12 @@ where
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        match self.count {
-            0 => None,
-            1 => {
-                self.count = 0;
-                if self.inner.inner.finished {
-                    None
-                } else {
-                    self.inner.inner.finished = true;
-                    let slice = &self.inner.inner.slice;
-                    Some(SegmentedSlice::new(
-                        slice.buf,
-                        slice.start,
-                        slice.start + slice.len,
-                    ))
-                }
-            }
-            _ => {
-                self.count -= 1;
-                self.inner.next()
-            }
-        }
+        self.inner.next()
     }
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let (lower, upper) = self.inner.size_hint();
-        (
-            std::cmp::min(self.count, lower),
-            Some(upper.map_or(self.count, |u| std::cmp::min(self.count, u))),
-        )
+        self.inner.size_hint()
     }
 }
 
@@ -1369,7 +1359,6 @@ impl<'a, T, A: Allocator + 'a> ChunksMut<'a, T, A> {
 impl<'a, T, A: Allocator + 'a> Iterator for ChunksMut<'a, T, A> {
     type Item = SegmentedSliceMut<'a, T, A>;
 
-    #[inline]
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.start >= self.end {
@@ -1463,7 +1452,6 @@ impl<'a, T, A: Allocator + 'a> ChunksExactMut<'a, T, A> {
 
     /// Returns the remainder of the original slice that is not covered by
     /// the iterator.
-    #[inline]
     #[inline]
     pub fn into_remainder(self) -> SegmentedSliceMut<'a, T, A> {
         SegmentedSliceMut::new(self.buf, self.end, self.full_end)
