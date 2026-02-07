@@ -1773,6 +1773,24 @@ impl<'a, T, A: Allocator> SegmentedSliceMut<'a, T, A> {
         }
     }
 
+    /// Returns an iterator over mutable subslices separated by elements that match `pred`.
+    #[inline]
+    pub fn split_mut<P>(&mut self, pred: P) -> iter::SplitMut<'_, T, A, P>
+    where
+        P: FnMut(&T) -> bool,
+    {
+        iter::SplitMut::new(self.slice_mut(..), pred)
+    }
+
+    /// Returns an iterator over mutable subslices separated by elements that match `pred`, starting from the end.
+    #[inline]
+    pub fn rsplit_mut<P>(&mut self, pred: P) -> iter::RSplitMut<'_, T, A, P>
+    where
+        P: FnMut(&T) -> bool,
+    {
+        iter::RSplitMut::new(self.slice_mut(..), pred)
+    }
+
     /// Sorts the slice.
     ///
     /// This sort is stable (i.e., does not reorder equal elements) and O(n * log(n)) worst-case.

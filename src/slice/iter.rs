@@ -316,6 +316,7 @@ impl<'a, T, A: Allocator> SliceIterMut<'a, T, A> {
 /// This struct is created by the [`split`] method on [`SegmentedSlice`].
 ///
 /// [`split`]: SegmentedSlice::split
+#[derive(Debug, Clone)]
 pub struct Split<'a, T, A: Allocator + 'a, P>
 where
     P: FnMut(&T) -> bool,
@@ -354,42 +355,57 @@ where
             return None;
         }
 
-        // Find the position of the next matching element
-        let mut idx = None;
-        for (i, elem) in self.slice.iter().enumerate() {
-            if (self.pred)(elem) {
-                idx = Some(i);
-                break;
-            }
-        }
+        let mut iter = self.slice.iter();
+        let mut consumed = 0;
 
-        match idx {
-            None => {
+        loop {
+            if iter.remaining == 0 {
                 self.finished = true;
                 // Return the remaining slice
-                let result = SegmentedSlice::new(
-                    self.slice.buf,
-                    self.slice.start,
-                    self.slice.start + self.slice.len,
-                );
-                self.slice = SegmentedSlice::new(
-                    self.slice.buf,
-                    self.slice.start + self.slice.len,
-                    self.slice.start + self.slice.len,
-                );
-                Some(result)
+                let result = self.slice;
+                self.slice = SegmentedSlice {
+                    buf: self.slice.buf,
+                    start: self.slice.start + self.slice.len,
+                    len: 0,
+                    end_ptr: self.slice.end_ptr,
+                    end_seg: self.slice.end_seg,
+                    _marker: PhantomData,
+                };
+                return Some(result);
             }
-            Some(idx) => {
-                let result =
-                    SegmentedSlice::new(self.slice.buf, self.slice.start, self.slice.start + idx);
-                // Skip the separator element
-                self.slice = SegmentedSlice::new(
-                    self.slice.buf,
-                    self.slice.start + idx + 1,
-                    self.slice.start + self.slice.len,
-                );
-                Some(result)
+
+            // SAFETY: iter.remaining > 0 means ptr is valid
+            let element = unsafe { &*iter.ptr.as_ptr() };
+
+            if (self.pred)(element) {
+                // Match found!
+                let result = SegmentedSlice {
+                    buf: self.slice.buf,
+                    start: self.slice.start,
+                    len: consumed,
+                    end_ptr: iter.ptr, // Reuse the pointer we stopped at
+                    end_seg: iter.seg, // Reuse the segment index
+                    _marker: PhantomData,
+                };
+
+                // Advance past the separator
+                iter.next();
+
+                // Update slice to start after the separator
+                self.slice = SegmentedSlice {
+                    buf: self.slice.buf,
+                    start: self.slice.start + consumed + 1,
+                    len: iter.remaining, // Only remains what's left in the iterator
+                    end_ptr: self.slice.end_ptr, // Original end is preserved
+                    end_seg: self.slice.end_seg,
+                    _marker: PhantomData,
+                };
+
+                return Some(result);
             }
+
+            iter.next();
+            consumed += 1;
         }
     }
 
@@ -414,38 +430,58 @@ where
             return None;
         }
 
-        // Find the position of the last matching element
-        let mut idx = None;
-        for (i, elem) in self.slice.iter().enumerate().rev() {
-            if (self.pred)(elem) {
-                idx = Some(i);
-                break;
-            }
-        }
+        let mut iter = self.slice.iter();
+        let mut consumed = 0;
 
-        match idx {
-            None => {
+        loop {
+            if iter.remaining == 0 {
                 self.finished = true;
-                let result = SegmentedSlice::new(
-                    self.slice.buf,
-                    self.slice.start,
-                    self.slice.start + self.slice.len,
-                );
-                self.slice =
-                    SegmentedSlice::new(self.slice.buf, self.slice.start, self.slice.start);
-                Some(result)
+                let result = self.slice;
+                self.slice = SegmentedSlice {
+                    buf: self.slice.buf,
+                    start: self.slice.start,
+                    len: 0,
+                    end_ptr: iter.ptr,
+                    end_seg: iter.seg,
+                    _marker: PhantomData,
+                };
+                return Some(result);
             }
-            Some(idx) => {
-                let result = SegmentedSlice::new(
-                    self.slice.buf,
-                    self.slice.start + idx + 1,
-                    self.slice.start + self.slice.len,
-                );
-                // Update slice to exclude the separator and everything after
-                self.slice =
-                    SegmentedSlice::new(self.slice.buf, self.slice.start, self.slice.start + idx);
-                Some(result)
+
+            // SAFETY: iter.remaining > 0 means back_ptr is valid
+            let element = unsafe { &*iter.back_ptr.as_ptr() };
+
+            if (self.pred)(element) {
+                let result_start = self.slice.start + iter.remaining;
+
+                let result = SegmentedSlice {
+                    buf: self.slice.buf,
+                    start: result_start,
+                    len: consumed,
+                    end_ptr: self.slice.end_ptr,
+                    end_seg: self.slice.end_seg,
+                    _marker: PhantomData,
+                };
+
+                // Capture separator pointer/seg BEFORE advancing
+                let separator_ptr = iter.back_ptr;
+                let separator_seg = iter.back_seg;
+
+                iter.next_back();
+
+                self.slice = SegmentedSlice {
+                    buf: self.slice.buf,
+                    start: self.slice.start,
+                    len: iter.remaining,
+                    end_ptr: separator_ptr,
+                    end_seg: separator_seg,
+                    _marker: PhantomData,
+                };
+                return Some(result);
             }
+
+            iter.next_back();
+            consumed += 1;
         }
     }
 }
@@ -505,11 +541,14 @@ where
         }
 
         let result = SegmentedSlice::new(self.slice.buf, self.slice.start, self.slice.start + idx);
-        self.slice = SegmentedSlice::new(
-            self.slice.buf,
-            self.slice.start + idx,
-            self.slice.start + self.slice.len,
-        );
+        self.slice = SegmentedSlice {
+            buf: self.slice.buf,
+            start: self.slice.start + idx,
+            len: self.slice.len - idx,
+            end_ptr: self.slice.end_ptr,
+            end_seg: self.slice.end_seg,
+            _marker: PhantomData,
+        };
         Some(result)
     }
 
@@ -1712,51 +1751,71 @@ where
             return None;
         }
 
-        // Find the position of the next matching element
-        let mut idx = None;
-        // SegmentedSliceMut::iter() returns mutable references, but we only need to read for predicate.
-        // But predicate takes &T. So &mut T -> &T coercion works? Yes.
-        // Wait, iter() consumes self? No, iter() on reference.
-        // But self.slice is owned SegmentedSliceMut.
-        // We can create iterator from reference to self.slice.
-        for (i, elem) in self.slice.iter().enumerate() {
-            if (self.pred)(elem) {
-                idx = Some(i);
-                break;
-            }
-        }
+        // Capture fields before borrowing slice mutably for replace and loop
+        let slice_buf = self.slice.buf;
+        let slice_start = self.slice.start;
+        let slice_len = self.slice.len;
+        let slice_end_ptr = self.slice.end_ptr;
+        let slice_end_seg = self.slice.end_seg;
 
-        match idx {
-            None => {
+        // Take the slice to avoid mutable borrow conflict during iteration
+        let mut slice = std::mem::replace(
+            &mut self.slice,
+            SegmentedSliceMut {
+                buf: slice_buf,
+                start: slice_start + slice_len,
+                len: 0,
+                end_ptr: NonNull::dangling(), // Temporary, will be overwritten if match
+                end_seg: 0,
+                _marker: PhantomData,
+            },
+        );
+
+        let mut iter = slice.iter_mut();
+        let mut consumed = 0;
+
+        loop {
+            if iter.remaining == 0 {
                 self.finished = true;
-                // Return the remaining slice
-                let result = SegmentedSliceMut::new(
-                    self.slice.buf,
-                    self.slice.start,
-                    self.slice.start + self.slice.len,
-                );
-                // Set slice to empty
-                self.slice = SegmentedSliceMut::new(
-                    self.slice.buf,
-                    self.slice.start + self.slice.len,
-                    self.slice.start + self.slice.len,
-                );
-                Some(result)
+                // iter is exhausted, slice is fully consumed.
+                // We return the original slice (which is now in `slice`).
+                // self.slice is already empty from the replace.
+                return Some(slice);
             }
-            Some(idx) => {
-                let result = SegmentedSliceMut::new(
-                    self.slice.buf,
-                    self.slice.start,
-                    self.slice.start + idx,
-                );
-                // Skip the separator element
-                self.slice = SegmentedSliceMut::new(
-                    self.slice.buf,
-                    self.slice.start + idx + 1,
-                    self.slice.start + self.slice.len,
-                );
-                Some(result)
+
+            // SAFETY: iter.remaining > 0 means iter.ptr is valid
+            let element = unsafe { &*iter.ptr.as_ptr() };
+
+            if (self.pred)(element) {
+                // Match found.
+                // Reconstruct result and remaining parts.
+
+                let result = SegmentedSliceMut {
+                    buf: slice_buf,
+                    start: slice_start,
+                    len: consumed,
+                    end_ptr: iter.ptr,
+                    end_seg: iter.seg,
+                    _marker: PhantomData,
+                };
+
+                iter.next(); // Skip separator
+
+                // Put remaining part back into self.slice
+                self.slice = SegmentedSliceMut {
+                    buf: slice_buf,
+                    start: slice_start + consumed + 1,
+                    len: iter.remaining,
+                    end_ptr: slice_end_ptr,
+                    end_seg: slice_end_seg,
+                    _marker: PhantomData,
+                };
+
+                return Some(result);
             }
+
+            iter.next();
+            consumed += 1;
         }
     }
 
@@ -1781,41 +1840,69 @@ where
             return None;
         }
 
-        // Find the position of the last matching element
-        let mut idx = None;
-        for (i, elem) in self.slice.iter().enumerate().rev() {
-            if (self.pred)(elem) {
-                idx = Some(i);
-                break;
-            }
-        }
+        // Capture fields before borrowing slice mutably
+        let slice_buf = self.slice.buf;
+        let slice_start = self.slice.start;
+        let slice_end_ptr = self.slice.end_ptr;
+        let slice_end_seg = self.slice.end_seg;
 
-        match idx {
-            None => {
+        // Take the slice to avoid mutable borrow conflict
+        let mut slice = std::mem::replace(
+            &mut self.slice,
+            SegmentedSliceMut {
+                buf: slice_buf,
+                start: slice_start,
+                len: 0,
+                end_ptr: NonNull::dangling(),
+                end_seg: 0,
+                _marker: PhantomData,
+            },
+        );
+
+        let mut iter = slice.iter_mut();
+        let mut consumed = 0;
+
+        loop {
+            if iter.remaining == 0 {
                 self.finished = true;
-                let result = SegmentedSliceMut::new(
-                    self.slice.buf,
-                    self.slice.start,
-                    self.slice.start + self.slice.len,
-                );
-                self.slice =
-                    SegmentedSliceMut::new(self.slice.buf, self.slice.start, self.slice.start);
-                Some(result)
+                return Some(slice);
             }
-            Some(idx) => {
-                let result = SegmentedSliceMut::new(
-                    self.slice.buf,
-                    self.slice.start + idx + 1,
-                    self.slice.start + self.slice.len,
-                );
-                // Update slice to exclude the separator and everything after
-                self.slice = SegmentedSliceMut::new(
-                    self.slice.buf,
-                    self.slice.start,
-                    self.slice.start + idx,
-                );
-                Some(result)
+
+            // SAFETY: iter.remaining > 0 means back_ptr is valid
+            let element = unsafe { &*iter.back_ptr.as_ptr() };
+
+            if (self.pred)(element) {
+                let result_start = slice_start + iter.remaining;
+
+                let result = SegmentedSliceMut {
+                    buf: slice_buf,
+                    start: result_start,
+                    len: consumed,
+                    end_ptr: slice_end_ptr,
+                    end_seg: slice_end_seg,
+                    _marker: PhantomData,
+                };
+
+                // Capture separator pointer/seg BEFORE advancing
+                let separator_ptr = iter.back_ptr;
+                let separator_seg = iter.back_seg;
+
+                iter.next_back();
+
+                // Put remaining part back into self.slice
+                self.slice = SegmentedSliceMut {
+                    buf: slice_buf,
+                    start: slice_start,
+                    len: iter.remaining,
+                    end_ptr: separator_ptr,
+                    end_seg: separator_seg,
+                    _marker: PhantomData,
+                };
+                return Some(result);
             }
+
+            iter.next_back();
+            consumed += 1;
         }
     }
 }
@@ -1921,7 +2008,26 @@ where
 {
     type Item = SegmentedSliceMut<'a, T, A>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        self.inner.next_back()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
     }
 }
+
+impl<'a, T, A: Allocator + 'a, P> DoubleEndedIterator for RSplitMut<'a, T, A, P>
+where
+    P: FnMut(&T) -> bool,
+{
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+}
+
+impl<'a, T, A: Allocator + 'a, P> FusedIterator for RSplitMut<'a, T, A, P> where P: FnMut(&T) -> bool
+{}
