@@ -1329,6 +1329,98 @@ where
 
 impl<'a, T, A: Allocator + 'a, P> FusedIterator for RSplitN<'a, T, A, P> where P: FnMut(&T) -> bool {}
 
+/// An iterator over subslices separated by elements that match a predicate
+/// function, limited to a given number of splits.
+///
+/// This struct is created by the [`splitn_mut`] method on [`SegmentedSliceMut`].
+///
+/// [`splitn_mut`]: SegmentedSliceMut::splitn_mut
+pub struct SplitNMut<'a, T, A: Allocator + 'a, P>
+where
+    P: FnMut(&T) -> bool,
+{
+    inner: GenericSplitN<SplitMut<'a, T, A, P>>,
+}
+
+impl<'a, T, A: Allocator + 'a, P: FnMut(&T) -> bool> SplitNMut<'a, T, A, P> {
+    #[inline]
+    pub(crate) fn new(slice: SegmentedSliceMut<'a, T, A>, n: usize, pred: P) -> Self {
+        Self {
+            inner: GenericSplitN {
+                iter: SplitMut::new(slice, pred),
+                count: n,
+            },
+        }
+    }
+}
+
+impl<'a, T, A: Allocator + 'a, P> Iterator for SplitNMut<'a, T, A, P>
+where
+    P: FnMut(&T) -> bool,
+{
+    type Item = SegmentedSliceMut<'a, T, A>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<'a, T, A: Allocator + 'a, P> FusedIterator for SplitNMut<'a, T, A, P> where P: FnMut(&T) -> bool
+{}
+
+/// An iterator over subslices separated by elements that match a predicate
+/// function, limited to a given number of splits, starting from the end.
+///
+/// This struct is created by the [`rsplitn_mut`] method on [`SegmentedSliceMut`].
+///
+/// [`rsplitn_mut`]: SegmentedSliceMut::rsplitn_mut
+pub struct RSplitNMut<'a, T, A: Allocator + 'a, P>
+where
+    P: FnMut(&T) -> bool,
+{
+    inner: GenericSplitN<RSplitMut<'a, T, A, P>>,
+}
+
+impl<'a, T, A: Allocator + 'a, P: FnMut(&T) -> bool> RSplitNMut<'a, T, A, P> {
+    #[inline]
+    pub(crate) fn new(slice: SegmentedSliceMut<'a, T, A>, n: usize, pred: P) -> Self {
+        Self {
+            inner: GenericSplitN {
+                iter: RSplitMut::new(slice, pred),
+                count: n,
+            },
+        }
+    }
+}
+
+impl<'a, T, A: Allocator + 'a, P> Iterator for RSplitNMut<'a, T, A, P>
+where
+    P: FnMut(&T) -> bool,
+{
+    type Item = SegmentedSliceMut<'a, T, A>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<'a, T, A: Allocator + 'a, P> FusedIterator for RSplitNMut<'a, T, A, P> where
+    P: FnMut(&T) -> bool
+{
+}
+
 /// An iterator over a `SegmentedSlice` in (non-overlapping) mutable chunks.
 ///
 /// This struct is created by the [`chunks_mut`] method on [`SegmentedSlice`].
