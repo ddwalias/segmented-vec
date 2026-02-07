@@ -32,7 +32,6 @@ pub mod iter;
 use allocator_api2::alloc::{Allocator, Global};
 use std::cmp::Ordering;
 use std::marker::PhantomData;
-use std::num::NonZero;
 use std::ops::{Index, IndexMut, RangeBounds};
 use std::ptr::NonNull;
 
@@ -417,13 +416,7 @@ impl<'a, T, A: Allocator + 'a> SegmentedSlice<'a, T, A> {
     #[track_caller]
     pub fn chunks(&self, chunk_size: usize) -> Chunks<'a, T, A> {
         assert!(chunk_size != 0, "chunk size must be non-zero");
-        Chunks {
-            buf: self.buf,
-            start: self.start,
-            end: self.start + self.len,
-            chunk_size,
-            _marker: PhantomData,
-        }
+        Chunks::new(*self, chunk_size)
     }
 
     /// Returns an iterator over `chunk_size` elements of the slice at a time.
@@ -431,38 +424,51 @@ impl<'a, T, A: Allocator + 'a> SegmentedSlice<'a, T, A> {
     #[track_caller]
     pub fn chunks_exact(&self, chunk_size: usize) -> ChunksExact<'a, T, A> {
         assert!(chunk_size != 0, "chunk size must be non-zero");
-        let end = self.start + self.len;
-        let rem = self.len % chunk_size;
-        let chunks_end = end - rem;
-        ChunksExact {
-            buf: self.buf,
-            start: self.start,
-            end: chunks_end,
-            remainder_start: chunks_end,
-            remainder_end: end,
-            chunk_size,
-            _marker: PhantomData,
-        }
+        ChunksExact::new(*self, chunk_size)
     }
 
-    // /// Returns a sub-slice of the slice.
-    // #[inline]
-    // #[must_use]
-    // pub fn slice<R: RangeBounds<usize>>(&self, range: R) -> SegmentedSlice<'a, T, A> {
-    //     let len = self.len();
-    //     let start = match range.start_bound() {
-    //         core::ops::Bound::Included(&s) => s,
-    //         core::ops::Bound::Excluded(&s) => s + 1,
-    //         core::ops::Bound::Unbounded => 0,
-    //     };
-    //     let end = match range.end_bound() {
-    //         core::ops::Bound::Included(&e) => e + 1,
-    //         core::ops::Bound::Excluded(&e) => e,
-    //         core::ops::Bound::Unbounded => len,
-    //     };
-    //     assert!(start <= end && end <= len);
-    //     SegmentedSlice::new(self.buf, self.start + start, self.start + end)
-    // }
+    /// Returns a sub-slice of the slice.
+    #[inline]
+    #[must_use]
+    pub fn sub_slice<R: RangeBounds<usize>>(&self, range: R) -> SegmentedSlice<'a, T, A> {
+        let len = self.len();
+        let start = match range.start_bound() {
+            core::ops::Bound::Included(&s) => s,
+            core::ops::Bound::Excluded(&s) => s + 1,
+            core::ops::Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            core::ops::Bound::Included(&e) => e + 1,
+            core::ops::Bound::Excluded(&e) => e,
+            core::ops::Bound::Unbounded => len,
+        };
+        assert!(start <= end && end <= len);
+        SegmentedSlice::new(self.buf, self.start + start, self.start + end)
+    }
+
+    #[inline]
+    pub fn split_once<F>(
+        &self,
+        pred: F,
+    ) -> Option<(SegmentedSlice<'a, T, A>, SegmentedSlice<'a, T, A>)>
+    where
+        F: FnMut(&T) -> bool,
+    {
+        let index = self.iter().position(pred)?;
+        Some((self.sub_slice(..index), self.sub_slice(index + 1..)))
+    }
+
+    #[inline]
+    pub fn rsplit_once<F>(
+        &self,
+        pred: F,
+    ) -> Option<(SegmentedSlice<'a, T, A>, SegmentedSlice<'a, T, A>)>
+    where
+        F: FnMut(&T) -> bool,
+    {
+        let index = self.iter().rposition(pred)?;
+        Some((self.sub_slice(..index), self.sub_slice(index + 1..)))
+    }
 }
 
 impl<'a, T, A: Allocator> SegmentedSliceMut<'a, T, A> {
@@ -1066,13 +1072,7 @@ impl<'a, T, A: Allocator> SegmentedSliceMut<'a, T, A> {
     #[track_caller]
     pub fn chunks(&self, chunk_size: usize) -> Chunks<'a, T, A> {
         assert!(chunk_size != 0, "chunk size must be non-zero");
-        Chunks {
-            buf: self.buf,
-            start: self.start,
-            end: self.start + self.len,
-            chunk_size,
-            _marker: PhantomData,
-        }
+        Chunks::new(self.as_slice(), chunk_size)
     }
 
     /// Returns an iterator over `chunk_size` elements of the slice at a time.
@@ -1080,18 +1080,7 @@ impl<'a, T, A: Allocator> SegmentedSliceMut<'a, T, A> {
     #[track_caller]
     pub fn chunks_exact(&self, chunk_size: usize) -> ChunksExact<'a, T, A> {
         assert!(chunk_size != 0, "chunk size must be non-zero");
-        let end = self.start + self.len;
-        let rem = self.len % chunk_size;
-        let chunks_end = end - rem;
-        ChunksExact {
-            buf: self.buf,
-            start: self.start,
-            end: chunks_end,
-            remainder_start: chunks_end,
-            remainder_end: end,
-            chunk_size,
-            _marker: PhantomData,
-        }
+        ChunksExact::new(self.as_slice(), chunk_size)
     }
 
     pub const fn array_windows<const N: usize>(&self) -> ArrayWindows<'_, T, N> {
@@ -1103,13 +1092,7 @@ impl<'a, T, A: Allocator> SegmentedSliceMut<'a, T, A> {
     #[track_caller]
     pub fn rchunks(&self, chunk_size: usize) -> RChunks<'a, T, A> {
         assert!(chunk_size != 0, "chunk size must be non-zero");
-        RChunks {
-            buf: self.buf,
-            start: self.start,
-            end: self.start + self.len,
-            chunk_size,
-            _marker: PhantomData,
-        }
+        RChunks::new(self.as_slice(), chunk_size)
     }
 
     /// Returns an iterator over `chunk_size` elements of the slice at a time, starting at the end.
@@ -1122,36 +1105,6 @@ impl<'a, T, A: Allocator> SegmentedSliceMut<'a, T, A> {
     /// Returns an iterator over `chunk_size` elements of the slice at a time, starting at the beginning.
     #[inline]
     #[track_caller]
-    pub fn chunks_mut(&mut self, chunk_size: usize) -> iter::ChunksMut<'a, T, A> {
-        assert!(chunk_size != 0, "chunk size must be non-zero");
-        iter::ChunksMut::new(self.slice_mut(..), chunk_size)
-    }
-
-    /// Returns an iterator over `chunk_size` elements of the slice at a time, starting at the beginning.
-    #[inline]
-    #[track_caller]
-    pub fn chunks_exact_mut(&mut self, chunk_size: usize) -> iter::ChunksExactMut<'a, T, A> {
-        assert!(chunk_size != 0, "chunk size must be non-zero");
-        iter::ChunksExactMut::new(self.slice_mut(..), chunk_size)
-    }
-
-    /// Returns an iterator over `chunk_size` elements of the slice at a time, starting at the end.
-    #[inline]
-    #[track_caller]
-    pub fn rchunks_mut(&mut self, chunk_size: usize) -> iter::RChunksMut<'a, T, A> {
-        assert!(chunk_size != 0, "chunk size must be non-zero");
-        iter::RChunksMut::new(self.slice_mut(..), chunk_size)
-    }
-
-    /// Returns an iterator over `chunk_size` elements of the slice at a time, starting at the end.
-    #[inline]
-    #[track_caller]
-    pub fn rchunks_exact_mut(&mut self, chunk_size: usize) -> iter::RChunksExactMut<'a, T, A> {
-        assert!(chunk_size != 0, "chunk size must be non-zero");
-        iter::RChunksExactMut::new(self.slice_mut(..), chunk_size)
-    }
-
-    #[inline]
     pub const fn chunk_by<F>(&self, _pred: F) -> ChunkBy<'_, T, F>
     where
         F: FnMut(&T, &T) -> bool,
@@ -1256,30 +1209,6 @@ impl<'a, T, A: Allocator> SegmentedSliceMut<'a, T, A> {
         )
     }
 
-    #[inline]
-    pub fn split_once<F>(
-        &self,
-        pred: F,
-    ) -> Option<(SegmentedSlice<'a, T, A>, SegmentedSlice<'a, T, A>)>
-    where
-        F: FnMut(&T) -> bool,
-    {
-        let index = self.iter().position(pred)?;
-        Some((self.slice(..index), self.slice(index + 1..)))
-    }
-
-    #[inline]
-    pub fn rsplit_once<F>(
-        &self,
-        pred: F,
-    ) -> Option<(SegmentedSlice<'a, T, A>, SegmentedSlice<'a, T, A>)>
-    where
-        F: FnMut(&T) -> bool,
-    {
-        let index = self.iter().rposition(pred)?;
-        Some((self.slice(..index), self.slice(index + 1..)))
-    }
-
     /// Returns `true` if the slice contains an element with the given value.
     #[inline]
     pub fn contains(&self, x: &T) -> bool
@@ -1322,25 +1251,6 @@ impl<'a, T, A: Allocator> SegmentedSliceMut<'a, T, A> {
             }
         }
         None
-    }
-
-    /// Returns a sub-slice of the slice.
-    #[inline]
-    #[must_use]
-    pub fn slice<R: RangeBounds<usize>>(&self, range: R) -> SegmentedSlice<'a, T, A> {
-        let len = self.len();
-        let start = match range.start_bound() {
-            core::ops::Bound::Included(&s) => s,
-            core::ops::Bound::Excluded(&s) => s + 1,
-            core::ops::Bound::Unbounded => 0,
-        };
-        let end = match range.end_bound() {
-            core::ops::Bound::Included(&e) => e + 1,
-            core::ops::Bound::Excluded(&e) => e,
-            core::ops::Bound::Unbounded => len,
-        };
-        assert!(start <= end && end <= len);
-        SegmentedSlice::new(self.buf, self.start + start, self.start + end)
     }
 
     /// Returns a reference to the element at the given index, or panics if the index is out of bounds.
