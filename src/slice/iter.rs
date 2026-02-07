@@ -668,6 +668,7 @@ impl<'a, T, A: Allocator + 'a, P> FusedIterator for SplitInclusive<'a, T, A, P> 
 }
 
 /// An iterator over subslices separated by elements that match a predicate function.
+#[derive(Debug)]
 pub struct SplitMut<'a, T, A: Allocator + 'a, P>
 where
     P: FnMut(&T) -> bool,
@@ -1157,6 +1158,52 @@ where
 }
 
 impl<'a, T, A: Allocator + 'a, P> FusedIterator for RSplit<'a, T, A, P> where P: FnMut(&T) -> bool {}
+
+#[derive(Debug)]
+pub struct RSplitMut<'a, T, A: Allocator + 'a, P>
+where
+    P: FnMut(&T) -> bool,
+{
+    inner: SplitMut<'a, T, A, P>,
+}
+
+impl<'a, T, A: Allocator + 'a, P: FnMut(&T) -> bool> RSplitMut<'a, T, A, P> {
+    pub(crate) fn new(slice: SegmentedSliceMut<'a, T, A>, pred: P) -> Self {
+        Self {
+            inner: SplitMut::new(slice, pred),
+        }
+    }
+}
+
+impl<'a, T, A: Allocator + 'a, P> Iterator for RSplitMut<'a, T, A, P>
+where
+    P: FnMut(&T) -> bool,
+{
+    type Item = SegmentedSliceMut<'a, T, A>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next_back()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<'a, T, A: Allocator + 'a, P> DoubleEndedIterator for RSplitMut<'a, T, A, P>
+where
+    P: FnMut(&T) -> bool,
+{
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+}
+
+impl<'a, T, A: Allocator + 'a, P> FusedIterator for RSplitMut<'a, T, A, P> where P: FnMut(&T) -> bool
+{}
 
 /// An iterator over subslices separated by elements that match a predicate
 /// function, limited to a given number of splits.
@@ -2303,48 +2350,3 @@ where
         todo!()
     }
 }
-
-pub struct RSplitMut<'a, T, A: Allocator + 'a, P>
-where
-    P: FnMut(&T) -> bool,
-{
-    inner: SplitMut<'a, T, A, P>,
-}
-
-impl<'a, T, A: Allocator + 'a, P: FnMut(&T) -> bool> RSplitMut<'a, T, A, P> {
-    pub(crate) fn new(slice: SegmentedSliceMut<'a, T, A>, pred: P) -> Self {
-        Self {
-            inner: SplitMut::new(slice, pred),
-        }
-    }
-}
-
-impl<'a, T, A: Allocator + 'a, P> Iterator for RSplitMut<'a, T, A, P>
-where
-    P: FnMut(&T) -> bool,
-{
-    type Item = SegmentedSliceMut<'a, T, A>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next_back()
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-}
-
-impl<'a, T, A: Allocator + 'a, P> DoubleEndedIterator for RSplitMut<'a, T, A, P>
-where
-    P: FnMut(&T) -> bool,
-{
-    #[inline]
-    fn next_back(&mut self) -> Option<Self::Item> {
-        self.inner.next()
-    }
-}
-
-impl<'a, T, A: Allocator + 'a, P> FusedIterator for RSplitMut<'a, T, A, P> where P: FnMut(&T) -> bool
-{}

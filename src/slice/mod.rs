@@ -85,6 +85,7 @@ impl<'a, T, A: Allocator + 'a> Copy for SegmentedSlice<'a, T, A> {}
 /// Mutable segmented slice.
 ///
 /// This is analogous to `&mut [T]` but for segmented (non-contiguous) storage.
+#[derive(Debug)]
 pub struct SegmentedSliceMut<'a, T, A: Allocator + 'a = Global> {
     /// Raw pointer to the underlying SegmentedVec's buffer.
     pub(crate) buf: NonNull<RawSegmentedVec<T, A>>,
