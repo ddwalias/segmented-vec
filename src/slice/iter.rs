@@ -310,6 +310,15 @@ impl<'a, T, A: Allocator> SliceIterMut<'a, T, A> {
     }
 }
 
+/// An internal abstraction over the splitting iterators, so that
+/// splitn, splitn_mut etc can be implemented once.
+#[doc(hidden)]
+pub(super) trait SplitIter: DoubleEndedIterator {
+    /// Marks the underlying iterator as complete, extracting the remaining
+    /// portion of the slice.
+    fn finish(&mut self) -> Option<Self::Item>;
+}
+
 /// An iterator over subslices separated by elements that match a predicate
 /// function.
 ///
@@ -360,18 +369,7 @@ where
 
         loop {
             if iter.remaining == 0 {
-                self.finished = true;
-                // Return the remaining slice
-                let result = self.slice;
-                self.slice = SegmentedSlice {
-                    buf: self.slice.buf,
-                    start: self.slice.start + self.slice.len,
-                    len: 0,
-                    end_ptr: self.slice.end_ptr,
-                    end_seg: self.slice.end_seg,
-                    _marker: PhantomData,
-                };
-                return Some(result);
+                return self.finish();
             }
 
             // SAFETY: iter.remaining > 0 means ptr is valid
@@ -435,17 +433,7 @@ where
 
         loop {
             if iter.remaining == 0 {
-                self.finished = true;
-                let result = self.slice;
-                self.slice = SegmentedSlice {
-                    buf: self.slice.buf,
-                    start: self.slice.start,
-                    len: 0,
-                    end_ptr: iter.ptr,
-                    end_seg: iter.seg,
-                    _marker: PhantomData,
-                };
-                return Some(result);
+                return self.finish();
             }
 
             // SAFETY: iter.remaining > 0 means back_ptr is valid
@@ -482,6 +470,21 @@ where
 
             iter.next_back();
             consumed += 1;
+        }
+    }
+}
+
+impl<'a, T, A: Allocator + 'a, P> SplitIter for Split<'a, T, A, P>
+where
+    P: FnMut(&T) -> bool,
+{
+    #[inline]
+    fn finish(&mut self) -> Option<SegmentedSlice<'a, T, A>> {
+        if self.finished {
+            None
+        } else {
+            self.finished = true;
+            Some(self.slice)
         }
     }
 }
@@ -1776,11 +1779,10 @@ where
 
         loop {
             if iter.remaining == 0 {
-                self.finished = true;
                 // iter is exhausted, slice is fully consumed.
-                // We return the original slice (which is now in `slice`).
-                // self.slice is already empty from the replace.
-                return Some(slice);
+                // We return the remaining slice via finish().
+                self.slice = slice;
+                return self.finish();
             }
 
             // SAFETY: iter.remaining > 0 means iter.ptr is valid
@@ -1864,8 +1866,8 @@ where
 
         loop {
             if iter.remaining == 0 {
-                self.finished = true;
-                return Some(slice);
+                self.slice = slice;
+                return self.finish();
             }
 
             // SAFETY: iter.remaining > 0 means back_ptr is valid
@@ -1903,6 +1905,35 @@ where
 
             iter.next_back();
             consumed += 1;
+        }
+    }
+}
+
+impl<'a, T, A: Allocator + 'a, P> SplitIter for SplitMut<'a, T, A, P>
+where
+    P: FnMut(&T) -> bool,
+{
+    #[inline]
+    fn finish(&mut self) -> Option<SegmentedSliceMut<'a, T, A>> {
+        if self.finished {
+            None
+        } else {
+            self.finished = true;
+            // Capture fields before borrowing slice mutably
+            let slice_buf = self.slice.buf;
+            let slice_start = self.slice.start;
+
+            Some(std::mem::replace(
+                &mut self.slice,
+                SegmentedSliceMut {
+                    buf: slice_buf,
+                    start: slice_start,
+                    len: 0,
+                    end_ptr: NonNull::dangling(),
+                    end_seg: 0,
+                    _marker: PhantomData,
+                },
+            ))
         }
     }
 }
