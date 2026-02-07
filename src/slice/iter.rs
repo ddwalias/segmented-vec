@@ -1957,21 +1957,14 @@ impl<T, A: Allocator> std::iter::FusedIterator for Chunks<'_, T, A> {}
 ///
 /// [`chunks_mut`]: SegmentedSlice::chunks_mut
 pub struct ChunksMut<'a, T, A: Allocator + 'a = Global> {
-    buf: NonNull<RawSegmentedVec<T, A>>,
-    start: usize,
-    end: usize,
-    chunk_size: usize,
-    /// Cached pointer to the start of the current range.
+    pub(crate) slice: SegmentedSliceMut<'a, T, A>,
+    pub(crate) chunk_size: usize,
+    /// Cached pointer to the start of the current chunk.
     pub(crate) start_ptr: NonNull<T>,
     /// Current segment index for start pointer.
     pub(crate) start_seg: usize,
     /// End of current segment for start pointer.
     pub(crate) start_seg_end: NonNull<T>,
-    /// Cached pointer to the end (one-past-last) of the current range.
-    pub(crate) end_ptr: NonNull<T>,
-    /// Current segment index for end pointer.
-    pub(crate) end_seg: usize,
-    _marker: PhantomData<&'a mut T>,
 }
 
 impl<'a, T, A: Allocator + 'a> ChunksMut<'a, T, A> {
@@ -1981,16 +1974,11 @@ impl<'a, T, A: Allocator + 'a> ChunksMut<'a, T, A> {
 
         if slice.len == 0 {
             return Self {
-                buf: slice.buf,
-                start: slice.start,
-                end: slice.start,
+                slice,
                 chunk_size,
                 start_ptr: NonNull::dangling(),
                 start_seg: 0,
                 start_seg_end: NonNull::dangling(),
-                end_ptr: NonNull::dangling(),
-                end_seg: 0,
-                _marker: PhantomData,
             };
         }
 
@@ -2018,16 +2006,11 @@ impl<'a, T, A: Allocator + 'a> ChunksMut<'a, T, A> {
         };
 
         Self {
-            buf: slice.buf,
-            start: slice.start,
-            end: slice.start + slice.len,
+            slice,
             chunk_size,
             start_ptr,
             start_seg,
             start_seg_end,
-            end_ptr: slice.end_ptr,
-            end_seg: slice.end_seg,
-            _marker: PhantomData,
         }
     }
 }
@@ -2037,11 +2020,11 @@ impl<'a, T, A: Allocator + 'a> Iterator for ChunksMut<'a, T, A> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if self.start >= self.end {
+        if self.slice.len == 0 {
             None
         } else {
-            let chunk_len = std::cmp::min(self.chunk_size, self.end - self.start);
-            let chunk_start = self.start;
+            let chunk_len = std::cmp::min(self.chunk_size, self.slice.len);
+            let chunk_start = self.slice.start;
 
             // Use cached start info
             let start_ptr = self.start_ptr;
@@ -2055,7 +2038,7 @@ impl<'a, T, A: Allocator + 'a> Iterator for ChunksMut<'a, T, A> {
                 } else {
                     // It crosses segment boundary.
                     let chunk_end_idx = chunk_start + chunk_len;
-                    let buf = self.buf.as_ref();
+                    let buf = self.slice.buf.as_ref();
                     let (seg, off) = RawSegmentedVec::<T, A>::location(chunk_end_idx);
                     let (seg, ptr) = if seg >= buf.segment_count() {
                         let last_seg = seg - 1;
@@ -2069,7 +2052,7 @@ impl<'a, T, A: Allocator + 'a> Iterator for ChunksMut<'a, T, A> {
             };
 
             let result = SegmentedSliceMut {
-                buf: self.buf,
+                buf: self.slice.buf,
                 start: chunk_start,
                 len: chunk_len,
                 end_ptr,
@@ -2078,18 +2061,20 @@ impl<'a, T, A: Allocator + 'a> Iterator for ChunksMut<'a, T, A> {
             };
 
             // Update iterator state
-            self.start += chunk_len;
+            self.slice.start += chunk_len;
+            self.slice.len -= chunk_len;
 
             // Update start cache for next call
-            if self.start < self.end {
+            if self.slice.len > 0 {
                 self.start_ptr = end_ptr;
                 self.start_seg = end_seg;
                 // If we crossed segments, update the segment end too
                 if end_seg != start_seg {
                     unsafe {
                         let cap = RawSegmentedVec::<T, A>::segment_capacity(end_seg);
-                        self.start_seg_end =
-                            NonNull::new_unchecked(self.buf.as_ref().segment_ptr(end_seg).add(cap));
+                        self.start_seg_end = NonNull::new_unchecked(
+                            self.slice.buf.as_ref().segment_ptr(end_seg).add(cap),
+                        );
                     }
                 }
             } else {
@@ -2103,11 +2088,10 @@ impl<'a, T, A: Allocator + 'a> Iterator for ChunksMut<'a, T, A> {
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        if self.start >= self.end {
+        if self.slice.len == 0 {
             (0, Some(0))
         } else {
-            let len = self.end - self.start;
-            let n = len.div_ceil(self.chunk_size);
+            let n = self.slice.len.div_ceil(self.chunk_size);
             (n, Some(n))
         }
     }
@@ -2120,19 +2104,20 @@ impl<'a, T, A: Allocator + 'a> Iterator for ChunksMut<'a, T, A> {
     #[inline]
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
         let skip = n.checked_mul(self.chunk_size)?;
-        let remaining_len = self.end - self.start;
-        if skip >= remaining_len {
-            self.start = self.end;
+        if skip >= self.slice.len {
+            self.slice.start += self.slice.len;
+            self.slice.len = 0;
             self.start_ptr = NonNull::dangling();
             self.start_seg_end = NonNull::dangling();
             return None;
         }
 
-        self.start += skip;
+        self.slice.start += skip;
+        self.slice.len -= skip;
 
         // Re-initialize start cache
-        let (mut seg, mut off) = RawSegmentedVec::<T, A>::location(self.start);
-        let buf = unsafe { self.buf.as_ref() };
+        let (mut seg, mut off) = RawSegmentedVec::<T, A>::location(self.slice.start);
+        let buf = unsafe { self.slice.buf.as_ref() };
         if seg >= buf.segment_count() {
             if seg > 0 {
                 seg -= 1;
@@ -2151,41 +2136,41 @@ impl<'a, T, A: Allocator + 'a> Iterator for ChunksMut<'a, T, A> {
 impl<'a, T, A: Allocator + 'a> DoubleEndedIterator for ChunksMut<'a, T, A> {
     #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
-        if self.start >= self.end {
+        if self.slice.len == 0 {
             None
         } else {
-            let len = self.end - self.start;
-            let remainder = len % self.chunk_size;
+            let remainder = self.slice.len % self.chunk_size;
             let chunk_len = if remainder != 0 {
                 remainder
             } else {
                 self.chunk_size
             };
 
-            let chunk_start = self.end - chunk_len;
+            let chunk_start = self.slice.start + self.slice.len - chunk_len;
 
-            // The chunk ends at self.end_ptr/end_seg.
+            // The chunk ends at self.slice.end_ptr/end_seg.
             let result = SegmentedSliceMut {
-                buf: self.buf,
+                buf: self.slice.buf,
                 start: chunk_start,
                 len: chunk_len,
-                end_ptr: self.end_ptr,
-                end_seg: self.end_seg,
+                end_ptr: self.slice.end_ptr,
+                end_seg: self.slice.end_seg,
                 _marker: PhantomData,
             };
 
-            self.end -= chunk_len;
+            self.slice.len -= chunk_len;
 
-            // Update self.end_ptr and end_seg for next calls.
-            if self.start < self.end {
+            // Update self.slice.end_ptr and end_seg for next calls.
+            if self.slice.len > 0 {
                 unsafe {
-                    let buf = self.buf.as_ref();
-                    let seg_ptr = buf.segment_ptr(self.end_seg);
-                    let offset = self.end_ptr.as_ptr().offset_from(seg_ptr) as usize;
+                    let buf = self.slice.buf.as_ref();
+                    let seg_ptr = buf.segment_ptr(self.slice.end_seg);
+                    let offset = self.slice.end_ptr.as_ptr().offset_from(seg_ptr) as usize;
 
                     if offset >= chunk_len {
                         // Same segment
-                        self.end_ptr = NonNull::new_unchecked(self.end_ptr.as_ptr().sub(chunk_len));
+                        self.slice.end_ptr =
+                            NonNull::new_unchecked(self.slice.end_ptr.as_ptr().sub(chunk_len));
                     } else {
                         // Crosses segment(s)
                         let (seg, off) = RawSegmentedVec::<T, A>::location(chunk_start);
@@ -2196,12 +2181,12 @@ impl<'a, T, A: Allocator + 'a> DoubleEndedIterator for ChunksMut<'a, T, A> {
                         } else {
                             (seg, buf.segment_ptr(seg).add(off))
                         };
-                        self.end_ptr = NonNull::new_unchecked(ptr);
-                        self.end_seg = seg;
+                        self.slice.end_ptr = NonNull::new_unchecked(ptr);
+                        self.slice.end_seg = seg;
                     }
                 }
             } else {
-                self.end_ptr = NonNull::dangling();
+                self.slice.end_ptr = NonNull::dangling();
                 // start cache also reset if we met
                 self.start_ptr = NonNull::dangling();
                 self.start_seg_end = NonNull::dangling();
@@ -2215,35 +2200,29 @@ impl<'a, T, A: Allocator + 'a> DoubleEndedIterator for ChunksMut<'a, T, A> {
     fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
         let total_chunks = self.size_hint().0;
         if n >= total_chunks {
-            self.start = self.end;
+            self.slice.start += self.slice.len;
+            self.slice.len = 0;
             self.start_ptr = NonNull::dangling();
             self.start_seg_end = NonNull::dangling();
-            self.end_ptr = NonNull::dangling();
+            self.slice.end_ptr = NonNull::dangling();
             return None;
         }
 
-        let index_from_start = total_chunks - 1 - n;
-        let relative_start = index_from_start * self.chunk_size;
-        let chunk_len = std::cmp::min(self.chunk_size, (self.end - self.start) - relative_start);
-        let chunk_start_abs = self.start + relative_start;
-        let chunk_end_abs = chunk_start_abs + chunk_len;
-
-        self.end = chunk_start_abs + chunk_len; // Point to original end... wait
-                                                // In nth_back(n), we want to skip n chunks from the back.
-                                                // So the new end is original_start + index_from_start * chunk_size + chunk_len.
-        self.end = chunk_end_abs;
+        let skip_len = n * self.chunk_size;
+        self.slice.len -= skip_len;
 
         // Re-initialize end cache
-        let (mut seg, mut off) = RawSegmentedVec::<T, A>::location(self.end);
-        let buf = unsafe { self.buf.as_ref() };
+        let (mut seg, mut off) =
+            RawSegmentedVec::<T, A>::location(self.slice.start + self.slice.len);
+        let buf = unsafe { self.slice.buf.as_ref() };
         if seg >= buf.segment_count() {
             if seg > 0 {
                 seg -= 1;
                 off = RawSegmentedVec::<T, A>::segment_capacity(seg);
             }
         }
-        self.end_seg = seg;
-        self.end_ptr = unsafe { NonNull::new_unchecked(buf.segment_ptr(seg).add(off)) };
+        self.slice.end_seg = seg;
+        self.slice.end_ptr = unsafe { NonNull::new_unchecked(buf.segment_ptr(seg).add(off)) };
 
         self.next_back()
     }
