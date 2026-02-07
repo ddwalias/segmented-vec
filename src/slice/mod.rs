@@ -406,10 +406,10 @@ impl<'a, T, A: Allocator + 'a> SegmentedSlice<'a, T, A> {
     #[inline]
     #[track_caller]
     pub fn windows(&self, size: usize) -> Windows<'a, T, A> {
-        Windows {
-            slice: *self,
-            size: NonZero::new(size).expect("window size must be non-zero"),
-        }
+        assert!(size != 0, "window size must be non-zero");
+        Windows::new(*self, unsafe {
+            core::num::NonZeroUsize::new_unchecked(size)
+        })
     }
 
     /// Returns an iterator over `chunk_size` elements of the slice at a time.
@@ -1057,17 +1057,8 @@ impl<'a, T, A: Allocator> SegmentedSliceMut<'a, T, A> {
     #[inline]
     #[track_caller]
     pub fn windows(&self, size: usize) -> Windows<'a, T, A> {
-        Windows {
-            slice: SegmentedSlice {
-                buf: self.buf,
-                start: self.start,
-                len: self.len,
-                end_ptr: self.end_ptr,
-                end_seg: self.end_seg,
-                _marker: PhantomData,
-            },
-            size: NonZero::new(size).expect("window size must be non-zero"),
-        }
+        let size = core::num::NonZeroUsize::new(size).expect("window size must be non-zero");
+        Windows::new(self.as_slice(), size)
     }
 
     /// Returns an iterator over `chunk_size` elements of the slice at a time.

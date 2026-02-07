@@ -8,7 +8,7 @@ use allocator_api2::alloc::{Allocator, Global};
 use std::cmp;
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
-use std::num::NonZero;
+use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 
 use crate::raw_vec::RawSegmentedVec;
@@ -1421,6 +1421,248 @@ impl<'a, T, A: Allocator + 'a, P> FusedIterator for RSplitNMut<'a, T, A, P> wher
 {
 }
 
+/// An iterator over overlapping windows of a `SegmentedSlice`.
+#[derive(Clone, Debug)]
+pub struct Windows<'a, T, A: Allocator + 'a = Global> {
+    pub(crate) slice: SegmentedSlice<'a, T, A>,
+    pub(crate) size: NonZeroUsize,
+    // Cached end location for the current window.
+    pub(crate) window_end_ptr: NonNull<T>,
+    // Current segment index for window end pointer
+    pub(crate) window_end_seg: usize,
+    // End of current segment for window end pointer
+    pub(crate) window_end_seg_end: NonNull<T>,
+}
+
+impl<'a, T: 'a, A: Allocator + 'a> Windows<'a, T, A> {
+    #[inline]
+    pub(super) fn new(slice: SegmentedSlice<'a, T, A>, size: NonZeroUsize) -> Self {
+        let size_val = size.get();
+        if slice.len < size_val {
+            return Self {
+                slice,
+                size,
+                window_end_ptr: NonNull::dangling(),
+                window_end_seg: 0,
+                window_end_seg_end: NonNull::dangling(),
+            };
+        }
+
+        let end_index = slice.start + size_val;
+        // This `location` call happens once upon creation.
+        let (mut window_end_seg, mut window_end_offset) =
+            RawSegmentedVec::<T, A>::location(end_index);
+
+        let buf = unsafe { slice.buf.as_ref() };
+        if window_end_seg >= buf.segment_count() {
+            // If we point past the last segment, backtrack to the end of the previous segment.
+            // This happens when the window ends exactly at the capacity limit.
+            if window_end_seg > 0 {
+                window_end_seg -= 1;
+                window_end_offset = RawSegmentedVec::<T, A>::segment_capacity(window_end_seg);
+            }
+        }
+
+        let window_end_ptr = unsafe {
+            let ptr = buf.segment_ptr(window_end_seg).add(window_end_offset);
+            NonNull::new_unchecked(ptr)
+        };
+
+        let window_end_seg_end = unsafe {
+            if window_end_seg < buf.segment_count() {
+                let cap = RawSegmentedVec::<T, A>::segment_capacity(window_end_seg);
+                NonNull::new_unchecked(buf.segment_ptr(window_end_seg).add(cap))
+            } else {
+                NonNull::dangling()
+            }
+        };
+
+        Self {
+            slice,
+            size,
+            window_end_ptr,
+            window_end_seg,
+            window_end_seg_end,
+        }
+    }
+}
+
+impl<'a, T, A: Allocator + 'a> Iterator for Windows<'a, T, A> {
+    type Item = SegmentedSlice<'a, T, A>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let size = self.size.get();
+        if self.slice.len() < size {
+            return None;
+        }
+
+        // Construct the window slice using cached end pointers.
+        // We use struct initialization directly to bypass `SegmentedSlice::new` which recalculates.
+        let window = SegmentedSlice {
+            buf: self.slice.buf,
+            start: self.slice.start,
+            len: size,
+            end_ptr: self.window_end_ptr,
+            end_seg: self.window_end_seg,
+            _marker: PhantomData,
+        };
+
+        // Advance start
+        self.slice.start += 1;
+        self.slice.len -= 1;
+
+        // Advance window_end
+        // Logic: if window_end_ptr == window_end_seg_end, move to next segment.
+
+        let buf = unsafe { self.slice.buf.as_ref() };
+
+        // Non-ZST logic
+        if core::mem::size_of::<T>() > 0 {
+            // Check if we reached the boundary of the current segment
+            if self.window_end_ptr == self.window_end_seg_end {
+                // Move to next segment
+                self.window_end_seg += 1;
+
+                if self.window_end_seg < buf.segment_count() {
+                    let ptr = unsafe { buf.segment_ptr(self.window_end_seg) };
+                    // Set ptr to start of next segment
+                    self.window_end_ptr = unsafe { NonNull::new_unchecked(ptr) };
+                    let cap = RawSegmentedVec::<T, A>::segment_capacity(self.window_end_seg);
+                    self.window_end_seg_end = unsafe { NonNull::new_unchecked(ptr.add(cap)) };
+                } else {
+                    // Should be covered by slice.len check, but for safety:
+                    self.window_end_ptr = NonNull::dangling();
+                    self.window_end_seg_end = NonNull::dangling();
+                }
+            }
+
+            // Now advance pointer by 1
+            // If we just switched segments, we are at start. Adding 1 moves to index 1.
+            // This is correct (see thought process).
+            self.window_end_ptr =
+                unsafe { NonNull::new_unchecked(self.window_end_ptr.as_ptr().add(1)) };
+        } else {
+            let end_index = self.slice.start + self.size.get();
+            let (seg, _) = RawSegmentedVec::<T, A>::location(end_index);
+            self.window_end_seg = seg;
+        }
+
+        Some(window)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.slice.len() < self.size.get() {
+            (0, Some(0))
+        } else {
+            let windows = self.slice.len() - self.size.get() + 1;
+            (windows, Some(windows))
+        }
+    }
+
+    #[inline]
+    fn count(self) -> usize {
+        self.size_hint().0
+    }
+
+    #[inline]
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        let size = self.size.get();
+        if self.slice.len() < size {
+            return None;
+        }
+        let windows_count = self.slice.len() - size + 1;
+        if n >= windows_count {
+            // Consumed all
+            self.slice.start += windows_count;
+            self.slice.len -= windows_count;
+            return None;
+        }
+
+        // Advance by n
+        self.slice.start += n;
+        self.slice.len -= n;
+
+        // Recalculate cached window_end fields
+        let end_index = self.slice.start + size;
+        let (mut seg, mut offset) = RawSegmentedVec::<T, A>::location(end_index);
+
+        let buf = unsafe { self.slice.buf.as_ref() };
+        if seg >= buf.segment_count() {
+            if seg > 0 {
+                seg -= 1;
+                offset = RawSegmentedVec::<T, A>::segment_capacity(seg);
+            }
+        }
+
+        self.window_end_seg = seg;
+
+        let ptr = unsafe { buf.segment_ptr(seg).add(offset) };
+        self.window_end_ptr = unsafe { NonNull::new_unchecked(ptr) };
+
+        self.window_end_seg_end = unsafe {
+            if seg < buf.segment_count() {
+                let cap = RawSegmentedVec::<T, A>::segment_capacity(seg);
+                NonNull::new_unchecked(buf.segment_ptr(seg).add(cap))
+            } else {
+                NonNull::dangling()
+            }
+        };
+
+        self.next()
+    }
+
+    #[inline]
+    fn last(mut self) -> Option<Self::Item> {
+        self.nth_back(0)
+    }
+}
+
+impl<'a, T, A: Allocator + 'a> DoubleEndedIterator for Windows<'a, T, A> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let size = self.size.get();
+        if self.slice.len() < size {
+            return None;
+        }
+
+        // The last window starts at `len - size`.
+        // Relative to `self.slice.start`:
+        // start_index = self.slice.start + (self.slice.len() - size);
+        let start_index = self.slice.start + self.slice.len() - size;
+        let end_index = start_index + size; // = self.slice.start + self.slice.len()
+
+        let window = SegmentedSlice::new(self.slice.buf, start_index, end_index);
+
+        // Shrink the slice from the end
+        self.slice.len -= 1;
+
+        Some(window)
+    }
+
+    #[inline]
+    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+        if self.slice.len() < self.size.get() {
+            return None;
+        }
+        let windows_count = self.slice.len() - self.size.get() + 1;
+        if n >= windows_count {
+            // Consumed all
+            self.slice.len -= windows_count;
+            return None;
+        }
+
+        // Decrement len by n
+        self.slice.len -= n;
+
+        self.next_back()
+    }
+}
+
+impl<T, A: Allocator> ExactSizeIterator for Windows<'_, T, A> {}
+impl<T, A: Allocator> FusedIterator for Windows<'_, T, A> {}
+
 /// An iterator over a `SegmentedSlice` in (non-overlapping) mutable chunks.
 ///
 /// This struct is created by the [`chunks_mut`] method on [`SegmentedSlice`].
@@ -2318,68 +2560,6 @@ impl<'a, T, A: Allocator + 'a> Iterator for RChunks<'a, T, A> {
 
 impl<T, A: Allocator> ExactSizeIterator for RChunks<'_, T, A> {}
 impl<T, A: Allocator> std::iter::FusedIterator for RChunks<'_, T, A> {}
-
-/// An iterator over overlapping windows of a `SegmentedSlice`.
-pub struct Windows<'a, T, A: Allocator + 'a = Global> {
-    pub(crate) slice: SegmentedSlice<'a, T, A>,
-    pub(crate) size: NonZero<usize>,
-}
-
-impl<'a, T, A: Allocator + 'a> Iterator for Windows<'a, T, A> {
-    type Item = SegmentedSlice<'a, T, A>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        let size = self.size.get();
-        if self.slice.len() < size {
-            return None;
-        }
-
-        // Better:
-        let window_end = self.slice.start + size;
-
-        // Compute end optimization fields for the WINDOW
-        // We need RawSegmentedVec access.
-        let buf_ref = unsafe { self.slice.buf.as_ref() };
-
-        let (mut end_seg, end_offset) = RawSegmentedVec::<T, A>::location(window_end);
-        let end_ptr = if end_seg >= buf_ref.segment_count() {
-            let (last_seg, last_offset) = RawSegmentedVec::<T, A>::location(window_end - 1);
-            end_seg = last_seg;
-            unsafe { NonNull::new_unchecked(buf_ref.segment_ptr(last_seg).add(last_offset + 1)) }
-        } else {
-            unsafe { NonNull::new_unchecked(buf_ref.segment_ptr(end_seg).add(end_offset)) }
-        };
-
-        let window = SegmentedSlice {
-            buf: self.slice.buf,
-            start: self.slice.start,
-            len: size,
-            end_ptr,
-            end_seg,
-            _marker: PhantomData,
-        };
-
-        // Advance the iterator
-        self.slice.start += 1;
-        self.slice.len -= 1;
-
-        Some(window)
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        if self.slice.len() < self.size.get() {
-            (0, Some(0))
-        } else {
-            let windows = self.slice.len() - self.size.get() + 1;
-            (windows, Some(windows))
-        }
-    }
-}
-
-impl<T, A: Allocator> ExactSizeIterator for Windows<'_, T, A> {}
-impl<T, A: Allocator> std::iter::FusedIterator for Windows<'_, T, A> {}
 
 unsafe impl<T: Send, A: Allocator + Send> Send for SliceIterMut<'_, T, A> {}
 unsafe impl<T: Sync, A: Allocator + Sync> Sync for SliceIterMut<'_, T, A> {}
