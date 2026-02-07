@@ -498,6 +498,7 @@ impl<'a, T, A: Allocator + 'a, P> FusedIterator for Split<'a, T, A, P> where P: 
 /// This struct is created by the [`split_inclusive`] method on [`SegmentedSlice`].
 ///
 /// [`split_inclusive`]: SegmentedSlice::split_inclusive
+#[derive(Debug, Clone)]
 pub struct SplitInclusive<'a, T, A: Allocator + 'a, P>
 where
     P: FnMut(&T) -> bool,
@@ -531,28 +532,45 @@ where
             return None;
         }
 
-        // Find the position of the next matching element
-        let idx = self
-            .slice
-            .iter()
-            .position(|x| (self.pred)(x))
-            .map(|idx| idx + 1) // Include the separator
-            .unwrap_or(self.slice.len());
+        let mut iter = self.slice.iter();
+        let mut consumed = 0;
 
-        if idx == self.slice.len() {
-            self.finished = true;
+        loop {
+            if iter.remaining == 0 {
+                return self.finish();
+            }
+
+            // SAFETY: iter.remaining > 0 means ptr is valid
+            let element = unsafe { &*iter.ptr.as_ptr() };
+            let matched = (self.pred)(element);
+
+            iter.next();
+            consumed += 1;
+
+            if matched {
+                // Match found! Include the separator in the result.
+                let result = SegmentedSlice {
+                    buf: self.slice.buf,
+                    start: self.slice.start,
+                    len: consumed,
+                    end_ptr: iter.ptr, // ptr is already past the separator
+                    end_seg: iter.seg,
+                    _marker: PhantomData,
+                };
+
+                // Update slice to start after the separator
+                self.slice = SegmentedSlice {
+                    buf: self.slice.buf,
+                    start: self.slice.start + consumed,
+                    len: iter.remaining,
+                    end_ptr: self.slice.end_ptr,
+                    end_seg: self.slice.end_seg,
+                    _marker: PhantomData,
+                };
+
+                return Some(result);
+            }
         }
-
-        let result = SegmentedSlice::new(self.slice.buf, self.slice.start, self.slice.start + idx);
-        self.slice = SegmentedSlice {
-            buf: self.slice.buf,
-            start: self.slice.start + idx,
-            len: self.slice.len - idx,
-            end_ptr: self.slice.end_ptr,
-            end_seg: self.slice.end_seg,
-            _marker: PhantomData,
-        };
-        Some(result)
     }
 
     #[inline]
@@ -560,7 +578,86 @@ where
         if self.finished {
             (0, Some(0))
         } else {
-            (1, Some(std::cmp::max(1, self.slice.len())))
+            (1, Some(self.slice.len()))
+        }
+    }
+}
+
+impl<'a, T, A: Allocator + 'a, P> DoubleEndedIterator for SplitInclusive<'a, T, A, P>
+where
+    P: FnMut(&T) -> bool,
+{
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+
+        let mut iter = self.slice.iter();
+        let mut consumed = 0;
+
+        loop {
+            if iter.remaining == 0 {
+                return self.finish();
+            }
+
+            // SAFETY: iter.remaining > 0 means back_ptr is valid
+            let element = unsafe { &*iter.back_ptr.as_ptr() };
+            let matched = (self.pred)(element);
+
+            if matched && consumed > 0 {
+                let result_start = self.slice.start + iter.remaining;
+                let result_len = consumed;
+
+                let result = SegmentedSlice {
+                    buf: self.slice.buf,
+                    start: result_start,
+                    len: result_len,
+                    end_ptr: self.slice.end_ptr,
+                    end_seg: self.slice.end_seg,
+                    _marker: PhantomData,
+                };
+
+                // Update self.slice to contain the left part (including the separator)
+                // The separator is at `iter.back_ptr`.
+                // We want the end to be `iter.back_ptr` + 1 (exclusive).
+                // Which is exactly `result_start` in pointer terms? No.
+                // `result_start` calculation `self.slice.start + iter.remaining` matches the *count*.
+
+                // We need `end_ptr` for the stored slice.
+                // `end_ptr` should be S+1. S is at `iter.back_ptr`.
+                let new_end_ptr = unsafe { NonNull::new_unchecked(iter.back_ptr.as_ptr().add(1)) };
+                // `end_seg` is `iter.back_seg`.
+
+                self.slice = SegmentedSlice {
+                    buf: self.slice.buf,
+                    start: self.slice.start,
+                    len: iter.remaining,
+                    end_ptr: new_end_ptr,
+                    end_seg: iter.back_seg,
+                    _marker: PhantomData,
+                };
+
+                return Some(result);
+            }
+
+            iter.next_back();
+            consumed += 1;
+        }
+    }
+}
+
+impl<'a, T, A: Allocator + 'a, P> SplitIter for SplitInclusive<'a, T, A, P>
+where
+    P: FnMut(&T) -> bool,
+{
+    #[inline]
+    fn finish(&mut self) -> Option<SegmentedSlice<'a, T, A>> {
+        if self.finished {
+            None
+        } else {
+            self.finished = true;
+            Some(self.slice)
         }
     }
 }
