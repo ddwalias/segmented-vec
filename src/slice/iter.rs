@@ -1112,6 +1112,7 @@ impl<'a, T, A: Allocator + 'a, P> FusedIterator for SplitInclusiveMut<'a, T, A, 
 /// This struct is created by the [`rsplit`] method on [`SegmentedSlice`].
 ///
 /// [`rsplit`]: SegmentedSlice::rsplit
+#[derive(Debug, Clone)]
 pub struct RSplit<'a, T, A: Allocator + 'a, P>
 where
     P: FnMut(&T) -> bool,
