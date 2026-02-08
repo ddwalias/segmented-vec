@@ -4198,35 +4198,244 @@ unsafe impl<T: Send, A: Allocator + Send> Send for SliceIterMut<'_, T, A> {}
 unsafe impl<T: Sync, A: Allocator + Sync> Sync for SliceIterMut<'_, T, A> {}
 
 /// An iterator over subslices separated by elements that match a predicate function.
-pub struct ChunkBy<'a, T, F> {
-    slice: SegmentedSlice<'a, T>,
+#[derive(Debug, Clone)]
+pub struct ChunkBy<'a, T, F, A: Allocator + 'a = Global> {
+    slice: SegmentedSlice<'a, T, A>,
     pred: F,
 }
 
-impl<'a, T, F> Iterator for ChunkBy<'a, T, F>
+impl<'a, T, F, A: Allocator + 'a> ChunkBy<'a, T, F, A> {
+    #[inline]
+    pub(crate) fn new(slice: SegmentedSlice<'a, T, A>, pred: F) -> Self {
+        Self { slice, pred }
+    }
+}
+
+impl<'a, T, F, A: Allocator + 'a> Iterator for ChunkBy<'a, T, F, A>
 where
     F: FnMut(&T, &T) -> bool,
 {
-    type Item = SegmentedSlice<'a, T>;
+    type Item = SegmentedSlice<'a, T, A>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        if self.slice.is_empty() {
+            return None;
+        }
+
+        let len = self.slice.len();
+        // Find the index of the first element that does not satisfy the predicate with the next element.
+        // We look for i such that !pred(slice[i], slice[i+1]).
+        // The chunk includes slice[i], so the split point is i + 1.
+        let split_point = self
+            .slice
+            .iter()
+            .zip(self.slice.iter().skip(1))
+            .position(|(prev, next)| !(self.pred)(prev, next))
+            .map(|i| i + 1)
+            .unwrap_or(len);
+
+        let (head, tail) = self.slice.split_at(split_point);
+        self.slice = tail;
+        Some(head)
     }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.slice.is_empty() {
+            (0, Some(0))
+        } else {
+            (1, Some(self.slice.len()))
+        }
+    }
+
+    #[inline]
+    fn last(mut self) -> Option<Self::Item> {
+        self.next_back()
+    }
+}
+
+impl<'a, T, F, A: Allocator + 'a> DoubleEndedIterator for ChunkBy<'a, T, F, A>
+where
+    F: FnMut(&T, &T) -> bool,
+{
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.slice.is_empty() {
+            return None;
+        }
+
+        // Find the index of the last element that does not satisfy the predicate with the previous element.
+        let split_point = self
+            .slice
+            .iter()
+            .zip(self.slice.iter().skip(1))
+            .rposition(|(prev, next)| !(self.pred)(prev, next))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+
+        let (head, tail) = self.slice.split_at(split_point);
+        self.slice = head;
+        Some(tail)
+    }
+}
+
+impl<'a, T, F, A: Allocator + 'a> FusedIterator for ChunkBy<'a, T, F, A> where
+    F: FnMut(&T, &T) -> bool
+{
 }
 
 /// An iterator over mutable subslices separated by elements that match a predicate function.
-pub struct ChunkByMut<'a, T, F> {
-    slice: SegmentedSliceMut<'a, T>,
+pub struct ChunkByMut<'a, T, F, A: Allocator + 'a = Global> {
+    slice: SegmentedSliceMut<'a, T, A>,
     pred: F,
 }
 
-impl<'a, T, F> Iterator for ChunkByMut<'a, T, F>
+impl<'a, T, F, A: Allocator + 'a> ChunkByMut<'a, T, F, A> {
+    #[inline]
+    pub(crate) fn new(slice: SegmentedSliceMut<'a, T, A>, pred: F) -> Self {
+        Self { slice, pred }
+    }
+}
+
+impl<'a, T, F, A: Allocator + 'a> Iterator for ChunkByMut<'a, T, F, A>
 where
     F: FnMut(&T, &T) -> bool,
 {
-    type Item = SegmentedSliceMut<'a, T>;
+    type Item = SegmentedSliceMut<'a, T, A>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        if self.slice.is_empty() {
+            return None;
+        }
+
+        let len = self.slice.len();
+        // To find the split point, we need to inspect elements.
+        // We can create a temporary immutable view of the remaining mutable slice.
+        // This is safe because we only hold it for finding the index and then drop it
+        // before performing the mutable split.
+        let temp_view = SegmentedSlice {
+            buf: self.slice.buf,
+            start: self.slice.start,
+            len: self.slice.len,
+            end_ptr: self.slice.end_ptr,
+            end_seg: self.slice.end_seg,
+            _marker: PhantomData,
+        };
+
+        let split_point = temp_view
+            .iter()
+            .zip(temp_view.iter().skip(1))
+            .position(|(prev, next)| !(self.pred)(prev, next))
+            .map(|i| i + 1)
+            .unwrap_or(len);
+
+        // Now we can split safely
+        // split_at_mut consumes self (or effectively reborrows if we implemented it that way),
+        // but here we want to update self.slice.
+        // SegmentedSliceMut methods usually return new slices.
+        // We need `split_at_mut` behavior on `self.slice`.
+        // Let's rely on `split_at_mut_checked` or similar if available, or just construct manually/use logic.
+        // SegmentedSliceMut::split_at_mut returns (head, tail).
+
+        // We need to temporarily take `self.slice` out or clone the metadata (it's Copy-ish but not Copy).
+        // Actually SegmentedSliceMut is not Copy.
+        // But we can duplicate the metadata since we have exclusive access to `self`.
+
+        // Let's use a helper or manual split to avoid fighting ownership if `split_at_mut` consumes.
+        // Looking at `SegmentedSliceMut`, `split_at_mut` likely consumes or reborrows.
+        // We can just manually split:
+
+        let head_len = split_point;
+
+        // Construct head
+        let head = SegmentedSliceMut::new(
+            self.slice.buf,
+            self.slice.start,
+            self.slice.start + head_len,
+        );
+
+        // Update self.slice to tail
+        self.slice = SegmentedSliceMut::new(
+            self.slice.buf,
+            self.slice.start + head_len,
+            self.slice.start + len,
+        ); // start + len is end
+
+        Some(head)
     }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.slice.is_empty() {
+            (0, Some(0))
+        } else {
+            (1, Some(self.slice.len()))
+        }
+    }
+
+    #[inline]
+    fn last(mut self) -> Option<Self::Item> {
+        self.next_back()
+    }
+}
+
+impl<'a, T, F, A: Allocator + 'a> DoubleEndedIterator for ChunkByMut<'a, T, F, A>
+where
+    F: FnMut(&T, &T) -> bool,
+{
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.slice.is_empty() {
+            return None;
+        }
+
+        let len = self.slice.len();
+        // Find the index of the last element that does not satisfy the predicate with the previous element.
+        // We look for i such that !pred(slice[i], slice[i+1]).
+        // The chunk includes slice[i+1], so the split point is i+1.
+
+        // Use temporary view to find index
+        let temp_view = SegmentedSlice {
+            buf: self.slice.buf,
+            start: self.slice.start,
+            len: self.slice.len,
+            end_ptr: self.slice.end_ptr,
+            end_seg: self.slice.end_seg,
+            _marker: PhantomData,
+        };
+
+        let split_point = temp_view
+            .iter()
+            .zip(temp_view.iter().skip(1))
+            .rposition(|(prev, next)| !(self.pred)(prev, next))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+
+        // Manually split mutably
+        let head_len = split_point;
+        // let tail_len = len - split_point;
+
+        // Construct tail (to return)
+        let tail = SegmentedSliceMut::new(
+            self.slice.buf,
+            self.slice.start + head_len, // start of tail
+            self.slice.start + len,      // end of tail (original end)
+        );
+
+        // Update self.slice to head
+        self.slice = SegmentedSliceMut::new(
+            self.slice.buf,
+            self.slice.start,
+            self.slice.start + head_len,
+        );
+
+        Some(tail)
+    }
+}
+
+impl<'a, T, F, A: Allocator + 'a> FusedIterator for ChunkByMut<'a, T, F, A> where
+    F: FnMut(&T, &T) -> bool
+{
 }

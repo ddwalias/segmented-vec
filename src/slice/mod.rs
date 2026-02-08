@@ -1101,11 +1101,11 @@ impl<'a, T, A: Allocator> SegmentedSliceMut<'a, T, A> {
     /// Returns an iterator over `chunk_size` elements of the slice at a time, starting at the beginning.
     #[inline]
     #[track_caller]
-    pub const fn chunk_by<F>(&self, _pred: F) -> ChunkBy<'_, T, F>
+    pub fn chunk_by<F>(&self, pred: F) -> ChunkBy<'_, T, F, A>
     where
         F: FnMut(&T, &T) -> bool,
     {
-        todo!()
+        ChunkBy::new(self.as_slice(), pred)
     }
 
     /// Divides one slice into two at an index.
@@ -1555,6 +1555,16 @@ impl<'a, T, A: Allocator> SegmentedSliceMut<'a, T, A> {
         T: Clone,
     {
         self.iter().cloned().collect()
+    }
+
+    /// Returns an iterator over mutable subslices separated by elements that match `pred`.
+    #[inline]
+    #[track_caller]
+    pub fn chunk_by_mut<F>(&mut self, pred: F) -> iter::ChunkByMut<'_, T, F, A>
+    where
+        F: FnMut(&T, &T) -> bool,
+    {
+        iter::ChunkByMut::new(self.slice_mut(..), pred)
     }
 }
 
