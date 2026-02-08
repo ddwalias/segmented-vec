@@ -41,9 +41,9 @@ use crate::SegmentedVec;
 
 // Re-export iterator types
 pub use iter::{
-    ArrayWindows, ChunkBy, ChunkByMut, Chunks, ChunksExact, ChunksExactMut, ChunksMut, RChunks,
-    RChunksExact, RChunksExactMut, RChunksMut, RSplit, RSplitMut, RSplitN, SliceIter, SliceIterMut,
-    Split, SplitInclusive, SplitInclusiveMut, SplitN, Windows,
+    ChunkBy, ChunkByMut, Chunks, ChunksExact, ChunksExactMut, ChunksMut, RChunks, RChunksExact,
+    RChunksExactMut, RChunksMut, RSplit, RSplitMut, RSplitN, SliceIter, SliceIterMut, Split,
+    SplitInclusive, SplitInclusiveMut, SplitN, Windows,
 };
 
 /// A view into a portion of a `SegmentedVec`.
@@ -1081,10 +1081,6 @@ impl<'a, T, A: Allocator> SegmentedSliceMut<'a, T, A> {
     pub fn chunks_exact(&self, chunk_size: usize) -> ChunksExact<'a, T, A> {
         assert!(chunk_size != 0, "chunk size must be non-zero");
         ChunksExact::new(self.as_slice(), chunk_size)
-    }
-
-    pub const fn array_windows<const N: usize>(&self) -> ArrayWindows<'_, T, N> {
-        todo!()
     }
 
     /// Returns an iterator over `chunk_size` elements at a time, starting at the end.
