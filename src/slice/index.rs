@@ -27,7 +27,7 @@ pub unsafe trait SliceIndex<T: ?Sized> {
 
 // --- usize ---
 
-unsafe impl<'a, T, A: Allocator + 'a> SliceIndex<SegmentedSlice<'a, T, A>> for usize {
+unsafe impl<'a, T> SliceIndex<SegmentedSlice<'a, T>> for usize {
     type Output<'b>
         = &'a T
     where
@@ -38,7 +38,7 @@ unsafe impl<'a, T, A: Allocator + 'a> SliceIndex<SegmentedSlice<'a, T, A>> for u
         'a: 'b;
 
     #[inline]
-    fn get(self, slice: &SegmentedSlice<'a, T, A>) -> Option<Self::Output<'a>> {
+    fn get(self, slice: &SegmentedSlice<'a, T>) -> Option<Self::Output<'a>> {
         if self < slice.len() {
             unsafe { Some(self.get_unchecked(slice)) }
         } else {
@@ -47,35 +47,32 @@ unsafe impl<'a, T, A: Allocator + 'a> SliceIndex<SegmentedSlice<'a, T, A>> for u
     }
 
     #[inline]
-    fn get_mut(self, _slice: &mut SegmentedSlice<'a, T, A>) -> Option<Self::OutputMut<'a>> {
+    fn get_mut(self, _slice: &mut SegmentedSlice<'a, T>) -> Option<Self::OutputMut<'a>> {
         None
     }
 
     #[inline]
-    unsafe fn get_unchecked(self, slice: &SegmentedSlice<'a, T, A>) -> Self::Output<'a> {
-        &*slice.buf.as_ref().ptr_at(slice.start + self)
+    unsafe fn get_unchecked(self, slice: &SegmentedSlice<'a, T>) -> Self::Output<'a> {
+        &*slice.ptr_at(slice.start + self)
     }
 
     #[inline]
-    unsafe fn get_unchecked_mut(
-        self,
-        _slice: &mut SegmentedSlice<'a, T, A>,
-    ) -> Self::OutputMut<'a> {
+    unsafe fn get_unchecked_mut(self, _slice: &mut SegmentedSlice<'a, T>) -> Self::OutputMut<'a> {
         std::hint::unreachable_unchecked()
     }
 
     #[inline]
-    fn index(self, slice: &SegmentedSlice<'a, T, A>) -> Self::Output<'a> {
+    fn index(self, slice: &SegmentedSlice<'a, T>) -> Self::Output<'a> {
         self.get(slice).expect("index out of bounds")
     }
 
     #[inline]
-    fn index_mut(self, slice: &mut SegmentedSlice<'a, T, A>) -> Self::OutputMut<'a> {
+    fn index_mut(self, slice: &mut SegmentedSlice<'a, T>) -> Self::OutputMut<'a> {
         self.get_mut(slice).expect("index out of bounds")
     }
 }
 
-unsafe impl<'a, T, A: Allocator + 'a> SliceIndex<SegmentedSliceMut<'a, T, A>> for usize {
+unsafe impl<'a, T> SliceIndex<SegmentedSliceMut<'a, T>> for usize {
     type Output<'b>
         = &'a T
     where
@@ -86,7 +83,7 @@ unsafe impl<'a, T, A: Allocator + 'a> SliceIndex<SegmentedSliceMut<'a, T, A>> fo
         'a: 'b;
 
     #[inline]
-    fn get(self, slice: &SegmentedSliceMut<'a, T, A>) -> Option<Self::Output<'a>> {
+    fn get(self, slice: &SegmentedSliceMut<'a, T>) -> Option<Self::Output<'a>> {
         if self < slice.len() {
             unsafe { Some(self.get_unchecked(slice)) }
         } else {
@@ -95,7 +92,7 @@ unsafe impl<'a, T, A: Allocator + 'a> SliceIndex<SegmentedSliceMut<'a, T, A>> fo
     }
 
     #[inline]
-    fn get_mut(self, slice: &mut SegmentedSliceMut<'a, T, A>) -> Option<Self::OutputMut<'a>> {
+    fn get_mut(self, slice: &mut SegmentedSliceMut<'a, T>) -> Option<Self::OutputMut<'a>> {
         if self < slice.len() {
             unsafe { Some(self.get_unchecked_mut(slice)) }
         } else {
@@ -104,25 +101,22 @@ unsafe impl<'a, T, A: Allocator + 'a> SliceIndex<SegmentedSliceMut<'a, T, A>> fo
     }
 
     #[inline]
-    unsafe fn get_unchecked(self, slice: &SegmentedSliceMut<'a, T, A>) -> Self::Output<'a> {
-        &*slice.buf.as_ref().ptr_at(slice.start + self)
+    unsafe fn get_unchecked(self, slice: &SegmentedSliceMut<'a, T>) -> Self::Output<'a> {
+        &*slice.ptr_at(slice.start + self)
     }
 
     #[inline]
-    unsafe fn get_unchecked_mut(
-        self,
-        slice: &mut SegmentedSliceMut<'a, T, A>,
-    ) -> Self::OutputMut<'a> {
-        &mut *slice.buf.as_ref().ptr_at(slice.start + self)
+    unsafe fn get_unchecked_mut(self, slice: &mut SegmentedSliceMut<'a, T>) -> Self::OutputMut<'a> {
+        &mut *slice.ptr_at(slice.start + self)
     }
 
     #[inline]
-    fn index(self, slice: &SegmentedSliceMut<'a, T, A>) -> Self::Output<'a> {
+    fn index(self, slice: &SegmentedSliceMut<'a, T>) -> Self::Output<'a> {
         self.get(slice).expect("index out of bounds")
     }
 
     #[inline]
-    fn index_mut(self, slice: &mut SegmentedSliceMut<'a, T, A>) -> Self::OutputMut<'a> {
+    fn index_mut(self, slice: &mut SegmentedSliceMut<'a, T>) -> Self::OutputMut<'a> {
         self.get_mut(slice).expect("index out of bounds")
     }
 }
@@ -131,9 +125,9 @@ unsafe impl<'a, T, A: Allocator + 'a> SliceIndex<SegmentedSliceMut<'a, T, A>> fo
 
 macro_rules! impl_range_index {
     ($SliceType:ident, $RangeType:ty, $MutRet:ty, $normalize:expr) => {
-        unsafe impl<'a, T, A: Allocator + 'a> SliceIndex<$SliceType<'a, T, A>> for $RangeType {
+        unsafe impl<'a, T> SliceIndex<$SliceType<'a, T>> for $RangeType {
             type Output<'b>
-                = SegmentedSlice<'a, T, A>
+                = SegmentedSlice<'a, T>
             where
                 'a: 'b;
             type OutputMut<'b>
@@ -142,7 +136,7 @@ macro_rules! impl_range_index {
                 'a: 'b;
 
             #[inline]
-            fn get(self, slice: &$SliceType<'a, T, A>) -> Option<Self::Output<'a>> {
+            fn get(self, slice: &$SliceType<'a, T>) -> Option<Self::Output<'a>> {
                 if $normalize(self.clone(), slice.len()).is_none() {
                     return None;
                 }
@@ -150,7 +144,7 @@ macro_rules! impl_range_index {
             }
 
             #[inline]
-            fn get_mut(self, slice: &mut $SliceType<'a, T, A>) -> Option<Self::OutputMut<'a>> {
+            fn get_mut(self, slice: &mut $SliceType<'a, T>) -> Option<Self::OutputMut<'a>> {
                 if $normalize(self.clone(), slice.len()).is_none() {
                     return None;
                 }
@@ -158,10 +152,10 @@ macro_rules! impl_range_index {
             }
 
             #[inline]
-            unsafe fn get_unchecked(self, slice: &$SliceType<'a, T, A>) -> Self::Output<'a> {
+            unsafe fn get_unchecked(self, slice: &$SliceType<'a, T>) -> Self::Output<'a> {
                 let range = $normalize(self, slice.len()).unwrap_unchecked();
                 SegmentedSlice::new(
-                    slice.buf,
+                    slice.segments,
                     slice.start + range.start,
                     slice.start + range.end,
                 )
@@ -170,23 +164,23 @@ macro_rules! impl_range_index {
             #[inline]
             unsafe fn get_unchecked_mut(
                 self,
-                slice: &mut $SliceType<'a, T, A>,
+                slice: &mut $SliceType<'a, T>,
             ) -> Self::OutputMut<'a> {
                 let range = $normalize(self, slice.len()).unwrap_unchecked();
                 <$MutRet>::new(
-                    slice.buf,
+                    slice.segments,
                     slice.start + range.start,
                     slice.start + range.end,
                 )
             }
 
             #[inline]
-            fn index(self, slice: &$SliceType<'a, T, A>) -> Self::Output<'a> {
+            fn index(self, slice: &$SliceType<'a, T>) -> Self::Output<'a> {
                 self.get(slice).expect("range out of bounds")
             }
 
             #[inline]
-            fn index_mut(self, slice: &mut $SliceType<'a, T, A>) -> Self::OutputMut<'a> {
+            fn index_mut(self, slice: &mut $SliceType<'a, T>) -> Self::OutputMut<'a> {
                 self.get_mut(slice).expect("range out of bounds")
             }
         }
@@ -244,37 +238,32 @@ fn range_to_inclusive(range: RangeToInclusive<usize>, len: usize) -> Option<Rang
 impl_range_index!(
     SegmentedSlice,
     Range<usize>,
-    SegmentedSlice<'a, T, A>,
+    SegmentedSlice<'a, T>,
     range_bounds
 );
 impl_range_index!(
     SegmentedSlice,
     RangeTo<usize>,
-    SegmentedSlice<'a, T, A>,
+    SegmentedSlice<'a, T>,
     range_to
 );
 impl_range_index!(
     SegmentedSlice,
     RangeFrom<usize>,
-    SegmentedSlice<'a, T, A>,
+    SegmentedSlice<'a, T>,
     range_from
 );
-impl_range_index!(
-    SegmentedSlice,
-    RangeFull,
-    SegmentedSlice<'a, T, A>,
-    range_full
-);
+impl_range_index!(SegmentedSlice, RangeFull, SegmentedSlice<'a, T>, range_full);
 impl_range_index!(
     SegmentedSlice,
     RangeInclusive<usize>,
-    SegmentedSlice<'a, T, A>,
+    SegmentedSlice<'a, T>,
     range_inclusive
 );
 impl_range_index!(
     SegmentedSlice,
     RangeToInclusive<usize>,
-    SegmentedSlice<'a, T, A>,
+    SegmentedSlice<'a, T>,
     range_to_inclusive
 );
 
@@ -283,37 +272,37 @@ impl_range_index!(
 impl_range_index!(
     SegmentedSliceMut,
     Range<usize>,
-    SegmentedSliceMut<'a, T, A>,
+    SegmentedSliceMut<'a, T>,
     range_bounds
 );
 impl_range_index!(
     SegmentedSliceMut,
     RangeTo<usize>,
-    SegmentedSliceMut<'a, T, A>,
+    SegmentedSliceMut<'a, T>,
     range_to
 );
 impl_range_index!(
     SegmentedSliceMut,
     RangeFrom<usize>,
-    SegmentedSliceMut<'a, T, A>,
+    SegmentedSliceMut<'a, T>,
     range_from
 );
 impl_range_index!(
     SegmentedSliceMut,
     RangeFull,
-    SegmentedSliceMut<'a, T, A>,
+    SegmentedSliceMut<'a, T>,
     range_full
 );
 impl_range_index!(
     SegmentedSliceMut,
     RangeInclusive<usize>,
-    SegmentedSliceMut<'a, T, A>,
+    SegmentedSliceMut<'a, T>,
     range_inclusive
 );
 impl_range_index!(
     SegmentedSliceMut,
     RangeToInclusive<usize>,
-    SegmentedSliceMut<'a, T, A>,
+    SegmentedSliceMut<'a, T>,
     range_to_inclusive
 );
 
@@ -366,12 +355,12 @@ macro_rules! impl_vec_range_index {
     ($RangeType:ty, $normalize:expr) => {
         unsafe impl<T, A: Allocator> SliceIndex<SegmentedVec<T, A>> for $RangeType {
             type Output<'a>
-                = SegmentedSlice<'a, T, A>
+                = SegmentedSlice<'a, T>
             where
                 T: 'a,
                 A: 'a;
             type OutputMut<'a>
-                = SegmentedSliceMut<'a, T, A>
+                = SegmentedSliceMut<'a, T>
             where
                 T: 'a,
                 A: 'a;

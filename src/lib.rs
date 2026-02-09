@@ -1282,13 +1282,13 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
 
     /// Returns an iterator over the vector.
     #[inline]
-    pub fn iter(&self) -> Iter<'_, T, A> {
+    pub fn iter(&self) -> Iter<'_, T> {
         Iter::new(&self.as_slice())
     }
 
     /// Returns a mutable iterator over the vector.
     #[inline]
-    pub fn iter_mut(&mut self) -> IterMut<'_, T, A> {
+    pub fn iter_mut(&mut self) -> IterMut<'_, T> {
         IterMut::new(&mut self.as_mut_slice())
     }
 
@@ -1484,7 +1484,7 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
     /// Panics if `chunk_size` is 0.
     #[inline]
     #[track_caller]
-    pub fn chunks(&self, chunk_size: usize) -> slice::Chunks<'_, T, A> {
+    pub fn chunks(&self, chunk_size: usize) -> slice::Chunks<'_, T> {
         self.as_slice().chunks(chunk_size)
     }
 
@@ -1495,7 +1495,7 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
     /// Panics if `size` is 0.
     #[inline]
     #[track_caller]
-    pub fn windows(&self, size: usize) -> slice::Windows<'_, T, A> {
+    pub fn windows(&self, size: usize) -> slice::Windows<'_, T> {
         self.as_slice().windows(size)
     }
 
@@ -2067,7 +2067,7 @@ impl<T> IntoIterator for SegmentedVec<T> {
 
 impl<'a, T, A: Allocator> IntoIterator for &'a SegmentedVec<T, A> {
     type Item = &'a T;
-    type IntoIter = Iter<'a, T, A>;
+    type IntoIter = Iter<'a, T>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -2076,7 +2076,7 @@ impl<'a, T, A: Allocator> IntoIterator for &'a SegmentedVec<T, A> {
 
 impl<'a, T, A: Allocator> IntoIterator for &'a mut SegmentedVec<T, A> {
     type Item = &'a mut T;
-    type IntoIter = IterMut<'a, T, A>;
+    type IntoIter = IterMut<'a, T>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter_mut()

@@ -18,11 +18,11 @@ const fn min_cap_exp_for_size(elem_size: usize) -> u32 {
     if elem_size == 0 {
         usize::BITS - 1
     } else if elem_size == 1 {
-        3 // 8 elements
+        3 // 2^3 = 8
     } else if elem_size <= 1024 {
-        2 // 4 elements
+        2 // 2^2 = 4
     } else {
-        0 // 1 element
+        0 // 2^0 = 1
     }
 }
 
@@ -48,7 +48,7 @@ const fn segment_capacity_for_size(index: usize, elem_size: usize) -> usize {
 
 /// Computes total capacity given the number of segments and element size.
 #[inline]
-const fn compute_capacity_for_size(segment_count: usize, elem_size: usize) -> usize {
+pub(crate) const fn compute_capacity_for_size(segment_count: usize, elem_size: usize) -> usize {
     if elem_size == 0 {
         usize::MAX
     } else {
@@ -251,16 +251,21 @@ impl<T, A: Allocator> RawSegmentedVec<T, A> {
         self.inner.segments.as_ptr().add(index).read() as *mut T
     }
 
+    /// Returns a pointer to the segments array (the backbone) as `NonNull<*mut T>`.
+    ///
+    /// This is used by `SegmentedSlice` to store the segments pointer directly
+    /// without needing the allocator generic.
+    #[inline]
+    pub(crate) fn segments_array_ptr(&self) -> NonNull<*mut T> {
+        // Cast `NonNull<*mut u8>` to `NonNull<*mut T>`.
+        // Safe because segment pointers are `*mut u8` which can be cast to `*mut T`.
+        unsafe { NonNull::new_unchecked(self.inner.segments.as_ptr() as *mut *mut T) }
+    }
+
     /// Returns the capacity of a segment at the given index.
     #[inline]
     pub(crate) fn segment_capacity(index: usize) -> usize {
         segment_capacity_for_size(index, std::mem::size_of::<T>())
-    }
-
-    /// Returns the logical start index of the segment at the given index.
-    #[inline]
-    pub(crate) fn segment_start_index(&self, index: usize) -> usize {
-        compute_capacity_for_size(index, std::mem::size_of::<T>())
     }
 
     /// Computes the segment index and offset within segment for a given logical index.
@@ -286,6 +291,20 @@ impl<T, A: Allocator> RawSegmentedVec<T, A> {
         let offset = index - segment_start;
 
         (segment_index, offset)
+    }
+
+    /// Like `location`, but if the index is at a segment boundary, it prefers
+    /// the end of the previous segment. This is useful for "past-the-end" pointers
+    /// to avoid reaching into unallocated segments.
+    #[inline]
+    pub(crate) fn location_for_end(index: usize) -> (usize, usize) {
+        let (seg, offset) = Self::location(index);
+        if offset == 0 && seg > 0 {
+            let prev_seg = seg - 1;
+            (prev_seg, Self::segment_capacity(prev_seg))
+        } else {
+            (seg, offset)
+        }
     }
 
     /// Returns a pointer to the element at the given logical index.
