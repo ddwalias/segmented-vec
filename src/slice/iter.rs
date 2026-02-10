@@ -1080,7 +1080,6 @@ impl<'a, T, P> FusedIterator for Split<'a, T, P> where P: FnMut(&T) -> bool {}
 /// This struct is created by the [`split_inclusive`] method on [`SegmentedSlice`].
 ///
 /// [`split_inclusive`]: SegmentedSlice::split_inclusive
-#[derive(Clone)]
 pub struct SplitInclusive<'a, T, P>
 where
     P: FnMut(&T) -> bool,
@@ -1088,6 +1087,18 @@ where
     slice: SegmentedSlice<'a, T>,
     pred: P,
     finished: bool,
+}
+
+impl<'a, T, P: FnMut(&T) -> bool> SplitInclusive<'a, T, P> {
+    #[inline]
+    pub(crate) fn new(slice: SegmentedSlice<'a, T>, pred: P) -> Self {
+        let finished = slice.is_empty();
+        Self {
+            slice,
+            pred,
+            finished,
+        }
+    }
 }
 
 impl<T: std::fmt::Debug, P> std::fmt::Debug for SplitInclusive<'_, T, P>
@@ -1102,14 +1113,15 @@ where
     }
 }
 
-impl<'a, T, P: FnMut(&T) -> bool> SplitInclusive<'a, T, P> {
-    #[inline]
-    pub(crate) fn new(slice: SegmentedSlice<'a, T>, pred: P) -> Self {
-        let finished = slice.is_empty();
+impl<'a, T, P> Clone for SplitInclusive<'a, T, P>
+where
+    P: Clone + FnMut(&T) -> bool,
+{
+    fn clone(&self) -> Self {
         Self {
-            slice,
-            pred,
-            finished,
+            slice: self.slice.clone(),
+            pred: self.pred.clone(),
+            finished: self.finished,
         }
     }
 }
@@ -1126,51 +1138,18 @@ where
             return None;
         }
 
-        let mut iter = self.slice.iter();
-        let mut consumed = 0;
-
-        loop {
-            if iter.remaining == 0 {
-                if self.finished || self.slice.is_empty() {
-                    self.finished = true;
-                    return None;
-                } else {
-                    self.finished = true;
-                    return Some(self.slice);
-                }
-            }
-
-            // SAFETY: iter.remaining > 0 means ptr is valid
-            let element = unsafe { &*iter.ptr.as_ptr() };
-            let matched = (self.pred)(element);
-
-            iter.next();
-            consumed += 1;
-
-            if matched {
-                // Match found! Include the separator in the result.
-                let result = SegmentedSlice {
-                    segments: self.slice.segments,
-                    start: self.slice.start,
-                    len: consumed,
-                    end_ptr: iter.ptr, // ptr is already past the separator
-                    end_seg: RawSegmentedVec::<T>::location(iter.idx).0,
-                    _marker: PhantomData,
-                };
-
-                // Update slice to start after the separator
-                self.slice = SegmentedSlice {
-                    segments: self.slice.segments,
-                    start: self.slice.start + consumed,
-                    len: iter.remaining,
-                    end_ptr: self.slice.end_ptr,
-                    end_seg: self.slice.end_seg,
-                    _marker: PhantomData,
-                };
-
-                return Some(result);
-            }
+        let idx = self
+            .slice
+            .iter()
+            .position(|x| (self.pred)(x))
+            .map(|idx| idx + 1)
+            .unwrap_or(self.slice.len());
+        if idx == self.slice.len() {
+            self.finished = true;
         }
+        let ret = Some(self.slice.range(..idx));
+        self.slice = self.slice.range(idx..);
+        ret
     }
 
     #[inline]
@@ -1178,7 +1157,10 @@ where
         if self.finished {
             (0, Some(0))
         } else {
-            (1, Some(self.slice.len()))
+            // If the predicate doesn't match anything, we yield one slice.
+            // If it matches every element, we yield `len()` one-element slices,
+            // or a single empty slice.
+            (1, Some(cmp::max(1, self.slice.len())))
         }
     }
 }
@@ -1193,63 +1175,25 @@ where
             return None;
         }
 
-        let mut iter = self.slice.iter();
-        let mut consumed = 0;
-
-        loop {
-            if iter.remaining == 0 {
-                if self.finished || self.slice.is_empty() {
-                    self.finished = true;
-                    return None;
-                } else {
-                    self.finished = true;
-                    return Some(self.slice);
-                }
-            }
-
-            // SAFETY: iter.remaining > 0 means back_ptr is valid
-            let element = unsafe { &*iter.back_ptr.as_ptr() };
-            let matched = (self.pred)(element);
-
-            if matched && consumed > 0 {
-                let result_start = self.slice.start + iter.remaining;
-                let result_len = consumed;
-
-                let result = SegmentedSlice {
-                    segments: self.slice.segments,
-                    start: result_start,
-                    len: result_len,
-                    end_ptr: self.slice.end_ptr,
-                    end_seg: self.slice.end_seg,
-                    _marker: PhantomData,
-                };
-
-                // Update self.slice to contain the left part (including the separator)
-                // The separator is at `iter.back_ptr`.
-                // We want the end to be `iter.back_ptr` + 1 (exclusive).
-                // Which is exactly `result_start` in pointer terms? No.
-                // `result_start` calculation `self.slice.start + iter.remaining` matches the *count*.
-
-                // We need `end_ptr` for the stored slice.
-                // `end_ptr` should be S+1. S is at `iter.back_ptr`.
-                let new_end_ptr = unsafe { NonNull::new_unchecked(iter.back_ptr.as_ptr().add(1)) };
-                // `end_seg` is `iter.back_seg`.
-
-                self.slice = SegmentedSlice {
-                    segments: self.slice.segments,
-                    start: self.slice.start,
-                    len: iter.remaining,
-                    end_ptr: new_end_ptr,
-                    end_seg: iter.back_seg,
-                    _marker: PhantomData,
-                };
-
-                return Some(result);
-            }
-
-            iter.next_back();
-            consumed += 1;
+        // The last index of self.slice is already checked and found to match
+        // by the last iteration, so we start searching a new match
+        // one index to the left.
+        let remainder = if self.slice.is_empty() {
+            self.slice
+        } else {
+            self.slice.range(..(self.slice.len() - 1))
+        };
+        let idx = remainder
+            .iter()
+            .rposition(|x| (self.pred)(x))
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        if idx == 0 {
+            self.finished = true;
         }
+        let ret = Some(self.slice.range(idx..));
+        self.slice = self.slice.range(..idx);
+        ret
     }
 }
 
@@ -2806,8 +2750,8 @@ impl<'a, T> ChunksExact<'a, T> {
         let rem_len = len % chunk_size;
         let exact_len = len - rem_len;
 
-        let rem = slice.sub_slice(exact_len..len);
-        let exact_slice = slice.sub_slice(0..exact_len);
+        let rem = slice.range(exact_len..len);
+        let exact_slice = slice.range(0..exact_len);
 
         if exact_len == 0 {
             return Self {

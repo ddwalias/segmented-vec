@@ -524,7 +524,10 @@ impl<'a, T> SegmentedSlice<'a, T> {
     /// Returns a sub-slice of the slice.
     #[inline]
     #[must_use]
-    pub fn sub_slice<R: RangeBounds<usize>>(&self, range: R) -> SegmentedSlice<'a, T> {
+    pub(crate) fn range<R>(&self, range: R) -> SegmentedSlice<'a, T>
+    where
+        R: RangeBounds<usize>,
+    {
         let len = self.len();
         let start = match range.start_bound() {
             core::ops::Bound::Included(&s) => s,
@@ -546,7 +549,7 @@ impl<'a, T> SegmentedSlice<'a, T> {
         F: FnMut(&T) -> bool,
     {
         let index = self.iter().position(pred)?;
-        Some((self.sub_slice(..index), self.sub_slice(index + 1..)))
+        Some((self.range(..index), self.range(index + 1..)))
     }
 
     #[inline]
@@ -555,7 +558,7 @@ impl<'a, T> SegmentedSlice<'a, T> {
         F: FnMut(&T) -> bool,
     {
         let index = self.iter().rposition(pred)?;
-        Some((self.sub_slice(..index), self.sub_slice(index + 1..)))
+        Some((self.range(..index), self.range(index + 1..)))
     }
 }
 
