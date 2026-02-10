@@ -4,11 +4,11 @@
 //! - Split iterators (`Split`, `SplitMut`, `SplitInclusive`, etc.)
 //! - Mutable chunk iterators (`ChunksMut`, `ChunksExactMut`, etc.)
 
-use std::cmp;
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
+use std::{cmp, mem};
 
 use crate::raw_vec::RawSegmentedVec;
 use crate::slice::{SegmentedSlice, SegmentedSliceMut};
@@ -1362,6 +1362,17 @@ where
     finished: bool,
 }
 
+impl<'a, T, P: FnMut(&T) -> bool> SplitInclusiveMut<'a, T, P> {
+    pub(crate) fn new(slice: SegmentedSliceMut<'a, T>, pred: P) -> Self {
+        let finished = slice.is_empty();
+        Self {
+            slice,
+            pred,
+            finished,
+        }
+    }
+}
+
 impl<T: std::fmt::Debug, P> std::fmt::Debug for SplitInclusiveMut<'_, T, P>
 where
     P: FnMut(&T) -> bool,
@@ -1371,17 +1382,6 @@ where
             .field("slice", &self.slice)
             .field("finished", &self.finished)
             .finish()
-    }
-}
-
-impl<'a, T, P: FnMut(&T) -> bool> SplitInclusiveMut<'a, T, P> {
-    pub(crate) fn new(slice: SegmentedSliceMut<'a, T>, pred: P) -> Self {
-        let finished = slice.is_empty();
-        Self {
-            slice,
-            pred,
-            finished,
-        }
     }
 }
 
@@ -1397,71 +1397,19 @@ where
             return None;
         }
 
-        // Capture fields before borrowing slice mutably for replace and loop
-        let slice_buf = self.slice.segments;
-        let slice_start = self.slice.start;
-        let slice_len = self.slice.len;
-        let slice_end_ptr = self.slice.end_ptr;
-        let slice_end_seg = self.slice.end_seg;
-
-        // Take the slice to avoid mutable borrow conflict during iteration
-        let mut slice = std::mem::replace(
-            &mut self.slice,
-            SegmentedSliceMut {
-                segments: slice_buf,
-                start: slice_start + slice_len,
-                len: 0,
-                end_ptr: NonNull::dangling(), // Temporary, will be overwritten if match
-                end_seg: 0,
-                _marker: PhantomData,
-            },
-        );
-
-        let mut iter = slice.iter_mut();
-        let mut consumed = 0;
-
-        loop {
-            if iter.remaining == 0 {
-                if self.finished || slice.is_empty() {
-                    self.finished = true;
-                    return None;
-                } else {
-                    self.finished = true;
-                    return Some(slice);
-                }
-            }
-
-            // SAFETY: iter.remaining > 0 means iter.ptr is valid
-            let element = unsafe { &*iter.ptr.as_ptr() };
-            let matched = (self.pred)(element);
-
-            iter.next();
-            consumed += 1;
-
-            if matched {
-                // Match found! Include the separator in the result.
-                let result = SegmentedSliceMut {
-                    segments: slice_buf,
-                    start: slice_start,
-                    len: consumed,
-                    end_ptr: iter.ptr, // ptr is already past the separator
-                    end_seg: RawSegmentedVec::<T>::location(iter.idx).0,
-                    _marker: PhantomData,
-                };
-
-                // Update slice to start after the separator
-                self.slice = SegmentedSliceMut {
-                    segments: slice_buf,
-                    start: slice_start + consumed,
-                    len: iter.remaining,
-                    end_ptr: slice_end_ptr,
-                    end_seg: slice_end_seg,
-                    _marker: PhantomData,
-                };
-
-                return Some(result);
-            }
+        let idx_opt = {
+            // work around borrowck limitations
+            let pred = &mut self.pred;
+            self.slice.iter().position(|x| (*pred)(x))
+        };
+        let idx = idx_opt.map(|idx| idx + 1).unwrap_or(self.slice.len());
+        if idx == self.slice.len() {
+            self.finished = true;
         }
+        let mut tmp = std::mem::take(&mut self.slice);
+        let (head, tail) = tmp.split_at_mut(idx);
+        self.slice = tail;
+        Some(head.range(..idx))
     }
 
     #[inline]
@@ -1469,7 +1417,10 @@ where
         if self.finished {
             (0, Some(0))
         } else {
-            (1, Some(self.slice.len()))
+            // If the predicate doesn't match anything, we yield one slice.
+            // If it matches every element, we yield `len()` one-element slices,
+            // or a single empty slice.
+            (1, Some(cmp::max(1, self.slice.len())))
         }
     }
 }
@@ -1484,79 +1435,26 @@ where
             return None;
         }
 
-        // Capture fields before borrowing slice mutably
-        let slice_buf = self.slice.segments;
-        let slice_start = self.slice.start;
-        let slice_end_ptr = self.slice.end_ptr;
-        let slice_end_seg = self.slice.end_seg;
+        let idx_opt = if self.slice.is_empty() {
+            None
+        } else {
+            // work around borrowck limitations
+            let pred = &mut self.pred;
 
-        // Take the slice to avoid mutable borrow conflict
-        let mut slice = std::mem::replace(
-            &mut self.slice,
-            SegmentedSliceMut {
-                segments: slice_buf,
-                start: slice_start,
-                len: 0,
-                end_ptr: NonNull::dangling(),
-                end_seg: 0,
-                _marker: PhantomData,
-            },
-        );
-
-        let mut iter = slice.iter_mut();
-        let mut consumed = 0;
-
-        loop {
-            if iter.remaining == 0 {
-                if self.finished || slice.is_empty() {
-                    self.finished = true;
-                    return None;
-                } else {
-                    self.finished = true;
-                    return Some(slice);
-                }
-            }
-
-            // SAFETY: iter.remaining > 0 means back_ptr is valid
-            let element = unsafe { &*iter.back_ptr.as_ptr() };
-            let matched = (self.pred)(element);
-
-            if matched && consumed > 0 {
-                let result_start = slice_start + iter.remaining;
-                let result_len = consumed;
-
-                let result = SegmentedSliceMut {
-                    segments: slice_buf,
-                    start: result_start,
-                    len: result_len,
-                    end_ptr: slice_end_ptr,
-                    end_seg: slice_end_seg,
-                    _marker: PhantomData,
-                };
-
-                // Capture separator seg BEFORE advancing
-                let separator_seg = iter.back_seg;
-
-                // The separator terminates the previous chunk (the one on the left).
-                // So the slice we store in `self.slice` ends AFTER the separator.
-                // Wait. `end_ptr` should be S+1. S is at `iter.back_ptr`.
-                let new_end_ptr = unsafe { NonNull::new_unchecked(iter.back_ptr.as_ptr().add(1)) };
-
-                self.slice = SegmentedSliceMut {
-                    segments: slice_buf,
-                    start: slice_start,
-                    len: iter.remaining,
-                    end_ptr: new_end_ptr,
-                    end_seg: separator_seg,
-                    _marker: PhantomData,
-                };
-
-                return Some(result);
-            }
-
-            iter.next_back();
-            consumed += 1;
+            // The last index of self.v is already checked and found to match
+            // by the last iteration, so we start searching a new match
+            // one index to the left.
+            let remainder = self.slice.as_slice().range(..(self.slice.len() - 1));
+            remainder.iter().rposition(|x| (*pred)(x))
+        };
+        let idx = idx_opt.map(|idx| idx + 1).unwrap_or(0);
+        if idx == 0 {
+            self.finished = true;
         }
+        let mut tmp = std::mem::take(&mut self.slice);
+        let (head, tail) = tmp.split_at_mut(idx);
+        self.slice = head;
+        Some(tail.range(1..))
     }
 }
 
