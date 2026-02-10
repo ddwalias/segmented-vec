@@ -164,13 +164,6 @@ impl<'a, T> SliceIter<'a, T> {
     }
 }
 
-impl<T> ExactSizeIterator for SliceIter<'_, T> {
-    #[inline(always)]
-    fn len(&self) -> usize {
-        self.remaining
-    }
-}
-
 impl<'a, T> Iterator for SliceIter<'a, T> {
     type Item = &'a T;
 
@@ -331,25 +324,6 @@ impl<'a, T> Iterator for SliceIter<'a, T> {
     // }
 }
 
-impl<T> Clone for SliceIter<'_, T> {
-    #[inline]
-    fn clone(&self) -> Self {
-        Self {
-            segments: self.segments,
-            ptr: self.ptr,
-            seg_end: self.seg_end,
-            idx: self.idx,
-            back_ptr: self.back_ptr,
-            back_seg_start: self.back_seg_start,
-            back_seg: self.back_seg,
-            remaining: self.remaining,
-            _marker: self._marker,
-        }
-    }
-}
-
-impl<T> std::iter::FusedIterator for SliceIter<'_, T> {}
-
 impl<T> DoubleEndedIterator for SliceIter<'_, T> {
     #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
@@ -480,6 +454,41 @@ impl<T> DoubleEndedIterator for SliceIter<'_, T> {
         }
 
         acc
+    }
+}
+
+impl<T> ExactSizeIterator for SliceIter<'_, T> {}
+impl<T> std::iter::FusedIterator for SliceIter<'_, T> {}
+impl<T> Default for SliceIter<'_, T> {
+    fn default() -> Self {
+        Self {
+            segments: NonNull::dangling(),
+            ptr: NonNull::dangling(),
+            seg_end: NonNull::dangling(),
+            idx: 0,
+            back_ptr: NonNull::dangling(),
+            back_seg_start: NonNull::dangling(),
+            back_seg: 0,
+            remaining: 0,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T> Clone for SliceIter<'_, T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            segments: self.segments,
+            ptr: self.ptr,
+            seg_end: self.seg_end,
+            idx: self.idx,
+            back_ptr: self.back_ptr,
+            back_seg_start: self.back_seg_start,
+            back_seg: self.back_seg,
+            remaining: self.remaining,
+            _marker: self._marker,
+        }
     }
 }
 
@@ -927,6 +936,21 @@ impl<T> DoubleEndedIterator for SliceIterMut<'_, T> {
 
 impl<T> ExactSizeIterator for SliceIterMut<'_, T> {}
 impl<T> std::iter::FusedIterator for SliceIterMut<'_, T> {}
+impl<T> Default for SliceIterMut<'_, T> {
+    fn default() -> Self {
+        Self {
+            segments: NonNull::dangling(),
+            ptr: NonNull::dangling(),
+            seg_end: NonNull::dangling(),
+            idx: 0,
+            back_ptr: NonNull::dangling(),
+            back_seg_start: NonNull::dangling(),
+            back_seg: 0,
+            remaining: 0,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
 
 /// An internal abstraction over the splitting iterators, so that
 /// splitn, splitn_mut etc can be implemented once.
@@ -1209,18 +1233,6 @@ where
     finished: bool,
 }
 
-impl<T: std::fmt::Debug, P> std::fmt::Debug for SplitMut<'_, T, P>
-where
-    P: FnMut(&T) -> bool,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SplitMut")
-            .field("slice", &self.slice)
-            .field("finished", &self.finished)
-            .finish()
-    }
-}
-
 impl<'a, T, P: FnMut(&T) -> bool> SplitMut<'a, T, P> {
     #[inline]
     pub(crate) fn new(slice: SegmentedSliceMut<'a, T>, pred: P) -> Self {
@@ -1233,170 +1245,15 @@ impl<'a, T, P: FnMut(&T) -> bool> SplitMut<'a, T, P> {
     }
 }
 
-impl<'a, T, P> Iterator for SplitMut<'a, T, P>
+impl<T: std::fmt::Debug, P> std::fmt::Debug for SplitMut<'_, T, P>
 where
     P: FnMut(&T) -> bool,
 {
-    type Item = SegmentedSliceMut<'a, T>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.finished {
-            return None;
-        }
-
-        // Capture fields before borrowing slice mutably for replace and loop
-        let slice_buf = self.slice.segments;
-        let slice_start = self.slice.start;
-        let slice_len = self.slice.len;
-        let slice_end_ptr = self.slice.end_ptr;
-        let slice_end_seg = self.slice.end_seg;
-
-        // Take the slice to avoid mutable borrow conflict during iteration
-        let mut slice = std::mem::replace(
-            &mut self.slice,
-            SegmentedSliceMut {
-                segments: slice_buf,
-                start: slice_start + slice_len,
-                len: 0,
-                end_ptr: NonNull::dangling(), // Temporary, will be overwritten if match
-                end_seg: 0,
-                _marker: PhantomData,
-            },
-        );
-
-        let mut iter = slice.iter_mut();
-        let mut consumed = 0;
-
-        loop {
-            if iter.remaining == 0 {
-                // iter is exhausted, slice is fully consumed.
-                // We return the remaining slice via finish().
-                self.slice = slice;
-                return self.finish();
-            }
-
-            // SAFETY: iter.remaining > 0 means iter.ptr is valid
-            let element = unsafe { &*iter.ptr.as_ptr() };
-
-            if (self.pred)(element) {
-                // Match found.
-                // Reconstruct result and remaining parts.
-
-                let result = SegmentedSliceMut {
-                    segments: slice_buf,
-                    start: slice_start,
-                    len: consumed,
-                    end_ptr: iter.ptr,
-                    end_seg: RawSegmentedVec::<T>::location(iter.idx).0,
-                    _marker: PhantomData,
-                };
-
-                iter.next(); // Skip separator
-
-                // Put remaining part back into self.slice
-                self.slice = SegmentedSliceMut {
-                    segments: slice_buf,
-                    start: slice_start + consumed + 1,
-                    len: iter.remaining,
-                    end_ptr: slice_end_ptr,
-                    end_seg: slice_end_seg,
-                    _marker: PhantomData,
-                };
-
-                return Some(result);
-            }
-
-            iter.next();
-            consumed += 1;
-        }
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        if self.finished {
-            (0, Some(0))
-        } else {
-            // At least 1, at most len + 1
-            (1, Some(self.slice.len() + 1))
-        }
-    }
-}
-
-impl<'a, T, P> DoubleEndedIterator for SplitMut<'a, T, P>
-where
-    P: FnMut(&T) -> bool,
-{
-    #[inline]
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.finished {
-            return None;
-        }
-
-        // Capture fields before borrowing slice mutably
-        let slice_buf = self.slice.segments;
-        let slice_start = self.slice.start;
-        let slice_end_ptr = self.slice.end_ptr;
-        let slice_end_seg = self.slice.end_seg;
-
-        // Take the slice to avoid mutable borrow conflict
-        let mut slice = std::mem::replace(
-            &mut self.slice,
-            SegmentedSliceMut {
-                segments: slice_buf,
-                start: slice_start,
-                len: 0,
-                end_ptr: NonNull::dangling(),
-                end_seg: 0,
-                _marker: PhantomData,
-            },
-        );
-
-        let mut iter = slice.iter_mut();
-        let mut consumed = 0;
-
-        loop {
-            if iter.remaining == 0 {
-                self.slice = slice;
-                return self.finish();
-            }
-
-            // SAFETY: iter.remaining > 0 means back_ptr is valid
-            let element = unsafe { &*iter.back_ptr.as_ptr() };
-
-            if (self.pred)(element) {
-                let result_start = slice_start + iter.remaining;
-
-                let result = SegmentedSliceMut {
-                    segments: slice_buf,
-                    start: result_start,
-                    len: consumed,
-                    end_ptr: slice_end_ptr,
-                    end_seg: slice_end_seg,
-                    _marker: PhantomData,
-                };
-
-                // Capture separator pointer/seg BEFORE advancing
-                let separator_ptr = iter.back_ptr;
-                let separator_seg = iter.back_seg;
-
-                iter.next_back();
-
-                // Put remaining part back into self.slice
-                self.slice = SegmentedSliceMut {
-                    segments: slice_buf,
-                    start: slice_start,
-                    len: iter.remaining,
-                    end_ptr: separator_ptr,
-                    end_seg: separator_seg,
-                    _marker: PhantomData,
-                };
-                return Some(result);
-            }
-
-            iter.next_back();
-            consumed += 1;
-        }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SplitMut")
+            .field("slice", &self.slice)
+            .field("finished", &self.finished)
+            .finish()
     }
 }
 
@@ -1425,6 +1282,71 @@ where
                     _marker: PhantomData,
                 },
             ))
+        }
+    }
+}
+
+impl<'a, T, P> Iterator for SplitMut<'a, T, P>
+where
+    P: FnMut(&T) -> bool,
+{
+    type Item = SegmentedSliceMut<'a, T>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+
+        match self.slice.iter().position(|x| (self.pred)(x)) {
+            None => self.finish(),
+            Some(idx) => {
+                let mut tmp = std::mem::take(&mut self.slice);
+                // idx is the index of the element we are splitting on. We want to set self to the
+                // region after idx, and return the subslice before and not including idx.
+                // So first we split after idx
+                let (head, tail) = tmp.split_at_mut(idx + 1);
+                self.slice = tail;
+                // Then return the subslice up to but not including the found element
+                Some(head.range(..idx))
+            }
+        }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.finished {
+            (0, Some(0))
+        } else {
+            // At least 1, at most len + 1
+            (1, Some(self.slice.len() + 1))
+        }
+    }
+}
+
+impl<'a, T, P> DoubleEndedIterator for SplitMut<'a, T, P>
+where
+    P: FnMut(&T) -> bool,
+{
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+
+        let idx_opt = {
+            // work around borrowck limitations
+            let pred = &mut self.pred;
+            self.slice.iter().rposition(|x| (*pred)(x))
+        };
+        match idx_opt {
+            None => self.finish(),
+            Some(idx) => {
+                let mut tmp = std::mem::take(&mut self.slice);
+                let (head, tail) = tmp.split_at_mut(idx);
+                self.slice = head;
+                Some(tail.range(1..))
+            }
         }
     }
 }

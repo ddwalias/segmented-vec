@@ -140,6 +140,19 @@ impl<'a, T: std::fmt::Debug> std::fmt::Debug for SegmentedSliceMut<'a, T> {
     }
 }
 
+impl<'a, T> Default for SegmentedSliceMut<'a, T> {
+    fn default() -> Self {
+        Self {
+            segments: NonNull::dangling(),
+            start: 0,
+            len: 0,
+            end_ptr: NonNull::dangling(),
+            end_seg: 0,
+            _marker: PhantomData,
+        }
+    }
+}
+
 impl<'a, T> SegmentedSliceMut<'a, T> {
     #[inline]
     pub(crate) fn new(segments: NonNull<*mut T>, start: usize, end: usize) -> Self {
@@ -1392,6 +1405,25 @@ impl<'a, T> SegmentedSliceMut<'a, T> {
     #[must_use]
 
     pub fn slice_mut<R: RangeBounds<usize>>(&mut self, range: R) -> Self {
+        let len = self.len();
+        let start = match range.start_bound() {
+            core::ops::Bound::Included(&s) => s,
+            core::ops::Bound::Excluded(&s) => s + 1,
+            core::ops::Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            core::ops::Bound::Included(&e) => e + 1,
+            core::ops::Bound::Excluded(&e) => e,
+            core::ops::Bound::Unbounded => len,
+        };
+        assert!(start <= end && end <= len);
+        Self::new(self.segments, self.start + start, self.start + end)
+    }
+
+    /// Returns a mutable sub-slice of the slice, consuming `self`.
+    #[inline]
+    #[must_use]
+    pub(crate) fn range<R: RangeBounds<usize>>(self, range: R) -> Self {
         let len = self.len();
         let start = match range.start_bound() {
             core::ops::Bound::Included(&s) => s,
