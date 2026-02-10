@@ -94,10 +94,16 @@ impl<'a, T> Clone for SegmentedSlice<'a, T> {
 
 impl<'a, T> Copy for SegmentedSlice<'a, T> {}
 
+impl<'a, T: std::fmt::Debug> std::fmt::Debug for SegmentedSlice<'a, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
 /// Mutable segmented slice.
 ///
 /// This is analogous to `&mut [T]` but for segmented (non-contiguous) storage.
-#[derive(Debug)]
+
 pub struct SegmentedSliceMut<'a, T> {
     /// Pointer to the segments array.
     pub(crate) segments: NonNull<*mut T>,
@@ -110,6 +116,28 @@ pub struct SegmentedSliceMut<'a, T> {
     /// Cached segment index for end
     pub(crate) end_seg: usize,
     _marker: PhantomData<&'a mut T>,
+}
+
+impl<'a, T: std::fmt::Debug> std::fmt::Debug for SegmentedSliceMut<'a, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // We can inspect elements mutably or immutably.
+        // SliceIterMut is not Clone, but we can iterate to view elements.
+        // However, `Debug` takes `&self`. We cannot call `iter_mut()` which takes `&mut self`.
+        // We need an immutable iterator or unsafe peek.
+        // Fortunately, we can construct a `SegmentedSlice` from the raw parts of `SegmentedSliceMut`
+        // just for printing, because `SegmentedSlice` allows immutable access.
+        // SAFETY: We are inside `Debug` which has a shared reference `&self`.
+        // Creating a `SegmentedSlice` copy is safe as long as we only read, which `Debug` does.
+        let slice_view = SegmentedSlice {
+            segments: self.segments,
+            start: self.start,
+            len: self.len,
+            end_ptr: self.end_ptr,
+            end_seg: self.end_seg,
+            _marker: PhantomData,
+        };
+        f.debug_list().entries(slice_view.iter()).finish()
+    }
 }
 
 impl<'a, T> SegmentedSliceMut<'a, T> {
@@ -481,6 +509,16 @@ impl<'a, T> SegmentedSlice<'a, T> {
     pub fn chunks_exact(&self, chunk_size: usize) -> ChunksExact<'a, T> {
         assert!(chunk_size != 0, "chunk size must be non-zero");
         ChunksExact::new(*self, chunk_size)
+    }
+
+    /// Returns an iterator over the slice, yielding subslices that are non-empty and such that all elements match `pred`.
+    #[inline]
+    #[track_caller]
+    pub fn chunk_by<F>(&self, pred: F) -> ChunkBy<'_, T, F>
+    where
+        F: FnMut(&T, &T) -> bool,
+    {
+        ChunkBy::new(*self, pred)
     }
 
     /// Returns a sub-slice of the slice.
@@ -2365,12 +2403,6 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
         assert!(end <= len, "slice end out of bounds");
 
         SegmentedSliceMut::new(self.buf.segments_array_ptr(), start, end)
-    }
-}
-
-impl<T: std::fmt::Debug> std::fmt::Debug for SegmentedSlice<'_, T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.iter()).finish()
     }
 }
 

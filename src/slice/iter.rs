@@ -27,8 +27,8 @@ impl<'a, T> IntoIterator for SegmentedSliceMut<'a, T> {
     type IntoIter = SliceIterMut<'a, T>;
 
     #[inline]
-    fn into_iter(self) -> Self::IntoIter {
-        SliceIterMut::into_iter(self)
+    fn into_iter(mut self) -> Self::IntoIter {
+        SliceIterMut::new(&mut self)
     }
 }
 
@@ -37,6 +37,7 @@ impl<'a, T> IntoIterator for SegmentedSliceMut<'a, T> {
 ///
 /// This iterator is optimized for sequential access by tracking pointers
 /// directly instead of computing segment locations on each iteration.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct SliceIter<'a, T> {
     segments: NonNull<*mut T>,
     /// Current pointer for forward iteration
@@ -44,7 +45,7 @@ pub struct SliceIter<'a, T> {
     /// End of current segment for forward iteration
     seg_end: NonNull<T>,
     /// Current segment index for forward iteration
-    seg: usize,
+    idx: usize,
     /// Current pointer for backward iteration (points to next element to yield)
     back_ptr: NonNull<T>,
     /// Start of current segment for backward iteration
@@ -58,7 +59,7 @@ pub struct SliceIter<'a, T> {
 
 impl<T: std::fmt::Debug> std::fmt::Debug for SliceIter<'_, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.clone()).finish()
+        f.debug_tuple("Iter").field(&self.as_slice()).finish()
     }
 }
 
@@ -76,7 +77,7 @@ impl<'a, T> SliceIter<'a, T> {
                 segments: slice.segments,
                 ptr: NonNull::dangling(),
                 seg_end: NonNull::dangling(),
-                seg: 0,
+                idx: slice.start,
                 back_ptr: NonNull::dangling(),
                 back_seg_start: NonNull::dangling(),
                 back_seg: 0,
@@ -85,28 +86,49 @@ impl<'a, T> SliceIter<'a, T> {
             };
         }
 
-        // SAFETY: buf is valid for the lifetime 'a
-        let buf = slice.segments;
+        let segments = slice.segments;
 
         // Compute forward iteration state
         let (start_seg, start_offset) = RawSegmentedVec::<T>::location(slice.start);
-        let start_ptr =
-            unsafe { NonNull::new_unchecked((*buf.as_ptr().add(start_seg)).add(start_offset)) };
+        let start_ptr = unsafe {
+            NonNull::new_unchecked((*segments.as_ptr().add(start_seg)).add(start_offset))
+        };
         let start_seg_cap = RawSegmentedVec::<T>::segment_capacity(start_seg);
-        let start_seg_end =
-            unsafe { NonNull::new_unchecked((*buf.as_ptr().add(start_seg)).add(start_seg_cap)) };
+        let start_seg_end = unsafe {
+            NonNull::new_unchecked((*segments.as_ptr().add(start_seg)).add(start_seg_cap))
+        };
+
+        let end_seg_start = unsafe { *segments.as_ptr().add(slice.end_seg) };
 
         // Compute backward iteration state
-        // Optimize: usage of cached fields from SegmentedSlice
-        let back_ptr = unsafe { NonNull::new_unchecked(slice.end_ptr.as_ptr().sub(1)) };
-        let back_seg = slice.end_seg;
-        let back_seg_start = unsafe { NonNull::new_unchecked(*buf.as_ptr().add(back_seg)) };
+        let (back_ptr, back_seg, back_seg_start) = if slice.end_ptr.as_ptr() != end_seg_start {
+            let ptr = unsafe { NonNull::new_unchecked(slice.end_ptr.as_ptr().sub(1)) };
+            // We are in the same segment as end_seg
+            (ptr, slice.end_seg, unsafe {
+                NonNull::new_unchecked(end_seg_start)
+            })
+        } else {
+            // SLOW PATH: end_ptr is at the very beginning of a segment.
+            // This means the actual last element is in the PREVIOUS segment.
+            let prev_seg = slice.end_seg - 1;
+
+            // Load the previous segment's pointer
+            let prev_seg_ptr = unsafe { *segments.as_ptr().add(prev_seg) };
+            let prev_cap = RawSegmentedVec::<T>::segment_capacity(prev_seg);
+
+            // Point to the last element of the previous segment
+            let ptr = unsafe { NonNull::new_unchecked(prev_seg_ptr.add(prev_cap - 1)) };
+
+            (ptr, prev_seg, unsafe {
+                NonNull::new_unchecked(prev_seg_ptr)
+            })
+        };
 
         Self {
             segments: slice.segments,
             ptr: start_ptr,
             seg_end: start_seg_end,
-            seg: start_seg,
+            idx: slice.start,
             back_ptr,
             back_seg_start,
             back_seg,
@@ -118,29 +140,22 @@ impl<'a, T> SliceIter<'a, T> {
     #[must_use]
     #[inline]
     pub fn as_slice(&self) -> SegmentedSlice<'a, T> {
-        if self.remaining == 0 {
-            return SegmentedSlice::new(self.segments, 0, 0);
+        if self.remaining == 0 || std::mem::size_of::<T>() == 0 {
+            return SegmentedSlice {
+                segments: self.segments,
+                start: 0,
+                len: self.remaining,
+                end_ptr: NonNull::dangling(),
+                end_seg: 0,
+                _marker: PhantomData,
+            };
         }
 
-        // Optimize: calculate offset from seg_end to avoid loading segment_ptr from memory.
-        let start = if std::mem::size_of::<T>() == 0 {
-            0
-        } else {
-            let seg_cap = RawSegmentedVec::<T>::segment_capacity(self.seg);
-            let dist_to_end =
-                unsafe { self.seg_end.as_ptr().offset_from(self.ptr.as_ptr()) as usize };
-            let offset = seg_cap - dist_to_end;
-            let segment_start = super::segment_start_index::<T>(self.seg);
-            segment_start + offset
-        };
-
-        // Construct SegmentedSlice directly to avoid re-calculating end location
-        // end_ptr is exclusive, so it is back_ptr + 1
         let end_ptr = unsafe { NonNull::new_unchecked(self.back_ptr.as_ptr().add(1)) };
 
         SegmentedSlice {
             segments: self.segments,
-            start,
+            start: self.idx,
             len: self.remaining,
             end_ptr,
             end_seg: self.back_seg,
@@ -149,15 +164,172 @@ impl<'a, T> SliceIter<'a, T> {
     }
 }
 
-// iterator! {struct Iter -> *const T, &'a T, const, {/* no mut */}, as_ref, each_ref, {
-//     fn is_sorted_by<F>(self, mut compare: F) -> bool
-//     where
-//         Self: Sized,
-//         F: FnMut(&Self::Item, &Self::Item) -> bool,
-//     {
-//         self.as_slice().is_sorted_by(|a, b| compare(&a, &b))
-//     }
-// }}
+impl<T> ExactSizeIterator for SliceIter<'_, T> {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.remaining
+    }
+}
+
+impl<'a, T> Iterator for SliceIter<'a, T> {
+    type Item = &'a T;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        #[cold]
+        fn advance_segment<'a, T>(iter: &mut SliceIter<'a, T>) {
+            // Use our logical index 'idx' to find the next segment location.
+            let (new_seg, _) = RawSegmentedVec::<T>::location(iter.idx);
+
+            // SAFETY: SegmentedSlice guarantees these segments exist.
+            let seg_ptr = unsafe { *iter.segments.as_ptr().add(new_seg) };
+            let cap = RawSegmentedVec::<T>::segment_capacity(new_seg);
+
+            // SAFETY: SegmentedSlice guarantees these segments exist.
+            iter.ptr = unsafe { NonNull::new_unchecked(seg_ptr) };
+            // SAFETY: SegmentedSlice guarantees these segments exist.
+            iter.seg_end = unsafe { NonNull::new_unchecked(seg_ptr.add(cap)) };
+        }
+
+        if self.remaining == 0 {
+            return None;
+        }
+
+        // ZST fast path
+        if std::mem::size_of::<T>() == 0 {
+            self.remaining -= 1;
+            // SAFETY: ZSTs don't need valid memory, dangling pointer is fine
+            return Some(unsafe { &*std::ptr::NonNull::<T>::dangling().as_ptr() });
+        }
+
+        if self.ptr == self.seg_end {
+            advance_segment(self);
+        }
+
+        // SAFETY: remaining > 0 means ptr is valid
+        let result = unsafe { self.ptr.as_ref() };
+        // SAFETY: ptr is valid
+        self.ptr = unsafe { NonNull::new_unchecked(self.ptr.as_ptr().add(1)) };
+        self.idx += 1;
+        self.remaining -= 1;
+
+        Some(result)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+
+    #[inline]
+    fn count(self) -> usize {
+        self.remaining
+    }
+
+    #[inline]
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        if n >= self.remaining {
+            self.idx += self.remaining;
+            self.remaining = 0;
+            return None;
+        }
+
+        if std::mem::size_of::<T>() == 0 {
+            self.remaining -= n + 1;
+            return Some(unsafe { &*std::ptr::NonNull::<T>::dangling().as_ptr() });
+        }
+
+        // SAFETY: remaining > 0 means ptr is valid
+        let dist_from_end =
+            unsafe { self.seg_end.as_ptr().offset_from(self.ptr.as_ptr()) } as usize;
+        if n < dist_from_end {
+            let result = unsafe { self.ptr.as_ptr().add(n) };
+            self.ptr = unsafe { NonNull::new_unchecked(result.add(1)) };
+            self.idx += n + 1;
+            self.remaining -= n + 1;
+            return Some(unsafe { &*result });
+        } else {
+            let target_idx = self.idx + n;
+            let (next_seg, offset) = RawSegmentedVec::<T>::location(target_idx);
+            let next_seg_ptr = unsafe { *self.segments.as_ptr().add(next_seg) };
+            let next_seg_cap = RawSegmentedVec::<T>::segment_capacity(next_seg);
+
+            let result = unsafe { next_seg_ptr.add(offset) };
+            self.ptr = unsafe { NonNull::new_unchecked(result.add(1)) };
+            self.seg_end = unsafe { NonNull::new_unchecked(next_seg_ptr.add(next_seg_cap)) };
+            self.idx = target_idx + 1;
+            self.remaining -= n + 1;
+            return Some(unsafe { &*result });
+        }
+    }
+
+    #[inline]
+    fn last(mut self) -> Option<Self::Item> {
+        self.next_back()
+    }
+
+    #[inline]
+    fn fold<B, F>(mut self, init: B, mut f: F) -> B
+    where
+        F: FnMut(B, Self::Item) -> B,
+    {
+        if self.remaining == 0 {
+            return init;
+        }
+
+        if std::mem::size_of::<T>() == 0 {
+            let mut acc = init;
+            for _ in 0..self.remaining {
+                acc = f(acc, unsafe {
+                    &*std::ptr::NonNull::<T>::dangling().as_ptr()
+                });
+            }
+            return acc;
+        }
+
+        let mut acc = init;
+        // SAFETY: remaining > 0 means ptr is valid
+        let dist_from_end =
+            unsafe { self.seg_end.as_ptr().offset_from(self.ptr.as_ptr()) } as usize;
+        let first_chunk_len = usize::min(dist_from_end, self.remaining);
+        let first_chunk = unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), first_chunk_len) };
+        acc = first_chunk.iter().fold(acc, &mut f);
+
+        self.remaining -= first_chunk_len;
+        if self.remaining == 0 {
+            return acc;
+        }
+
+        let next_idx = self.idx + first_chunk_len;
+        let (mut current_seg_idx, _) = RawSegmentedVec::<T>::location(next_idx);
+
+        while self.remaining > 0 {
+            // SAFETY: remaining > 0 means segments is valid
+            let seg_ptr = unsafe { *self.segments.as_ptr().add(current_seg_idx) };
+            let seg_cap = RawSegmentedVec::<T>::segment_capacity(current_seg_idx);
+            let chunk_len = usize::min(seg_cap, self.remaining);
+
+            // SAFETY: chunk_len <= seg_cap means seg_ptr is valid
+            let seg_slice = unsafe { std::slice::from_raw_parts(seg_ptr, chunk_len) };
+            acc = seg_slice.iter().fold(acc, &mut f);
+
+            self.remaining -= chunk_len;
+            current_seg_idx += 1;
+        }
+
+        acc
+    }
+
+    // TODO: implement try_fold when it's stabilized
+
+    // fn is_sorted_by<F>(self, mut compare: F) -> bool
+    // where
+    //     Self: Sized,
+    //     F: FnMut(&Self::Item, &Self::Item) -> bool,
+    // {
+    //     self.as_slice().is_sorted_by(|a, b| compare(&a, &b))
+    // }
+}
 
 impl<T> Clone for SliceIter<'_, T> {
     #[inline]
@@ -166,13 +338,148 @@ impl<T> Clone for SliceIter<'_, T> {
             segments: self.segments,
             ptr: self.ptr,
             seg_end: self.seg_end,
-            seg: self.seg,
+            idx: self.idx,
             back_ptr: self.back_ptr,
             back_seg_start: self.back_seg_start,
             back_seg: self.back_seg,
             remaining: self.remaining,
             _marker: self._marker,
         }
+    }
+}
+
+impl<T> std::iter::FusedIterator for SliceIter<'_, T> {}
+
+impl<T> DoubleEndedIterator for SliceIter<'_, T> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        #[cold]
+        fn retreat_segment<'a, T>(iter: &mut SliceIter<'a, T>) {
+            // Move to the previous segment index
+            iter.back_seg -= 1;
+
+            // Safety: Valid iterators always have valid preceding segments
+            let seg_ptr = unsafe { *iter.segments.as_ptr().add(iter.back_seg) };
+            let cap = RawSegmentedVec::<T>::segment_capacity(iter.back_seg);
+
+            iter.ptr = unsafe { NonNull::new_unchecked(seg_ptr) };
+            iter.seg_end = unsafe { NonNull::new_unchecked(seg_ptr.add(cap)) };
+        }
+
+        if self.remaining == 0 {
+            return None;
+        }
+
+        // ZST fast path
+        if std::mem::size_of::<T>() == 0 {
+            self.remaining -= 1;
+            // SAFETY: ZSTs don't need valid memory, dangling pointer is fine
+            return Some(unsafe { &*std::ptr::NonNull::<T>::dangling().as_ptr() });
+        }
+
+        if self.back_ptr == self.back_seg_start {
+            retreat_segment(self);
+        }
+
+        // SAFETY: remaining > 0 means ptr is valid
+        let result = unsafe { self.back_ptr.as_ref() };
+        // SAFETY: ptr is valid
+        self.back_ptr = unsafe { NonNull::new_unchecked(self.back_ptr.as_ptr().sub(1)) };
+        self.remaining -= 1;
+
+        Some(result)
+    }
+
+    #[inline]
+    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+        if n >= self.remaining {
+            self.remaining = 0;
+            return None;
+        }
+
+        if std::mem::size_of::<T>() == 0 {
+            self.remaining -= n + 1;
+            return Some(unsafe { &*std::ptr::NonNull::<T>::dangling().as_ptr() });
+        }
+
+        // SAFETY: remaining > 0 means ptr is valid
+        let dist_to_start = unsafe {
+            self.back_ptr
+                .as_ptr()
+                .offset_from(self.back_seg_start.as_ptr())
+        } as usize;
+        if n < dist_to_start {
+            let result = unsafe { self.back_ptr.as_ptr().sub(n) };
+            self.back_ptr = unsafe { NonNull::new_unchecked(result.sub(1)) };
+            self.remaining -= n + 1;
+            return Some(unsafe { &*result });
+        } else {
+            let target_idx = self.idx + self.remaining - n - 1;
+            let (prev_seg, offset) = RawSegmentedVec::<T>::location(target_idx);
+            let prev_seg_ptr = unsafe { *self.segments.as_ptr().add(prev_seg) };
+
+            let result = unsafe { prev_seg_ptr.add(offset) };
+            self.back_ptr = unsafe { NonNull::new_unchecked(result.sub(1)) };
+            self.back_seg_start = unsafe { NonNull::new_unchecked(prev_seg_ptr) };
+            self.back_seg = prev_seg;
+            self.remaining -= n + 1;
+            return Some(unsafe { &*result });
+        }
+    }
+
+    fn rfold<B, F>(mut self, init: B, mut f: F) -> B
+    where
+        Self: Sized,
+        F: FnMut(B, Self::Item) -> B,
+    {
+        if self.remaining == 0 {
+            return init;
+        }
+
+        if std::mem::size_of::<T>() == 0 {
+            let mut acc = init;
+            for _ in 0..self.remaining {
+                acc = f(acc, unsafe {
+                    &*std::ptr::NonNull::<T>::dangling().as_ptr()
+                });
+            }
+            return acc;
+        }
+
+        let mut acc = init;
+        // SAFETY: remaining > 0 means ptr is valid
+        let dist_to_start = unsafe {
+            self.back_ptr
+                .as_ptr()
+                .offset_from(self.back_seg_start.as_ptr())
+        } as usize;
+        let first_chunk_len = usize::min(dist_to_start, self.remaining);
+        let first_chunk_base = unsafe { self.back_ptr.as_ptr().sub(first_chunk_len) };
+        let first_chunk = unsafe { std::slice::from_raw_parts(first_chunk_base, first_chunk_len) };
+        acc = first_chunk.iter().rfold(acc, &mut f);
+
+        self.remaining -= first_chunk_len;
+        if self.remaining == 0 {
+            return acc;
+        }
+
+        let mut current_seg_idx = self.back_seg;
+
+        while self.remaining > 0 {
+            // SAFETY: remaining > 0 means segments is valid
+            let seg_ptr = unsafe { *self.segments.as_ptr().add(current_seg_idx) };
+            let seg_cap = RawSegmentedVec::<T>::segment_capacity(current_seg_idx);
+            let chunk_len = usize::min(seg_cap, self.remaining);
+
+            // SAFETY: chunk_len <= seg_cap means seg_ptr is valid
+            let seg_slice = unsafe { std::slice::from_raw_parts(seg_ptr, chunk_len) };
+            acc = seg_slice.iter().rfold(acc, &mut f);
+
+            self.remaining -= chunk_len;
+            current_seg_idx -= 1;
+        }
+
+        acc
     }
 }
 
@@ -187,7 +494,7 @@ pub struct SliceIterMut<'a, T> {
     /// End of current segment for forward iteration
     seg_end: NonNull<T>,
     /// Current segment index for forward iteration
-    seg: usize,
+    idx: usize,
     /// Current pointer for backward iteration (points to next element to yield)
     back_ptr: NonNull<T>,
     /// Start of current segment for backward iteration
@@ -199,26 +506,19 @@ pub struct SliceIterMut<'a, T> {
     _marker: PhantomData<&'a mut T>,
 }
 
+unsafe impl<T: Send> Send for SliceIterMut<'_, T> {}
+unsafe impl<T: Sync> Sync for SliceIterMut<'_, T> {}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for SliceIterMut<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("IterMut").field(&self.as_slice()).finish()
+    }
+}
+
 impl<'a, T> SliceIterMut<'a, T> {
     /// Creates a new `SliceIterMut` from a buffer and index range.
     #[inline]
     pub(crate) fn new(slice: &mut SegmentedSliceMut<'_, T>) -> Self {
-        // Delegate to from_slice_mut by manually copying fields.
-        // This is safe because we are just creating another view over the same data,
-        // and SliceIterMut logic handles the lifetime safety.
-        Self::into_iter(SegmentedSliceMut {
-            segments: slice.segments,
-            start: slice.start,
-            len: slice.len(),
-            end_ptr: slice.end_ptr,
-            end_seg: slice.end_seg,
-            _marker: PhantomData,
-        })
-    }
-
-    /// Creates a new `SliceIterMut` that consumes the `SegmentedSliceMut`.
-    #[inline]
-    pub(crate) fn into_iter(slice: SegmentedSliceMut<'a, T>) -> Self {
         let len = slice.len();
 
         if len == 0 || std::mem::size_of::<T>() == 0 {
@@ -226,7 +526,7 @@ impl<'a, T> SliceIterMut<'a, T> {
                 segments: slice.segments,
                 ptr: NonNull::dangling(),
                 seg_end: NonNull::dangling(),
-                seg: 0,
+                idx: slice.start,
                 back_ptr: NonNull::dangling(),
                 back_seg_start: NonNull::dangling(),
                 back_seg: 0,
@@ -235,28 +535,49 @@ impl<'a, T> SliceIterMut<'a, T> {
             };
         }
 
-        // SAFETY: buf is valid for the lifetime 'a
-        let buf = slice.segments;
+        let segments = slice.segments;
 
         // Compute forward iteration state
         let (start_seg, start_offset) = RawSegmentedVec::<T>::location(slice.start);
-        let start_ptr =
-            unsafe { NonNull::new_unchecked((*buf.as_ptr().add(start_seg)).add(start_offset)) };
+        let start_ptr = unsafe {
+            NonNull::new_unchecked((*segments.as_ptr().add(start_seg)).add(start_offset))
+        };
         let start_seg_cap = RawSegmentedVec::<T>::segment_capacity(start_seg);
-        let start_seg_end =
-            unsafe { NonNull::new_unchecked((*buf.as_ptr().add(start_seg)).add(start_seg_cap)) };
+        let start_seg_end = unsafe {
+            NonNull::new_unchecked((*segments.as_ptr().add(start_seg)).add(start_seg_cap))
+        };
+
+        let end_seg_start = unsafe { *segments.as_ptr().add(slice.end_seg) };
 
         // Compute backward iteration state
-        // Optimize: usage of cached fields from SegmentedSliceMut
-        let back_ptr = unsafe { NonNull::new_unchecked(slice.end_ptr.as_ptr().sub(1)) };
-        let back_seg = slice.end_seg;
-        let back_seg_start = unsafe { NonNull::new_unchecked(*buf.as_ptr().add(back_seg)) };
+        let (back_ptr, back_seg, back_seg_start) = if slice.end_ptr.as_ptr() != end_seg_start {
+            let ptr = unsafe { NonNull::new_unchecked(slice.end_ptr.as_ptr().sub(1)) };
+            // We are in the same segment as end_seg
+            (ptr, slice.end_seg, unsafe {
+                NonNull::new_unchecked(end_seg_start)
+            })
+        } else {
+            // SLOW PATH: end_ptr is at the very beginning of a segment.
+            // This means the actual last element is in the PREVIOUS segment.
+            let prev_seg = slice.end_seg - 1;
+
+            // Load the previous segment's pointer
+            let prev_seg_ptr = unsafe { *segments.as_ptr().add(prev_seg) };
+            let prev_cap = RawSegmentedVec::<T>::segment_capacity(prev_seg);
+
+            // Point to the last element of the previous segment
+            let ptr = unsafe { NonNull::new_unchecked(prev_seg_ptr.add(prev_cap - 1)) };
+
+            (ptr, prev_seg, unsafe {
+                NonNull::new_unchecked(prev_seg_ptr)
+            })
+        };
 
         Self {
             segments: slice.segments,
             ptr: start_ptr,
             seg_end: start_seg_end,
-            seg: start_seg,
+            idx: slice.start,
             back_ptr,
             back_seg_start,
             back_seg,
@@ -265,32 +586,50 @@ impl<'a, T> SliceIterMut<'a, T> {
         }
     }
 
-    #[must_use]
-    #[inline]
-    pub fn into_slice(self) -> SegmentedSlice<'a, T> {
-        if self.remaining == 0 {
-            return SegmentedSlice::new(self.segments, 0, 0);
+    #[must_use = "`self` will be dropped if the result is not used"]
+    pub fn into_slice(self) -> SegmentedSliceMut<'a, T> {
+        if self.remaining == 0 || std::mem::size_of::<T>() == 0 {
+            return SegmentedSliceMut {
+                segments: self.segments,
+                start: 0,
+                len: self.remaining,
+                end_ptr: NonNull::dangling(),
+                end_seg: 0,
+                _marker: PhantomData,
+            };
         }
 
-        // Optimize: calculate offset from seg_end to avoid loading segment_ptr from memory.
-        let start = if std::mem::size_of::<T>() == 0 {
-            0
-        } else {
-            let seg_cap = RawSegmentedVec::<T>::segment_capacity(self.seg);
-            let dist_to_end =
-                unsafe { self.seg_end.as_ptr().offset_from(self.ptr.as_ptr()) as usize };
-            let offset = seg_cap - dist_to_end;
-            let segment_start = super::segment_start_index::<T>(self.seg);
-            segment_start + offset
-        };
+        let end_ptr = unsafe { NonNull::new_unchecked(self.back_ptr.as_ptr().add(1)) };
 
-        // Construct SegmentedSlice directly to avoid re-calculating end location
-        // end_ptr is exclusive, so it is back_ptr + 1
+        SegmentedSliceMut {
+            segments: self.segments,
+            start: self.idx,
+            len: self.remaining,
+            end_ptr,
+            end_seg: self.back_seg,
+            _marker: PhantomData,
+        }
+    }
+
+    #[must_use]
+    #[inline]
+    pub fn as_slice(&self) -> SegmentedSlice<'a, T> {
+        if self.remaining == 0 || std::mem::size_of::<T>() == 0 {
+            return SegmentedSlice {
+                segments: self.segments,
+                start: 0,
+                len: self.remaining,
+                end_ptr: NonNull::dangling(),
+                end_seg: 0,
+                _marker: PhantomData,
+            };
+        }
+
         let end_ptr = unsafe { NonNull::new_unchecked(self.back_ptr.as_ptr().add(1)) };
 
         SegmentedSlice {
             segments: self.segments,
-            start,
+            start: self.idx,
             len: self.remaining,
             end_ptr,
             end_seg: self.back_seg,
@@ -298,6 +637,296 @@ impl<'a, T> SliceIterMut<'a, T> {
         }
     }
 }
+
+impl<'a, T> Iterator for SliceIterMut<'a, T> {
+    type Item = &'a mut T;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        #[cold]
+        fn advance_segment<'a, T>(iter: &mut SliceIterMut<'a, T>) {
+            // Use our logical index 'idx' to find the next segment location.
+            let (new_seg, _) = RawSegmentedVec::<T>::location(iter.idx);
+
+            // SAFETY: SegmentedSlice guarantees these segments exist.
+            let seg_ptr = unsafe { *iter.segments.as_ptr().add(new_seg) };
+            let cap = RawSegmentedVec::<T>::segment_capacity(new_seg);
+
+            // SAFETY: SegmentedSlice guarantees these segments exist.
+            iter.ptr = unsafe { NonNull::new_unchecked(seg_ptr) };
+            // SAFETY: SegmentedSlice guarantees these segments exist.
+            iter.seg_end = unsafe { NonNull::new_unchecked(seg_ptr.add(cap)) };
+        }
+
+        if self.remaining == 0 {
+            return None;
+        }
+
+        // ZST fast path
+        if std::mem::size_of::<T>() == 0 {
+            self.remaining -= 1;
+            // SAFETY: ZSTs don't need valid memory, dangling pointer is fine
+            return Some(unsafe { &mut *std::ptr::NonNull::<T>::dangling().as_ptr() });
+        }
+
+        if self.ptr == self.seg_end {
+            advance_segment(self);
+        }
+
+        // SAFETY: remaining > 0 means ptr is valid
+        let result = unsafe { &mut *self.ptr.as_ptr() };
+        // SAFETY: ptr is valid
+        self.ptr = unsafe { NonNull::new_unchecked(self.ptr.as_ptr().add(1)) };
+        self.idx += 1;
+        self.remaining -= 1;
+
+        Some(result)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+
+    #[inline]
+    fn count(self) -> usize {
+        self.remaining
+    }
+
+    #[inline]
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        if n >= self.remaining {
+            self.idx += self.remaining;
+            self.remaining = 0;
+            return None;
+        }
+
+        if std::mem::size_of::<T>() == 0 {
+            self.remaining -= n + 1;
+            return Some(unsafe { &mut *std::ptr::NonNull::<T>::dangling().as_ptr() });
+        }
+
+        // SAFETY: remaining > 0 means ptr is valid
+        let dist_from_end =
+            unsafe { self.seg_end.as_ptr().offset_from(self.ptr.as_ptr()) } as usize;
+        if n < dist_from_end {
+            let result = unsafe { self.ptr.as_ptr().add(n) };
+            self.ptr = unsafe { NonNull::new_unchecked(result.add(1)) };
+            self.idx += n + 1;
+            self.remaining -= n + 1;
+            return Some(unsafe { &mut *result });
+        } else {
+            let target_idx = self.idx + n;
+            let (next_seg, offset) = RawSegmentedVec::<T>::location(target_idx);
+            let next_seg_ptr = unsafe { *self.segments.as_ptr().add(next_seg) };
+            let next_seg_cap = RawSegmentedVec::<T>::segment_capacity(next_seg);
+
+            let result = unsafe { next_seg_ptr.add(offset) };
+            self.ptr = unsafe { NonNull::new_unchecked(result.add(1)) };
+            self.seg_end = unsafe { NonNull::new_unchecked(next_seg_ptr.add(next_seg_cap)) };
+            self.idx = target_idx + 1;
+            self.remaining -= n + 1;
+            return Some(unsafe { &mut *result });
+        }
+    }
+
+    #[inline]
+    fn last(mut self) -> Option<Self::Item> {
+        self.next_back()
+    }
+
+    #[inline]
+    fn fold<B, F>(mut self, init: B, mut f: F) -> B
+    where
+        F: FnMut(B, Self::Item) -> B,
+    {
+        if self.remaining == 0 {
+            return init;
+        }
+
+        if std::mem::size_of::<T>() == 0 {
+            let mut acc = init;
+            for _ in 0..self.remaining {
+                acc = f(acc, unsafe {
+                    &mut *std::ptr::NonNull::<T>::dangling().as_ptr()
+                });
+            }
+            return acc;
+        }
+
+        let mut acc = init;
+        // SAFETY: remaining > 0 means ptr is valid
+        let dist_from_end =
+            unsafe { self.seg_end.as_ptr().offset_from(self.ptr.as_ptr()) } as usize;
+        let first_chunk_len = usize::min(dist_from_end, self.remaining);
+        let first_chunk =
+            unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), first_chunk_len) };
+        acc = first_chunk.iter_mut().fold(acc, &mut f);
+
+        self.remaining -= first_chunk_len;
+        if self.remaining == 0 {
+            return acc;
+        }
+
+        let next_idx = self.idx + first_chunk_len;
+        let (mut current_seg_idx, _) = RawSegmentedVec::<T>::location(next_idx);
+
+        while self.remaining > 0 {
+            // SAFETY: remaining > 0 means segments is valid
+            let seg_ptr = unsafe { *self.segments.as_ptr().add(current_seg_idx) };
+            let seg_cap = RawSegmentedVec::<T>::segment_capacity(current_seg_idx);
+            let chunk_len = usize::min(seg_cap, self.remaining);
+
+            // SAFETY: chunk_len <= seg_cap means seg_ptr is valid
+            let seg_slice = unsafe { std::slice::from_raw_parts_mut(seg_ptr, chunk_len) };
+            acc = seg_slice.iter_mut().fold(acc, &mut f);
+
+            self.remaining -= chunk_len;
+            current_seg_idx += 1;
+        }
+
+        acc
+    }
+
+    // TODO: implement try_fold when it's stabilized
+}
+
+impl<T> DoubleEndedIterator for SliceIterMut<'_, T> {
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        #[cold]
+        fn retreat_segment<'a, T>(iter: &mut SliceIterMut<'a, T>) {
+            // Move to the previous segment index
+            iter.back_seg -= 1;
+
+            // Safety: Valid iterators always have valid preceding segments
+            let seg_ptr = unsafe { *iter.segments.as_ptr().add(iter.back_seg) };
+            let cap = RawSegmentedVec::<T>::segment_capacity(iter.back_seg);
+
+            iter.back_ptr = unsafe { NonNull::new_unchecked(seg_ptr.add(cap - 1)) };
+            iter.back_seg_start = unsafe { NonNull::new_unchecked(seg_ptr) };
+        }
+
+        if self.remaining == 0 {
+            return None;
+        }
+
+        // ZST fast path
+        if std::mem::size_of::<T>() == 0 {
+            self.remaining -= 1;
+            // SAFETY: ZSTs don't need valid memory, dangling pointer is fine
+            return Some(unsafe { &mut *std::ptr::NonNull::<T>::dangling().as_ptr() });
+        }
+
+        if self.back_ptr == self.back_seg_start {
+            retreat_segment(self);
+        }
+
+        // SAFETY: remaining > 0 means ptr is valid
+        let result = unsafe { &mut *self.back_ptr.as_ptr() };
+        // SAFETY: ptr is valid
+        self.back_ptr = unsafe { NonNull::new_unchecked(self.back_ptr.as_ptr().sub(1)) };
+        self.remaining -= 1;
+
+        Some(result)
+    }
+
+    #[inline]
+    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
+        if n >= self.remaining {
+            self.remaining = 0;
+            return None;
+        }
+
+        if std::mem::size_of::<T>() == 0 {
+            self.remaining -= n + 1;
+            return Some(unsafe { &mut *std::ptr::NonNull::<T>::dangling().as_ptr() });
+        }
+
+        // SAFETY: remaining > 0 means ptr is valid
+        let dist_to_start = unsafe {
+            self.back_ptr
+                .as_ptr()
+                .offset_from(self.back_seg_start.as_ptr())
+        } as usize;
+        if n < dist_to_start {
+            let result = unsafe { self.back_ptr.as_ptr().sub(n) };
+            self.back_ptr = unsafe { NonNull::new_unchecked(result.sub(1)) };
+            self.remaining -= n + 1;
+            return Some(unsafe { &mut *result });
+        } else {
+            let target_idx = self.idx + self.remaining - n - 1;
+            let (prev_seg, offset) = RawSegmentedVec::<T>::location(target_idx);
+            let prev_seg_ptr = unsafe { *self.segments.as_ptr().add(prev_seg) };
+
+            let result = unsafe { prev_seg_ptr.add(offset) };
+            self.back_ptr = unsafe { NonNull::new_unchecked(result.sub(1)) };
+            self.back_seg_start = unsafe { NonNull::new_unchecked(prev_seg_ptr) };
+            self.back_seg = prev_seg;
+            self.remaining -= n + 1;
+            return Some(unsafe { &mut *result });
+        }
+    }
+
+    fn rfold<B, F>(mut self, init: B, mut f: F) -> B
+    where
+        Self: Sized,
+        F: FnMut(B, Self::Item) -> B,
+    {
+        if self.remaining == 0 {
+            return init;
+        }
+
+        if std::mem::size_of::<T>() == 0 {
+            let mut acc = init;
+            for _ in 0..self.remaining {
+                acc = f(acc, unsafe {
+                    &mut *std::ptr::NonNull::<T>::dangling().as_ptr()
+                });
+            }
+            return acc;
+        }
+
+        let mut acc = init;
+        // SAFETY: remaining > 0 means ptr is valid
+        let dist_to_start = unsafe {
+            self.back_ptr
+                .as_ptr()
+                .offset_from(self.back_seg_start.as_ptr())
+        } as usize;
+        let first_chunk_len = usize::min(dist_to_start, self.remaining);
+        let first_chunk_base = unsafe { self.back_ptr.as_ptr().sub(first_chunk_len) };
+        let first_chunk =
+            unsafe { std::slice::from_raw_parts_mut(first_chunk_base, first_chunk_len) };
+        acc = first_chunk.iter_mut().rfold(acc, &mut f);
+
+        self.remaining -= first_chunk_len;
+        if self.remaining == 0 {
+            return acc;
+        }
+
+        let mut current_seg_idx = self.back_seg;
+
+        while self.remaining > 0 {
+            // SAFETY: remaining > 0 means segments is valid
+            let seg_ptr = unsafe { *self.segments.as_ptr().add(current_seg_idx) };
+            let seg_cap = RawSegmentedVec::<T>::segment_capacity(current_seg_idx);
+            let chunk_len = usize::min(seg_cap, self.remaining);
+
+            // SAFETY: chunk_len <= seg_cap means seg_ptr is valid
+            let seg_slice = unsafe { std::slice::from_raw_parts_mut(seg_ptr, chunk_len) };
+            acc = seg_slice.iter_mut().rfold(acc, &mut f);
+
+            self.remaining -= chunk_len;
+            current_seg_idx -= 1;
+        }
+
+        acc
+    }
+}
+
+impl<T> ExactSizeIterator for SliceIterMut<'_, T> {}
+impl<T> std::iter::FusedIterator for SliceIterMut<'_, T> {}
 
 /// An internal abstraction over the splitting iterators, so that
 /// splitn, splitn_mut etc can be implemented once.
@@ -314,7 +943,7 @@ pub(super) trait SplitIter: DoubleEndedIterator {
 /// This struct is created by the [`split`] method on [`SegmentedSlice`].
 ///
 /// [`split`]: SegmentedSlice::split
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Split<'a, T, P>
 where
     P: FnMut(&T) -> bool,
@@ -322,6 +951,18 @@ where
     pub(crate) slice: SegmentedSlice<'a, T>,
     pred: P,
     finished: bool,
+}
+
+impl<T: std::fmt::Debug, P> std::fmt::Debug for Split<'_, T, P>
+where
+    P: FnMut(&T) -> bool,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Split")
+            .field("slice", &self.slice)
+            .field("finished", &self.finished)
+            .finish()
+    }
 }
 
 impl<'a, T, P: FnMut(&T) -> bool> Split<'a, T, P> {
@@ -371,7 +1012,7 @@ where
                     start: self.slice.start,
                     len: consumed,
                     end_ptr: iter.ptr, // Reuse the pointer we stopped at
-                    end_seg: iter.seg, // Reuse the segment index
+                    end_seg: RawSegmentedVec::<T>::location(iter.idx).0, // Compute segment from logical index
                     _marker: PhantomData,
                 };
 
@@ -487,7 +1128,7 @@ impl<'a, T, P> FusedIterator for Split<'a, T, P> where P: FnMut(&T) -> bool {}
 /// This struct is created by the [`split_inclusive`] method on [`SegmentedSlice`].
 ///
 /// [`split_inclusive`]: SegmentedSlice::split_inclusive
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SplitInclusive<'a, T, P>
 where
     P: FnMut(&T) -> bool,
@@ -495,6 +1136,18 @@ where
     slice: SegmentedSlice<'a, T>,
     pred: P,
     finished: bool,
+}
+
+impl<T: std::fmt::Debug, P> std::fmt::Debug for SplitInclusive<'_, T, P>
+where
+    P: FnMut(&T) -> bool,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SplitInclusive")
+            .field("slice", &self.slice)
+            .field("finished", &self.finished)
+            .finish()
+    }
 }
 
 impl<'a, T, P: FnMut(&T) -> bool> SplitInclusive<'a, T, P> {
@@ -549,7 +1202,7 @@ where
                     start: self.slice.start,
                     len: consumed,
                     end_ptr: iter.ptr, // ptr is already past the separator
-                    end_seg: iter.seg,
+                    end_seg: RawSegmentedVec::<T>::location(iter.idx).0,
                     _marker: PhantomData,
                 };
 
@@ -651,7 +1304,6 @@ where
 impl<'a, T, P> FusedIterator for SplitInclusive<'a, T, P> where P: FnMut(&T) -> bool {}
 
 /// An iterator over subslices separated by elements that match a predicate function.
-#[derive(Debug)]
 pub struct SplitMut<'a, T, P>
 where
     P: FnMut(&T) -> bool,
@@ -659,6 +1311,18 @@ where
     slice: SegmentedSliceMut<'a, T>,
     pred: P,
     finished: bool,
+}
+
+impl<T: std::fmt::Debug, P> std::fmt::Debug for SplitMut<'_, T, P>
+where
+    P: FnMut(&T) -> bool,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SplitMut")
+            .field("slice", &self.slice)
+            .field("finished", &self.finished)
+            .finish()
+    }
 }
 
 impl<'a, T, P: FnMut(&T) -> bool> SplitMut<'a, T, P> {
@@ -728,7 +1392,7 @@ where
                     start: slice_start,
                     len: consumed,
                     end_ptr: iter.ptr,
-                    end_seg: iter.seg,
+                    end_seg: RawSegmentedVec::<T>::location(iter.idx).0,
                     _marker: PhantomData,
                 };
 
@@ -880,6 +1544,18 @@ where
     finished: bool,
 }
 
+impl<T: std::fmt::Debug, P> std::fmt::Debug for SplitInclusiveMut<'_, T, P>
+where
+    P: FnMut(&T) -> bool,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SplitInclusiveMut")
+            .field("slice", &self.slice)
+            .field("finished", &self.finished)
+            .finish()
+    }
+}
+
 impl<'a, T, P: FnMut(&T) -> bool> SplitInclusiveMut<'a, T, P> {
     pub(crate) fn new(slice: SegmentedSliceMut<'a, T>, pred: P) -> Self {
         let finished = slice.is_empty();
@@ -951,7 +1627,7 @@ where
                     start: slice_start,
                     len: consumed,
                     end_ptr: iter.ptr, // ptr is already past the separator
-                    end_seg: iter.seg,
+                    end_seg: RawSegmentedVec::<T>::location(iter.idx).0,
                     _marker: PhantomData,
                 };
 
@@ -3906,174 +4582,19 @@ impl<'a, T> DoubleEndedIterator for RChunksExactMut<'a, T> {
 impl<'a, T> ExactSizeIterator for RChunksExactMut<'a, T> {}
 impl<'a, T> FusedIterator for RChunksExactMut<'a, T> {}
 
-impl<'a, T> Iterator for SliceIter<'a, T> {
-    type Item = &'a T;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
-
-        // ZST fast path
-        if std::mem::size_of::<T>() == 0 {
-            self.remaining -= 1;
-            // SAFETY: ZSTs don't need valid memory, dangling pointer is fine
-            return Some(unsafe { &*std::ptr::NonNull::<T>::dangling().as_ptr() });
-        }
-
-        // SAFETY: remaining > 0 means ptr is valid
-        let result = unsafe { self.ptr.as_ref() };
-        self.remaining -= 1;
-
-        if self.remaining > 0 {
-            // Advance pointer
-            self.ptr = unsafe { NonNull::new_unchecked(self.ptr.as_ptr().add(1)) };
-
-            // Check if we need to move to the next segment
-            if self.ptr == self.seg_end && self.seg < self.back_seg {
-                self.seg += 1;
-                let seg_ptr = unsafe { *self.segments.as_ptr().add(self.seg) };
-                let seg_cap = RawSegmentedVec::<T>::segment_capacity(self.seg);
-                self.ptr = unsafe { NonNull::new_unchecked(seg_ptr) };
-                self.seg_end = unsafe { NonNull::new_unchecked(seg_ptr.add(seg_cap)) };
-            }
-        }
-
-        Some(result)
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
-    }
-}
-
-impl<T> ExactSizeIterator for SliceIter<'_, T> {}
-impl<T> std::iter::FusedIterator for SliceIter<'_, T> {}
-
-impl<T> DoubleEndedIterator for SliceIter<'_, T> {
-    #[inline]
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
-
-        // ZST fast path
-        if std::mem::size_of::<T>() == 0 {
-            self.remaining -= 1;
-            return Some(unsafe { &*std::ptr::NonNull::<T>::dangling().as_ptr() });
-        }
-
-        // SAFETY: remaining > 0 means back_ptr is valid
-        let result = unsafe { self.back_ptr.as_ref() };
-        self.remaining -= 1;
-
-        if self.remaining > 0 {
-            // Check if we need to move to the previous segment
-            if self.back_ptr == self.back_seg_start && self.back_seg > self.seg {
-                self.back_seg -= 1;
-                let seg_ptr = unsafe { *self.segments.as_ptr().add(self.back_seg) };
-                let seg_cap = RawSegmentedVec::<T>::segment_capacity(self.back_seg);
-                self.back_seg_start = unsafe { NonNull::new_unchecked(seg_ptr) };
-                self.back_ptr = unsafe { NonNull::new_unchecked(seg_ptr.add(seg_cap - 1)) };
-            } else {
-                self.back_ptr = unsafe { NonNull::new_unchecked(self.back_ptr.as_ptr().sub(1)) };
-            }
-        }
-
-        Some(result)
-    }
-}
-
-impl<'a, T> Iterator for SliceIterMut<'a, T> {
-    type Item = &'a mut T;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
-
-        // ZST fast path
-        if std::mem::size_of::<T>() == 0 {
-            self.remaining -= 1;
-            // SAFETY: ZSTs don't need valid memory, dangling pointer is fine
-            return Some(unsafe { &mut *std::ptr::NonNull::<T>::dangling().as_ptr() });
-        }
-
-        // SAFETY: remaining > 0 means ptr is valid
-        let result = unsafe { &mut *self.ptr.as_ptr() };
-        self.remaining -= 1;
-
-        if self.remaining > 0 {
-            // Advance pointer
-            self.ptr = unsafe { NonNull::new_unchecked(self.ptr.as_ptr().add(1)) };
-
-            // Check if we need to move to the next segment
-            if self.ptr == self.seg_end && self.seg < self.back_seg {
-                self.seg += 1;
-                let seg_ptr = unsafe { *self.segments.as_ptr().add(self.seg) };
-                let seg_cap = RawSegmentedVec::<T>::segment_capacity(self.seg);
-                self.ptr = unsafe { NonNull::new_unchecked(seg_ptr) };
-                self.seg_end = unsafe { NonNull::new_unchecked(seg_ptr.add(seg_cap)) };
-            }
-        }
-
-        Some(result)
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
-    }
-}
-
-impl<T> ExactSizeIterator for SliceIterMut<'_, T> {}
-impl<T> std::iter::FusedIterator for SliceIterMut<'_, T> {}
-
-impl<T> DoubleEndedIterator for SliceIterMut<'_, T> {
-    #[inline]
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
-
-        // ZST fast path
-        if std::mem::size_of::<T>() == 0 {
-            self.remaining -= 1;
-            return Some(unsafe { &mut *std::ptr::NonNull::<T>::dangling().as_ptr() });
-        }
-
-        // SAFETY: remaining > 0 means back_ptr is valid
-        let result = unsafe { &mut *self.back_ptr.as_ptr() };
-        self.remaining -= 1;
-
-        if self.remaining > 0 {
-            // Check if we need to move to the previous segment
-            if self.back_ptr == self.back_seg_start && self.back_seg > self.seg {
-                self.back_seg -= 1;
-                let seg_ptr = unsafe { *self.segments.as_ptr().add(self.back_seg) };
-                let seg_cap = RawSegmentedVec::<T>::segment_capacity(self.back_seg);
-                self.back_seg_start = unsafe { NonNull::new_unchecked(seg_ptr) };
-                self.back_ptr = unsafe { NonNull::new_unchecked(seg_ptr.add(seg_cap - 1)) };
-            } else {
-                self.back_ptr = unsafe { NonNull::new_unchecked(self.back_ptr.as_ptr().sub(1)) };
-            }
-        }
-
-        Some(result)
-    }
-}
-
-unsafe impl<T: Send> Send for SliceIterMut<'_, T> {}
-unsafe impl<T: Sync> Sync for SliceIterMut<'_, T> {}
-
 /// An iterator over subslices separated by elements that match a predicate function.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ChunkBy<'a, T, F> {
     slice: SegmentedSlice<'a, T>,
     pred: F,
+}
+
+impl<T: std::fmt::Debug, F> std::fmt::Debug for ChunkBy<'_, T, F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChunkBy")
+            .field("slice", &self.slice)
+            .finish()
+    }
 }
 
 impl<'a, T, F> ChunkBy<'a, T, F> {
@@ -4158,6 +4679,14 @@ impl<'a, T, F> FusedIterator for ChunkBy<'a, T, F> where F: FnMut(&T, &T) -> boo
 pub struct ChunkByMut<'a, T, F> {
     slice: SegmentedSliceMut<'a, T>,
     pred: F,
+}
+
+impl<T: std::fmt::Debug, F> std::fmt::Debug for ChunkByMut<'_, T, F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChunkByMut")
+            .field("slice", &self.slice)
+            .finish()
+    }
 }
 
 impl<'a, T, F> ChunkByMut<'a, T, F> {
