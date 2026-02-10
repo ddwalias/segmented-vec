@@ -943,7 +943,6 @@ pub(super) trait SplitIter: DoubleEndedIterator {
 /// This struct is created by the [`split`] method on [`SegmentedSlice`].
 ///
 /// [`split`]: SegmentedSlice::split
-#[derive(Clone)]
 pub struct Split<'a, T, P>
 where
     P: FnMut(&T) -> bool,
@@ -951,18 +950,6 @@ where
     pub(crate) slice: SegmentedSlice<'a, T>,
     pred: P,
     finished: bool,
-}
-
-impl<T: std::fmt::Debug, P> std::fmt::Debug for Split<'_, T, P>
-where
-    P: FnMut(&T) -> bool,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Split")
-            .field("slice", &self.slice)
-            .field("finished", &self.finished)
-            .finish()
-    }
 }
 
 impl<'a, T, P: FnMut(&T) -> bool> Split<'a, T, P> {
@@ -982,6 +969,31 @@ impl<'a, T, P: FnMut(&T) -> bool> Split<'a, T, P> {
     }
 }
 
+impl<T: std::fmt::Debug, P> std::fmt::Debug for Split<'_, T, P>
+where
+    P: FnMut(&T) -> bool,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Split")
+            .field("slice", &self.slice)
+            .field("finished", &self.finished)
+            .finish()
+    }
+}
+
+impl<'a, T, P> Clone for Split<'a, T, P>
+where
+    P: Clone + FnMut(&T) -> bool,
+{
+    fn clone(&self) -> Self {
+        Self {
+            slice: self.slice.clone(),
+            pred: self.pred.clone(),
+            finished: self.finished,
+        }
+    }
+}
+
 impl<'a, T, P> Iterator for Split<'a, T, P>
 where
     P: FnMut(&T) -> bool,
@@ -994,46 +1006,17 @@ where
             return None;
         }
 
-        let mut iter = self.slice.iter();
-        let mut consumed = 0;
-
-        loop {
-            if iter.remaining == 0 {
-                return self.finish();
+        match self.slice.iter().position(|x| (self.pred)(x)) {
+            None => self.finish(),
+            Some(idx) => {
+                let (left, right) =
+                    // SAFETY: if v.iter().position returns Some(idx), that
+                    // idx is definitely a valid index for v
+                    unsafe { (self.slice.get_unchecked(..idx), self.slice.get_unchecked(idx + 1..)) };
+                let ret = Some(left);
+                self.slice = right;
+                ret
             }
-
-            // SAFETY: iter.remaining > 0 means ptr is valid
-            let element = unsafe { &*iter.ptr.as_ptr() };
-
-            if (self.pred)(element) {
-                // Match found!
-                let result = SegmentedSlice {
-                    segments: self.slice.segments,
-                    start: self.slice.start,
-                    len: consumed,
-                    end_ptr: iter.ptr, // Reuse the pointer we stopped at
-                    end_seg: RawSegmentedVec::<T>::location(iter.idx).0, // Compute segment from logical index
-                    _marker: PhantomData,
-                };
-
-                // Advance past the separator
-                iter.next();
-
-                // Update slice to start after the separator
-                self.slice = SegmentedSlice {
-                    segments: self.slice.segments,
-                    start: self.slice.start + consumed + 1,
-                    len: iter.remaining, // Only remains what's left in the iterator
-                    end_ptr: self.slice.end_ptr, // Original end is preserved
-                    end_seg: self.slice.end_seg,
-                    _marker: PhantomData,
-                };
-
-                return Some(result);
-            }
-
-            iter.next();
-            consumed += 1;
         }
     }
 
@@ -1058,48 +1041,17 @@ where
             return None;
         }
 
-        let mut iter = self.slice.iter();
-        let mut consumed = 0;
-
-        loop {
-            if iter.remaining == 0 {
-                return self.finish();
+        match self.slice.iter().rposition(|x| (self.pred)(x)) {
+            None => self.finish(),
+            Some(idx) => {
+                let (left, right) =
+                    // SAFETY: if v.iter().rposition returns Some(idx), then
+                    // idx is definitely a valid index for v
+                    unsafe { (self.slice.get_unchecked(..idx), self.slice.get_unchecked(idx + 1..)) };
+                let ret = Some(right);
+                self.slice = left;
+                ret
             }
-
-            // SAFETY: iter.remaining > 0 means back_ptr is valid
-            let element = unsafe { &*iter.back_ptr.as_ptr() };
-
-            if (self.pred)(element) {
-                let result_start = self.slice.start + iter.remaining;
-
-                let result = SegmentedSlice {
-                    segments: self.slice.segments,
-                    start: result_start,
-                    len: consumed,
-                    end_ptr: self.slice.end_ptr,
-                    end_seg: self.slice.end_seg,
-                    _marker: PhantomData,
-                };
-
-                // Capture separator pointer/seg BEFORE advancing
-                let separator_ptr = iter.back_ptr;
-                let separator_seg = iter.back_seg;
-
-                iter.next_back();
-
-                self.slice = SegmentedSlice {
-                    segments: self.slice.segments,
-                    start: self.slice.start,
-                    len: iter.remaining,
-                    end_ptr: separator_ptr,
-                    end_seg: separator_seg,
-                    _marker: PhantomData,
-                };
-                return Some(result);
-            }
-
-            iter.next_back();
-            consumed += 1;
         }
     }
 }
