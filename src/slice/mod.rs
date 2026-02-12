@@ -46,13 +46,6 @@ pub use iter::{
     SplitInclusive, SplitInclusiveMut, SplitN, Windows,
 };
 
-// Use logic from RawSegmentedVec to ensure consistency
-/// Returns the starting index for a given segment.
-#[inline]
-fn segment_start_index<T>(segment_idx: usize) -> usize {
-    crate::raw_vec::compute_capacity_for_size(segment_idx, std::mem::size_of::<T>())
-}
-
 /// Returns the capacity of the segment at the given index.
 #[inline]
 fn segment_capacity<T>(segment_idx: usize) -> usize {
