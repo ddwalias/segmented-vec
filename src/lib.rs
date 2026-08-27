@@ -497,13 +497,19 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
             return;
         }
 
-        // Drop elements from len to self.len using chunk-based iteration
+        // Retire the tail before destroying it. If `T::drop` panics the
+        // elements are already outside `0..len`, so `Drop for SegmentedVec`
+        // cannot destroy them a second time.
+        let old_len = self.len;
+        self.len = len;
+
+        // Drop elements from len to old_len using chunk-based iteration
         // This is more efficient than element-by-element dropping.
         unsafe {
             if std::mem::needs_drop::<T>() {
                 // Find the starting segment and offset for `len`
                 let (mut seg_idx, mut offset) = RawSegmentedVec::<T, A>::location(len);
-                let mut remaining = self.len - len;
+                let mut remaining = old_len - len;
 
                 while remaining > 0 {
                     let seg_cap = RawSegmentedVec::<T, A>::segment_capacity(seg_idx);
@@ -523,7 +529,6 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
             }
         }
 
-        self.len = len;
         self.update_write_ptr_for_len(len);
     }
 
@@ -907,6 +912,11 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
             let mut prev_seg_ptr = self.buf.segment_ptr(0);
 
             let mut retained = 1usize;
+            // Keep `self.len` in step with the compacted prefix. A duplicate is
+            // destroyed with `drop_in_place` below, and `same_bucket` is user
+            // code; if either unwinds, the live range must not still cover the
+            // destroyed slot or the copy's stale source.
+            self.len = 1;
 
             for _ in 1..len {
                 let curr_ptr = read_seg_ptr.add(read_off);
@@ -927,6 +937,7 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
                     prev_seg_ptr = write_seg_ptr;
 
                     retained += 1;
+                    self.len = retained;
 
                     // Advance write cursor
                     write_off += 1;
@@ -1185,6 +1196,11 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
             return;
         }
 
+        // Retire the elements before destroying them. If `T::drop` panics they
+        // are already outside `0..len`, so `Drop for SegmentedVec` cannot
+        // destroy them a second time.
+        self.len = 0;
+
         // Chunk-based dropping: iterate through segments
         unsafe {
             let mut remaining = len;
@@ -1207,7 +1223,6 @@ impl<T, A: Allocator> SegmentedVec<T, A> {
             }
         }
 
-        self.len = 0;
         self.update_write_ptr_for_len(0);
     }
 
@@ -2579,5 +2594,88 @@ mod tests {
         assert_eq!(vec.len(), 4);
         // Last element (4) should be at index 1 now
         assert_eq!(vec[1], 4);
+    }
+
+    /// A panicking `Drop` must not leave already-destroyed elements inside
+    /// `0..len`.
+    #[test]
+    fn panic_safety_does_not_double_free() {
+        use std::cell::Cell;
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        thread_local! {
+            static DROPS: Cell<usize> = const { Cell::new(0) };
+            static ARMED: Cell<bool> = const { Cell::new(false) };
+        }
+
+        #[derive(PartialEq)]
+        struct Boom(i32);
+
+        impl Drop for Boom {
+            fn drop(&mut self) {
+                DROPS.with(|d| d.set(d.get() + 1));
+                if ARMED.with(|a| a.replace(false)) {
+                    panic!("element Drop panics");
+                }
+            }
+        }
+
+        fn fill() -> SegmentedVec<Boom> {
+            let mut v = SegmentedVec::new();
+            for i in 0..8 {
+                v.push(Boom(i));
+            }
+            v
+        }
+
+        // `clear` with a panicking element `Drop`.
+        DROPS.with(|d| d.set(0));
+        {
+            let mut v = fill();
+            ARMED.with(|a| a.set(true));
+            let r = catch_unwind(AssertUnwindSafe(|| v.clear()));
+            ARMED.with(|a| a.set(false));
+            assert!(r.is_err(), "clear: the armed Drop should have panicked");
+        }
+        // Eight elements exist. Fewer drops mean a leak, which is sound; more
+        // mean an element was destroyed twice.
+        assert!(
+            DROPS.with(|d| d.get()) <= 8,
+            "clear: {} drops for 8 elements",
+            DROPS.with(|d| d.get())
+        );
+
+        // `truncate` with a panicking element `Drop`.
+        DROPS.with(|d| d.set(0));
+        {
+            let mut v = fill();
+            ARMED.with(|a| a.set(true));
+            let r = catch_unwind(AssertUnwindSafe(|| v.truncate(2)));
+            ARMED.with(|a| a.set(false));
+            assert!(r.is_err(), "truncate: the armed Drop should have panicked");
+        }
+        assert!(
+            DROPS.with(|d| d.get()) <= 8,
+            "truncate: {} drops for 8 elements",
+            DROPS.with(|d| d.get())
+        );
+
+        // `dedup_by` with a panicking element `Drop` on a removed duplicate.
+        DROPS.with(|d| d.set(0));
+        {
+            let mut v = SegmentedVec::new();
+            for i in [0, 0, 1, 2, 3, 4, 5, 6] {
+                v.push(Boom(i));
+            }
+            ARMED.with(|a| a.set(true));
+            let r = catch_unwind(AssertUnwindSafe(|| v.dedup_by(|a, b| a.0 == b.0)));
+            ARMED.with(|a| a.set(false));
+            assert!(r.is_err(), "dedup_by: the armed Drop should have panicked");
+        }
+        assert!(
+            DROPS.with(|d| d.get()) <= 8,
+            "dedup_by: {} drops for 8 elements",
+            DROPS.with(|d| d.get())
+        );
     }
 }
